@@ -33,38 +33,138 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-    html, body, [class*="css"] { background-color: #0d1117; color: #c9d1d9; font-family: 'Inter', sans-serif; }
-    .stApp { background-color: #0d1117; }
-    section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
-    div[data-testid="metric-container"] {
-        background-color: #161b22; border: 1px solid #30363d;
-        border-radius: 8px; padding: 16px;
+    /* Base */
+    html, body, [class*="css"] {
+        background-color: #0d1117;
+        color: #e6edf3;
+        font-family: 'Inter', sans-serif;
     }
-    div[data-testid="metric-container"] label { color: #8b949e !important; font-size: 12px; text-transform: uppercase; }
-    div[data-testid="metric-container"] div { color: #c9d1d9 !important; }
-    h1, h2, h3 { color: #e6edf3 !important; }
+    .stApp { background-color: #0d1117; }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #161b22;
+        border-right: 1px solid #30363d;
+    }
+    section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
+
+    /* Metric cards — brighter text */
+    div[data-testid="metric-container"] {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 16px;
+    }
+    div[data-testid="metric-container"] label {
+        color: #adbac7 !important;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+        color: #ffffff !important;
+        font-size: 22px !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="metric-container"] div[data-testid="stMetricDelta"] {
+        color: #adbac7 !important;
+    }
+
+    /* All paragraph and body text — brighter */
+    p, li, span, div { color: #e6edf3; }
+
+    /* Headers */
+    h1, h2, h3, h4 { color: #ffffff !important; }
     h1 { border-bottom: 1px solid #30363d; padding-bottom: 12px; }
+
+    /* DataFrames / tables */
     .stDataFrame { background-color: #161b22; }
-    thead tr th { background-color: #21262d !important; color: #8b949e !important; }
-    button[data-baseweb="tab"] { color: #8b949e !important; }
-    button[data-baseweb="tab"][aria-selected="true"] { color: #58a6ff !important; border-bottom: 2px solid #58a6ff !important; }
+    .stDataFrame * { color: #e6edf3 !important; }
+    thead tr th {
+        background-color: #21262d !important;
+        color: #adbac7 !important;
+        font-size: 11px !important;
+        text-transform: uppercase !important;
+    }
+    tbody tr td { color: #e6edf3 !important; }
+    tbody tr:hover { background-color: #1c2128 !important; }
+
+    /* Tabs */
+    button[data-baseweb="tab"] { color: #adbac7 !important; }
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: #58a6ff !important;
+        border-bottom: 2px solid #58a6ff !important;
+    }
+
+    /* Expanders */
+    details summary { color: #58a6ff !important; font-weight: 600; }
+    details { background-color: #161b22 !important; border: 1px solid #30363d !important; border-radius: 8px; }
+
+    /* Buttons */
+    .stButton button {
+        background-color: #21262d !important;
+        color: #e6edf3 !important;
+        border: 1px solid #30363d !important;
+        border-radius: 6px !important;
+    }
+    .stButton button:hover {
+        background-color: #30363d !important;
+        border-color: #58a6ff !important;
+        color: #ffffff !important;
+    }
+
+    /* Selectbox / radio */
+    .stSelectbox div, .stRadio div { color: #e6edf3 !important; }
+    .stRadio label { color: #e6edf3 !important; }
+
+    /* Info / warning boxes */
+    .stAlert { background-color: #161b22 !important; color: #e6edf3 !important; border-color: #30363d !important; }
+
+    /* Caption text */
+    .stCaption, small { color: #adbac7 !important; }
+
+    /* Recommendation cards */
     .rec-card {
-        background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-        padding: 16px; margin-bottom: 12px;
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 12px;
+        color: #e6edf3;
     }
     .rec-section-title {
-        font-size: 11px; font-weight: 700; text-transform: uppercase;
-        letter-spacing: 0.05em; margin-bottom: 8px;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 8px;
     }
     .signal-badge {
-        display: inline-block; padding: 6px 18px; border-radius: 20px;
-        font-weight: 700; font-size: 15px; letter-spacing: 0.08em;
+        display: inline-block;
+        padding: 6px 18px;
+        border-radius: 20px;
+        font-weight: 700;
+        font-size: 15px;
+        letter-spacing: 0.08em;
     }
     .pill {
-        display: inline-block; padding: 3px 10px; border-radius: 12px;
-        font-size: 11px; font-weight: 600; margin-right: 6px; margin-bottom: 4px;
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 600;
+        margin-right: 6px;
+        margin-bottom: 4px;
     }
+
+    /* Markdown text in expanders */
+    .streamlit-expanderContent p { color: #e6edf3 !important; }
+    .streamlit-expanderContent { color: #e6edf3 !important; }
+
+    /* Dividers */
     hr { border-color: #30363d; }
+
+    /* Plotly chart backgrounds already set in code */
 </style>
 """, unsafe_allow_html=True)
 
