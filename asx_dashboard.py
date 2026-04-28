@@ -33,138 +33,38 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Base */
-    html, body, [class*="css"] {
-        background-color: #0d1117;
-        color: #e6edf3;
-        font-family: 'Inter', sans-serif;
-    }
+    html, body, [class*="css"] { background-color: #0d1117; color: #c9d1d9; font-family: 'Inter', sans-serif; }
     .stApp { background-color: #0d1117; }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background-color: #161b22;
-        border-right: 1px solid #30363d;
-    }
-    section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
-
-    /* Metric cards — brighter text */
+    section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
     div[data-testid="metric-container"] {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 16px;
+        background-color: #161b22; border: 1px solid #30363d;
+        border-radius: 8px; padding: 16px;
     }
-    div[data-testid="metric-container"] label {
-        color: #adbac7 !important;
-        font-size: 12px;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-        color: #ffffff !important;
-        font-size: 22px !important;
-        font-weight: 700 !important;
-    }
-    div[data-testid="metric-container"] div[data-testid="stMetricDelta"] {
-        color: #adbac7 !important;
-    }
-
-    /* All paragraph and body text — brighter */
-    p, li, span, div { color: #e6edf3; }
-
-    /* Headers */
-    h1, h2, h3, h4 { color: #ffffff !important; }
+    div[data-testid="metric-container"] label { color: #8b949e !important; font-size: 12px; text-transform: uppercase; }
+    div[data-testid="metric-container"] div { color: #c9d1d9 !important; }
+    h1, h2, h3 { color: #e6edf3 !important; }
     h1 { border-bottom: 1px solid #30363d; padding-bottom: 12px; }
-
-    /* DataFrames / tables */
     .stDataFrame { background-color: #161b22; }
-    .stDataFrame * { color: #e6edf3 !important; }
-    thead tr th {
-        background-color: #21262d !important;
-        color: #adbac7 !important;
-        font-size: 11px !important;
-        text-transform: uppercase !important;
-    }
-    tbody tr td { color: #e6edf3 !important; }
-    tbody tr:hover { background-color: #1c2128 !important; }
-
-    /* Tabs */
-    button[data-baseweb="tab"] { color: #adbac7 !important; }
-    button[data-baseweb="tab"][aria-selected="true"] {
-        color: #58a6ff !important;
-        border-bottom: 2px solid #58a6ff !important;
-    }
-
-    /* Expanders */
-    details summary { color: #58a6ff !important; font-weight: 600; }
-    details { background-color: #161b22 !important; border: 1px solid #30363d !important; border-radius: 8px; }
-
-    /* Buttons */
-    .stButton button {
-        background-color: #21262d !important;
-        color: #e6edf3 !important;
-        border: 1px solid #30363d !important;
-        border-radius: 6px !important;
-    }
-    .stButton button:hover {
-        background-color: #30363d !important;
-        border-color: #58a6ff !important;
-        color: #ffffff !important;
-    }
-
-    /* Selectbox / radio */
-    .stSelectbox div, .stRadio div { color: #e6edf3 !important; }
-    .stRadio label { color: #e6edf3 !important; }
-
-    /* Info / warning boxes */
-    .stAlert { background-color: #161b22 !important; color: #e6edf3 !important; border-color: #30363d !important; }
-
-    /* Caption text */
-    .stCaption, small { color: #adbac7 !important; }
-
-    /* Recommendation cards */
+    thead tr th { background-color: #21262d !important; color: #8b949e !important; }
+    button[data-baseweb="tab"] { color: #8b949e !important; }
+    button[data-baseweb="tab"][aria-selected="true"] { color: #58a6ff !important; border-bottom: 2px solid #58a6ff !important; }
     .rec-card {
-        background: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 16px;
-        margin-bottom: 12px;
-        color: #e6edf3;
+        background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+        padding: 16px; margin-bottom: 12px;
     }
     .rec-section-title {
-        font-size: 11px;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-bottom: 8px;
+        font-size: 11px; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.05em; margin-bottom: 8px;
     }
     .signal-badge {
-        display: inline-block;
-        padding: 6px 18px;
-        border-radius: 20px;
-        font-weight: 700;
-        font-size: 15px;
-        letter-spacing: 0.08em;
+        display: inline-block; padding: 6px 18px; border-radius: 20px;
+        font-weight: 700; font-size: 15px; letter-spacing: 0.08em;
     }
     .pill {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 12px;
-        font-size: 11px;
-        font-weight: 600;
-        margin-right: 6px;
-        margin-bottom: 4px;
+        display: inline-block; padding: 3px 10px; border-radius: 12px;
+        font-size: 11px; font-weight: 600; margin-right: 6px; margin-bottom: 4px;
     }
-
-    /* Markdown text in expanders */
-    .streamlit-expanderContent p { color: #e6edf3 !important; }
-    .streamlit-expanderContent { color: #e6edf3 !important; }
-
-    /* Dividers */
     hr { border-color: #30363d; }
-
-    /* Plotly chart backgrounds already set in code */
 </style>
 """, unsafe_allow_html=True)
 
@@ -229,13 +129,20 @@ def get_anthropic_client():
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_ticker(ticker, period="6mo"):
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period=period, interval="1d")
-        info = t.info
-        return hist, info
-    except:
-        return pd.DataFrame(), {}
+    for attempt in range(3):  # retry up to 3 times
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period=period, interval="1d")
+            info = {}
+            try:
+                info = t.info
+            except:
+                pass
+            if not hist.empty:
+                return hist, info
+        except:
+            pass
+    return pd.DataFrame(), {}
 
 @st.cache_data(ttl=300)
 def fetch_comparison(tickers, start):
@@ -286,37 +193,69 @@ def liquidity_ratio(volume, window=30):
     return round(volume.iloc[-1] / avg, 2) if avg else 0
 
 def compute_signal(hist):
-    """Rule-based signal scoring. Returns (signal_label, score, indicators_dict)."""
-    close  = hist["Close"]
-    volume = hist["Volume"]
-    price  = close.iloc[-1]
-    prev   = close.iloc[-2] if len(close) > 1 else price
+    """Rule-based signal scoring with safe fallbacks for thin/missing data."""
+    try:
+        close  = hist["Close"].dropna()
+        volume = hist["Volume"].dropna()
 
-    rsi_val   = calc_rsi(close).iloc[-1]
-    obv_s     = calc_obv(close, volume)
-    obv_rising = obv_s.iloc[-1] > obv_s.iloc[-6]
-    ma20      = close.rolling(20).mean().iloc[-1]
-    ma50      = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else ma20
-    liq       = liquidity_ratio(volume)
-    day_chg   = (price - prev) / prev * 100
+        if len(close) < 5:
+            return "HOLD", 0, {"rsi": 50, "obv_rising": False, "above_ma20": False,
+                                "above_ma50": False, "liq_ratio": 1.0, "day_chg": 0, "score": 0}
 
-    score = 0
-    score += 2 if rsi_val < 30 else 1 if rsi_val < 45 else -2 if rsi_val > 70 else -1 if rsi_val > 60 else 0
-    score += 1 if obv_rising else -1
-    score += 1 if price > ma20 else -1
-    score += 1 if price > ma50 else -1
-    score += 1 if liq > 1.5 else -1 if liq < 0.5 else 0
-    score += 1 if day_chg > 3 else -1 if day_chg < -3 else 0
+        price = close.iloc[-1]
+        prev  = close.iloc[-2] if len(close) > 1 else price
 
-    label = ("STRONG BUY" if score >= 4 else "ACCUMULATE" if score >= 2
-             else "HOLD" if score >= -1 else "SELL" if score >= -3 else "AVOID")
+        try:
+            rsi_val = calc_rsi(close).iloc[-1]
+            rsi_val = round(float(rsi_val), 1) if not np.isnan(rsi_val) else 50.0
+        except:
+            rsi_val = 50.0
 
-    indicators = {
-        "rsi": round(rsi_val, 1), "obv_rising": obv_rising,
-        "above_ma20": price > ma20, "above_ma50": price > ma50,
-        "liq_ratio": liq, "day_chg": round(day_chg, 2), "score": score,
-    }
-    return label, score, indicators
+        try:
+            obv_s = calc_obv(close, volume)
+            obv_rising = obv_s.iloc[-1] > obv_s.iloc[-6] if len(obv_s) >= 6 else False
+        except:
+            obv_rising = False
+
+        try:
+            ma20 = close.rolling(20).mean().iloc[-1]
+            above_ma20 = bool(price > ma20) if not np.isnan(ma20) else False
+        except:
+            above_ma20 = False
+
+        try:
+            ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else np.nan
+            above_ma50 = bool(price > ma50) if not np.isnan(ma50) else False
+        except:
+            above_ma50 = False
+
+        try:
+            liq = liquidity_ratio(volume)
+            liq = float(liq) if not np.isnan(liq) else 1.0
+        except:
+            liq = 1.0
+
+        day_chg = round((price - prev) / prev * 100, 2) if prev else 0
+
+        score = 0
+        score += 2 if rsi_val < 30 else 1 if rsi_val < 45 else -2 if rsi_val > 70 else -1 if rsi_val > 60 else 0
+        score += 1 if obv_rising else -1
+        score += 1 if above_ma20 else -1
+        score += 1 if above_ma50 else -1
+        score += 1 if liq > 1.5 else -1 if liq < 0.5 else 0
+        score += 1 if day_chg > 3 else -1 if day_chg < -3 else 0
+
+        label = ("STRONG BUY" if score >= 4 else "ACCUMULATE" if score >= 2
+                 else "HOLD" if score >= -1 else "SELL" if score >= -3 else "AVOID")
+
+        return label, score, {
+            "rsi": rsi_val, "obv_rising": obv_rising,
+            "above_ma20": above_ma20, "above_ma50": above_ma50,
+            "liq_ratio": liq, "day_chg": day_chg, "score": score,
+        }
+    except Exception as e:
+        return "HOLD", 0, {"rsi": 50, "obv_rising": False, "above_ma20": False,
+                            "above_ma50": False, "liq_ratio": 1.0, "day_chg": 0, "score": 0}
 
 # ─────────────────────────────────────────────
 # AI RECOMMENDATION (ANTHROPIC SDK + WEB SEARCH)
@@ -410,8 +349,15 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────
-st.markdown("# 📈 ASX Portfolio Dashboard")
-st.markdown(f"<span style='color:#8b949e'>Institutional-grade analytics · {date.today().strftime('%A, %d %B %Y')}</span>", unsafe_allow_html=True)
+col_title, col_refresh = st.columns([5, 1])
+with col_title:
+    st.markdown("# 📈 ASX Portfolio Dashboard")
+    st.markdown(f"<span style='color:#8b949e'>Institutional-grade analytics · {date.today().strftime('%A, %d %B %Y')}</span>", unsafe_allow_html=True)
+with col_refresh:
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh", help="Clear cache and reload all live data"):
+        st.cache_data.clear()
+        st.rerun()
 st.markdown("---")
 
 # ─────────────────────────────────────────────
