@@ -155,12 +155,17 @@ init_holdings()
 @st.cache_resource
 def get_gemini_client():
     try:
-        api_key = st.secrets["GEMINI_API_KEY"]
+        api_key = st.secrets.get("GEMINI_API_KEY", None)
+        if not api_key:
+            # fallback: try direct key access
+            api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(
             model_name="gemini-2.0-flash",
-            tools="google_search",  # Google Search grounding
+            tools="google_search",
         )
+    except KeyError:
+        return None
     except Exception:
         return None
 
@@ -345,7 +350,9 @@ Respond ONLY with a valid JSON object — no markdown fences, no preamble:
 def get_ai_catalysts(tickers_tuple):
     model = get_gemini_client()
     if not model:
-        return None, "GEMINI_API_KEY not configured in Streamlit secrets."
+        # Diagnostic — check what secrets are available
+        available = list(st.secrets.keys()) if hasattr(st, "secrets") else []
+        return None, f"Gemini client could not be initialised. Keys found in secrets: {available}"
 
     tickers    = list(tickers_tuple)
     ticker_str = ", ".join(tickers)
