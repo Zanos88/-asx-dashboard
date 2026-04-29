@@ -280,7 +280,7 @@ def compute_signal(hist):
 # ─────────────────────────────────────────────
 # AI RECOMMENDATION (CLAUDE)
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)  # 24-hour cache
 def get_ai_recommendation(ticker, name, price, signal_label, score, indicators):
     client = get_anthropic_client()
     if not client:
@@ -329,7 +329,7 @@ Respond ONLY with a valid JSON object — no markdown fences:
 # ─────────────────────────────────────────────
 # AI CATALYST PIPELINE (CLAUDE + WEB SEARCH)
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=7200, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)  # 24-hour cache
 def get_ai_catalysts(tickers_tuple):
     client = get_anthropic_client()
     if not client:
@@ -478,20 +478,14 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.markdown("**🔄 Refresh Market Data**")
-    refresh_pw = st.text_input("Admin password", type="password", key="refresh_pw",
-                               placeholder="Enter password to refresh")
+    st.markdown("**🔒 AI Analysis Access**")
+    st.caption("Password required to run AI recommendations and catalyst search.")
+    st.text_input("Admin password", type="password", key="refresh_pw",
+                  placeholder="Enter password to unlock AI")
     if st.button("🔄 Refresh Market Data", use_container_width=True):
-        admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
-        if admin_pw and refresh_pw == admin_pw:
-            st.cache_data.clear()
-            st.success("Cache cleared — reloading prices...")
-            st.rerun()
-        elif not admin_pw:
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
+        st.cache_data.clear()
+        st.success("Cache cleared — reloading prices...")
+        st.rerun()
 
     st.markdown("---")
     st.markdown("**🔗 Share Portfolio URL**")
@@ -510,21 +504,9 @@ with col_title:
                 unsafe_allow_html=True)
 with col_refresh:
     st.markdown("<br>", unsafe_allow_html=True)
-    admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
-    if not admin_pw:
-        # No password set — allow freely
-        if st.button("🔄 Refresh", help="Clear cache and reload all live data"):
-            st.cache_data.clear()
-            st.rerun()
-    else:
-        if st.button("🔄 Refresh", help="Admin only — password required"):
-            # Reuse whatever was typed in the sidebar password field
-            typed_pw = st.session_state.get("refresh_pw", "")
-            if typed_pw == admin_pw:
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                st.error("Enter admin password in the sidebar first.")
+    if st.button("🔄 Refresh", help="Reload latest market prices"):
+        st.cache_data.clear()
+        st.rerun()
 st.markdown("---")
 
 # ─────────────────────────────────────────────
