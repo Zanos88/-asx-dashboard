@@ -155,18 +155,13 @@ init_holdings()
 @st.cache_resource
 def get_gemini_client():
     try:
-        api_key = st.secrets.get("GEMINI_API_KEY", None)
-        if not api_key:
-            # fallback: try direct key access
-            api_key = st.secrets["GEMINI_API_KEY"]
+        api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=api_key)
-        return genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            tools="google_search",
-        )
-    except KeyError:
-        return None
-    except Exception:
+        # Use GenerativeModel without tools — we'll prompt for search behaviour instead
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash-exp")
+        return model
+    except Exception as e:
+        st.error(f"Gemini init error: {e}")
         return None
 
 
@@ -382,11 +377,16 @@ Respond ONLY with a valid JSON array — no markdown fences, no preamble, no exp
 Include 3-6 events per ticker where data is available. Order by date ascending."""
 
     try:
-        response = model.generate_content(prompt)
-        raw      = response.text
-        cleaned  = raw.replace("```json", "").replace("```", "").strip()
-        start    = cleaned.find("[")
-        end      = cleaned.rfind("]") + 1
+        # Pass Google Search grounding as a tool at generation time
+        from google.generativeai import types
+        response = model.generate_content(
+            prompt,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        raw     = response.text
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        start   = cleaned.find("[")
+        end     = cleaned.rfind("]") + 1
         if start == -1 or end == 0:
             return None, "Could not parse Gemini response."
         return json.loads(cleaned[start:end]), None
