@@ -342,6 +342,46 @@ with st.sidebar:
     else:
         selected_ticker = "AKN.AX"
         timeframe = "6mo"
+
+    st.markdown("---")
+    st.markdown("### ✏️ Edit Holdings")
+    st.caption("Update quantities and entry prices as your portfolio changes.")
+
+    # Initialise session state from defaults on first load
+    if "holdings" not in st.session_state:
+        st.session_state.holdings = {
+            ticker: {"shares": meta["shares"], "avg_entry": meta["avg_entry"]}
+            for ticker, meta in ACTUAL_HOLDINGS.items()
+        }
+
+    for ticker, meta in ACTUAL_HOLDINGS.items():
+        st.markdown(f"**{ticker}** — {meta['name']}")
+        col_s, col_e = st.columns(2)
+        with col_s:
+            new_shares = st.number_input(
+                "Shares", min_value=0, step=1000,
+                value=int(st.session_state.holdings[ticker]["shares"]),
+                key=f"shares_{ticker}",
+                help=f"Total shares held in {ticker}"
+            )
+        with col_e:
+            new_entry = st.number_input(
+                "Avg Entry $", min_value=0.0001, step=0.001, format="%.4f",
+                value=float(st.session_state.holdings[ticker]["avg_entry"]),
+                key=f"entry_{ticker}",
+                help=f"Average entry price for {ticker}"
+            )
+        st.session_state.holdings[ticker]["shares"]    = new_shares
+        st.session_state.holdings[ticker]["avg_entry"] = new_entry
+        st.markdown("")
+
+    if st.button("↺ Reset to Defaults"):
+        st.session_state.holdings = {
+            ticker: {"shares": meta["shares"], "avg_entry": meta["avg_entry"]}
+            for ticker, meta in ACTUAL_HOLDINGS.items()
+        }
+        st.rerun()
+
     st.markdown("---")
     st.caption("Data via Yahoo Finance · Refreshes every 5 min")
     st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S AEST')}")
@@ -375,14 +415,19 @@ if view == "Portfolio Overview":
             st.warning(f"Could not load data for {ticker}")
             continue
 
+        # Use session state values if available
+        live = st.session_state.get("holdings", {}).get(ticker, meta)
+        shares    = live["shares"]
+        avg_entry = live["avg_entry"]
+
         price   = hist["Close"].iloc[-1]
         prev    = hist["Close"].iloc[-2] if len(hist) > 1 else price
         day_chg = (price - prev) / prev * 100
-        cost    = meta["avg_entry"] * meta["shares"]
-        value   = price * meta["shares"]
+        cost    = avg_entry * shares
+        value   = price * shares
         unreal  = value - cost
         unreal_p= (unreal / cost * 100) if cost else 0
-        be_dist = (meta["avg_entry"] - price) / price * 100
+        be_dist = (avg_entry - price) / price * 100
         mktcap  = info.get("marketCap", None)
 
         sig_label, sig_score, indicators = compute_signal(hist)
@@ -391,7 +436,6 @@ if view == "Portfolio Overview":
         total_value += value
         total_cost  += cost
 
-        # ── Holding card
         with st.container():
             st.markdown(f"""
             <div class="rec-card">
@@ -406,10 +450,10 @@ if view == "Portfolio Overview":
             """, unsafe_allow_html=True)
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Avg Entry",    f"${meta['avg_entry']:.4f}")
+        c1.metric("Avg Entry",    f"${avg_entry:.4f}")
         c2.metric("Last Price",   f"${price:.4f}", f"{day_chg:+.2f}%")
-        c3.metric("Shares",       f"{meta['shares']:,}" if meta["shares"] else "—")
-        c4.metric("Unrealised",   f"${unreal:+,.0f}" if meta["shares"] else "—", f"{unreal_p:+.1f}%" if meta["shares"] else None)
+        c3.metric("Shares",       f"{shares:,}" if shares else "—")
+        c4.metric("Unrealised",   f"${unreal:+,.0f}" if shares else "—", f"{unreal_p:+.1f}%" if shares else None)
         c5.metric("BE Distance",  f"{be_dist:+.1f}%")
         c6.metric("Mkt Cap",      f"${mktcap/1e6:.1f}M" if mktcap else "N/A")
 
