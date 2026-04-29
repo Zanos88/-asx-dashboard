@@ -170,6 +170,21 @@ def fetch_ticker(ticker, period="6mo"):
             except Exception:
                 pass
             if not hist.empty:
+                # If marketCap missing, calculate from price × sharesOutstanding
+                if not info.get("marketCap") and info.get("sharesOutstanding"):
+                    price = hist["Close"].iloc[-1]
+                    info["marketCap"] = price * info["sharesOutstanding"]
+                # If sharesOutstanding also missing, try to derive from fast_info
+                if not info.get("marketCap"):
+                    try:
+                        fi = t.fast_info
+                        if hasattr(fi, "market_cap") and fi.market_cap:
+                            info["marketCap"] = fi.market_cap
+                        elif hasattr(fi, "shares") and fi.shares:
+                            info["marketCap"] = hist["Close"].iloc[-1] * fi.shares
+                            info["sharesOutstanding"] = fi.shares
+                    except Exception:
+                        pass
                 return hist, info
         except Exception:
             pass
@@ -539,26 +554,27 @@ if view == "Portfolio Overview":
         total_value += value
         total_cost  += cost
 
-        st.markdown(f"""
-        <div class="rec-card">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-            <div>
-              <span style="color:#58a6ff;font-weight:700;font-size:20px;">{ticker}</span>
-              <span style="color:#8b949e;font-size:14px;margin-left:10px;">{name}</span>
+        with st.container():
+            st.markdown(f"""
+            <div class="rec-card">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+                <div>
+                  <span style="color:#58a6ff;font-weight:700;font-size:20px;">{ticker}</span>
+                  <span style="color:#8b949e;font-size:14px;margin-left:10px;">{name}</span>
+                </div>
+                {signal_badge_html(sig_label)}
+              </div>
             </div>
-            {signal_badge_html(sig_label)}
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Avg Entry",   f"${avg_entry:.4f}")
-        c2.metric("Last Price",  f"${price:.4f}", f"{day_chg:+.2f}%")
-        c3.metric("Shares",      f"{shares:,}" if shares else "—")
-        c4.metric("Unrealised",  f"${unreal:+,.0f}" if shares else "—",
-                                 f"{unreal_p:+.1f}%" if shares else None)
-        c5.metric("BE Distance", f"{be_dist:+.1f}%")
-        c6.metric("Mkt Cap",     f"${mktcap/1e6:.1f}M" if mktcap else "N/A")
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Avg Entry",   f"${avg_entry:.4f}")
+            c2.metric("Last Price",  f"${price:.4f}", f"{day_chg:+.2f}%")
+            c3.metric("Shares",      f"{shares:,}" if shares else "—")
+            c4.metric("Unrealised",  f"${unreal:+,.0f}" if shares else "—",
+                                     f"{unreal_p:+.1f}%" if shares else None)
+            c5.metric("BE Distance", f"{be_dist:+.1f}%")
+            c6.metric("Mkt Cap",     f"${mktcap/1e6:.1f}M" if mktcap else "—")
 
         pills = [
             (f"RSI {indicators['rsi']}", "#3fb950" if indicators['rsi'] < 30 else "#f85149" if indicators['rsi'] > 70 else "#8b949e"),
