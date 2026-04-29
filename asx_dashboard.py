@@ -383,54 +383,143 @@ with st.sidebar:
     view = st.radio("View", ["Portfolio Overview", "Stock Deep-Dive", "Comparison Chart", "Catalyst Pipeline"])
     st.markdown("---")
     if view == "Stock Deep-Dive":
-        all_tickers = list(ACTUAL_HOLDINGS.keys()) + list(WATCHLIST.keys())
+        all_tickers = list(st.session_state.holdings.keys()) + list(WATCHLIST.keys())
         selected_ticker = st.selectbox("Select Ticker", all_tickers)
         timeframe = st.selectbox("Timeframe", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
     else:
-        selected_ticker = "AKN.AX"
+        selected_ticker = list(st.session_state.holdings.keys())[0]
         timeframe = "6mo"
 
     st.markdown("---")
-    st.markdown("### ✏️ Edit Holdings")
-    st.caption("Update quantities and entry prices as your portfolio changes.")
+    st.markdown("### ✏️ Edit Portfolio")
+    st.caption("Update values, then click **✅ Apply Changes**.")
 
-    # Initialise session state from defaults on first load
-    if "holdings" not in st.session_state:
-        st.session_state.holdings = {
-            ticker: {"shares": meta["shares"], "avg_entry": meta["avg_entry"]}
-            for ticker, meta in ACTUAL_HOLDINGS.items()
+    # Initialise form_holdings if not present
+    if "form_holdings" not in st.session_state:
+        st.session_state.form_holdings = {
+            t: {"shares": h["shares"], "avg_entry": h["avg_entry"], "name": h.get("name", t)}
+            for t, h in st.session_state.holdings.items()
         }
 
-    for ticker, meta in ACTUAL_HOLDINGS.items():
-        st.markdown(f"**{ticker}** — {meta['name']}")
-        col_s, col_e = st.columns(2)
-        with col_s:
-            new_shares = st.number_input(
-                "Shares", min_value=0, step=1000,
-                value=int(st.session_state.holdings[ticker]["shares"]),
-                key=f"shares_{ticker}",
-                help=f"Total shares held in {ticker}"
-            )
-        with col_e:
-            new_entry = st.number_input(
-                "Avg Entry $", min_value=0.0001, step=0.001, format="%.4f",
-                value=float(st.session_state.holdings[ticker]["avg_entry"]),
-                key=f"entry_{ticker}",
-                help=f"Average entry price for {ticker}"
-            )
-        st.session_state.holdings[ticker]["shares"]    = new_shares
-        st.session_state.holdings[ticker]["avg_entry"] = new_entry
+    # Render editable rows with stable indexed keys
+    tickers_list = list(st.session_state.form_holdings.keys())
+    for i, ticker in enumerate(tickers_list):
+        h = st.session_state.form_holdings[ticker]
+        st.markdown(f"**{ticker}**")
+        s_val = st.number_input(
+            "Shares", min_value=0, step=1000,
+            value=int(h["shares"]),
+            key=f"fs_{i}"
+        )
+        e_val = st.number_input(
+            "Avg Entry $", min_value=0.0001, step=0.001, format="%.4f",
+            value=float(h["avg_entry"]),
+            key=f"fe_{i}"
+        )
+        st.session_state.form_holdings[ticker]["shares"]    = s_val
+        st.session_state.form_holdings[ticker]["avg_entry"] = e_val
         st.markdown("")
 
-    if st.button("↺ Reset to Defaults"):
+    # Apply Changes button
+    if st.button("✅ Apply Changes", use_container_width=True, type="primary"):
         st.session_state.holdings = {
-            ticker: {"shares": meta["shares"], "avg_entry": meta["avg_entry"]}
-            for ticker, meta in ACTUAL_HOLDINGS.items()
+            t: dict(h) for t, h in st.session_state.form_holdings.items()
         }
+        encoded = encode_holdings(st.session_state.holdings)
+        st.query_params["portfolio"] = encoded
+        st.success("✅ Portfolio updated!")
         st.rerun()
 
     st.markdown("---")
-    st.caption("Data via Yahoo Finance · Refreshes every 5 min")
+
+    # Add new ticker
+    st.markdown("**➕ Add New Ticker**")
+    new_t     = st.text_input("Ticker symbol", placeholder="e.g. BHP.AX", key="add_ticker_input")
+    new_s     = st.number_input("Shares", min_value=0, step=1000, value=0, key="add_shares")
+    new_e     = st.number_input("Avg Entry $", min_value=0.0001, step=0.001,
+                                format="%.4f", value=0.010, key="add_entry")
+    if st.button("➕ Add Ticker", use_container_width=True):
+        if new_t.strip():
+            t = new_t.strip().upper()
+            if not t.endswith(".AX"):
+                t += ".AX"
+            if t not in st.session_state.form_holdings:
+                st.session_state.form_holdings[t] = {
+                    "shares": new_s, "avg_entry": new_e, "name": t
+                }
+                st.session_state.holdings = {
+                    t2: dict(h) for t2, h in st.session_state.form_holdings.items()
+                }
+                encoded = encode_holdings(st.session_state.holdings)
+                st.query_params["portfolio"] = encoded
+                st.success(f"Added {t}!")
+                st.rerun()
+            else:
+                st.warning(f"{t} is already in your portfolio.")
+        else:
+            st.warning("Enter a ticker symbol first.")
+
+    st.markdown("---")
+
+    # Remove ticker
+    st.markdown("**🗑 Remove Ticker**")
+    remove_opts = ["— select to remove —"] + list(st.session_state.form_holdings.keys())
+    to_remove   = st.selectbox("", remove_opts, key="remove_sel", label_visibility="collapsed")
+    if st.button("Remove Selected", use_container_width=True):
+        if to_remove != "— select to remove —":
+            if len(st.session_state.form_holdings) > 1:
+                del st.session_state.form_holdings[to_remove]
+                st.session_state.holdings = {
+                    t: dict(h) for t, h in st.session_state.form_holdings.items()
+                }
+                encoded = encode_holdings(st.session_state.holdings)
+                st.query_params["portfolio"] = encoded
+                st.success(f"Removed {to_remove}")
+                st.rerun()
+            else:
+                st.warning("You must keep at least one holding.")
+
+    st.markdown("---")
+
+    # Reset to defaults
+    if st.button("↺ Reset to Defaults", use_container_width=True):
+        st.session_state.holdings = {
+            t: {"shares": m["shares"], "avg_entry": m["avg_entry"], "name": m["name"]}
+            for t, m in ACTUAL_HOLDINGS.items()
+        }
+        st.session_state.form_holdings = {
+            t: dict(h) for t, h in st.session_state.holdings.items()
+        }
+        st.query_params.clear()
+        st.rerun()
+
+    st.markdown("---")
+
+    # Refresh Market Data — password protected
+    st.markdown("**🔄 Refresh Market Data**")
+    refresh_pw = st.text_input("Admin password", type="password", key="refresh_pw",
+                               placeholder="Enter password to refresh")
+    if st.button("🔄 Refresh Market Data", use_container_width=True):
+        admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
+        if admin_pw and refresh_pw == admin_pw:
+            st.cache_data.clear()
+            st.success("Cache cleared — reloading prices...")
+            st.rerun()
+        elif not admin_pw:
+            # No password set — allow refresh (fallback for initial setup)
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.markdown("---")
+
+    # Shareable URL
+    st.markdown("**🔗 Share Portfolio URL**")
+    st.caption("Anyone with this link sees your portfolio pre-loaded.")
+    encoded    = encode_holdings(st.session_state.holdings)
+    share_url  = f"https://nhe5bwk4jecpb5xjrkgnia.streamlit.app/?portfolio={encoded}"
+    st.code(share_url, language=None)
     st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S AEST')}")
 
 # ─────────────────────────────────────────────
