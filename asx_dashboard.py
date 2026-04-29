@@ -3,7 +3,7 @@ ASX Portfolio Dashboard — Hedge Fund Grade + AI Recommendations
 Built with Python, Streamlit, yfinance, Plotly, and Anthropic SDK
 Run: streamlit run dashboard.py
 Deploy: Push to GitHub → link to share.streamlit.io
-Secrets: Add ANTHROPIC_API_KEY to Streamlit Cloud secrets or .streamlit/secrets.toml
+Secrets: Add ANTHROPIC_API_KEY and ADMIN_PASSWORD to Streamlit Cloud secrets
 """
 
 import streamlit as st
@@ -34,37 +34,42 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-    html, body, [class*="css"] { background-color: #0d1117; color: #c9d1d9; font-family: 'Inter', sans-serif; }
+    html, body, [class*="css"] {
+        background-color: #0d1117; color: #e6edf3; font-family: 'Inter', sans-serif;
+    }
     .stApp { background-color: #0d1117; }
     section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
+    section[data-testid="stSidebar"] * { color: #e6edf3 !important; }
     div[data-testid="metric-container"] {
-        background-color: #161b22; border: 1px solid #30363d;
-        border-radius: 8px; padding: 16px;
+        background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px;
     }
-    div[data-testid="metric-container"] label { color: #8b949e !important; font-size: 12px; text-transform: uppercase; }
-    div[data-testid="metric-container"] div { color: #c9d1d9 !important; }
-    h1, h2, h3 { color: #e6edf3 !important; }
+    div[data-testid="metric-container"] label { color: #adbac7 !important; font-size: 12px; text-transform: uppercase; }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color: #ffffff !important; font-size: 22px !important; font-weight: 700 !important; }
+    div[data-testid="metric-container"] div[data-testid="stMetricDelta"] { color: #adbac7 !important; }
+    p, li, span, div { color: #e6edf3; }
+    h1, h2, h3, h4 { color: #ffffff !important; }
     h1 { border-bottom: 1px solid #30363d; padding-bottom: 12px; }
     .stDataFrame { background-color: #161b22; }
-    thead tr th { background-color: #21262d !important; color: #8b949e !important; }
-    button[data-baseweb="tab"] { color: #8b949e !important; }
+    .stDataFrame * { color: #e6edf3 !important; }
+    thead tr th { background-color: #21262d !important; color: #adbac7 !important; font-size: 11px !important; text-transform: uppercase !important; }
+    tbody tr td { color: #e6edf3 !important; }
+    tbody tr:hover { background-color: #1c2128 !important; }
+    button[data-baseweb="tab"] { color: #adbac7 !important; }
     button[data-baseweb="tab"][aria-selected="true"] { color: #58a6ff !important; border-bottom: 2px solid #58a6ff !important; }
-    .rec-card {
-        background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-        padding: 16px; margin-bottom: 12px;
-    }
-    .rec-section-title {
-        font-size: 11px; font-weight: 700; text-transform: uppercase;
-        letter-spacing: 0.05em; margin-bottom: 8px;
-    }
-    .signal-badge {
-        display: inline-block; padding: 6px 18px; border-radius: 20px;
-        font-weight: 700; font-size: 15px; letter-spacing: 0.08em;
-    }
-    .pill {
-        display: inline-block; padding: 3px 10px; border-radius: 12px;
-        font-size: 11px; font-weight: 600; margin-right: 6px; margin-bottom: 4px;
-    }
+    details summary { color: #58a6ff !important; font-weight: 600; }
+    details { background-color: #161b22 !important; border: 1px solid #30363d !important; border-radius: 8px; }
+    .stButton button { background-color: #21262d !important; color: #e6edf3 !important; border: 1px solid #30363d !important; border-radius: 6px !important; }
+    .stButton button:hover { background-color: #30363d !important; border-color: #58a6ff !important; color: #ffffff !important; }
+    .stSelectbox div, .stRadio div { color: #e6edf3 !important; }
+    .stRadio label { color: #e6edf3 !important; }
+    .stAlert { background-color: #161b22 !important; color: #e6edf3 !important; border-color: #30363d !important; }
+    .stCaption, small { color: #adbac7 !important; }
+    .rec-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px; color: #e6edf3; }
+    .rec-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+    .signal-badge { display: inline-block; padding: 6px 18px; border-radius: 20px; font-weight: 700; font-size: 15px; letter-spacing: 0.08em; }
+    .pill { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-right: 6px; margin-bottom: 4px; }
+    .streamlit-expanderContent p { color: #e6edf3 !important; }
+    .streamlit-expanderContent { color: #e6edf3 !important; }
     hr { border-color: #30363d; }
 </style>
 """, unsafe_allow_html=True)
@@ -74,7 +79,7 @@ st.markdown("""
 # ─────────────────────────────────────────────
 ACTUAL_HOLDINGS = {
     "AKN.AX": {"avg_entry": 0.043, "shares": 212782, "name": "AuKing Mining"},
-    "XST.AX": {"avg_entry": 0.120, "shares": 0,      "name": "Xstate Resources"},  # ← update shares when known
+    "XST.AX": {"avg_entry": 0.120, "shares": 0,      "name": "Xstate Resources"},
 }
 WATCHLIST = {
     "G11.AX": {"name": "Group 11 Technologies"},
@@ -86,15 +91,7 @@ AKN_MILESTONES = [
     {"stage": "Resource",   "target_cap_m": 100},
     {"stage": "Developer",  "target_cap_m": 250},
 ]
-CATALYST_PIPELINE = [
-    {"date": "Apr 2025", "ticker": "AKN.AX", "event": "Diona-1 Flow Results",         "impact": "High"},
-    {"date": "May 2025", "ticker": "AKN.AX", "event": "AKN Shareholder Meeting",       "impact": "Medium"},
-    {"date": "Jun 2025", "ticker": "XST.AX", "event": "Quarterly Activities Report",   "impact": "Medium"},
-    {"date": "Jul 2025", "ticker": "AKN.AX", "event": "Resource Estimate Update",      "impact": "High"},
-    {"date": "Aug 2025", "ticker": "XST.AX", "event": "Capital Raise Decision",        "impact": "High"},
-]
 COMPARISON_START = "2026-01-01"
-
 SIGNAL_COLORS = {
     "STRONG BUY": "#3fb950",
     "ACCUMULATE": "#58a6ff",
@@ -102,7 +99,6 @@ SIGNAL_COLORS = {
     "SELL":       "#f85149",
     "AVOID":      "#8b949e",
 }
-
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
     font=dict(color="#c9d1d9", family="Inter"),
@@ -116,13 +112,11 @@ PLOTLY_LAYOUT = dict(
 # URL PARAMETER HELPERS
 # ─────────────────────────────────────────────
 def encode_holdings(holdings: dict) -> str:
-    """Encode holdings dict to a compact URL-safe string."""
-    payload = {t: {"s": h["shares"], "e": h["avg_entry"], "n": h["name"]}
+    payload = {t: {"s": h["shares"], "e": h["avg_entry"], "n": h.get("name", t)}
                for t, h in holdings.items()}
     return urllib.parse.quote(json.dumps(payload, separators=(",", ":")))
 
 def decode_holdings(encoded: str) -> dict:
-    """Decode URL parameter back to holdings dict."""
     try:
         payload = json.loads(urllib.parse.unquote(encoded))
         return {t: {"shares": v["s"], "avg_entry": v["e"], "name": v.get("n", t)}
@@ -130,19 +124,10 @@ def decode_holdings(encoded: str) -> dict:
     except:
         return {}
 
-def build_share_url(holdings: dict) -> str:
-    encoded = encode_holdings(holdings)
-    try:
-        base = st.query_params.get("_stcore_query_param_base", "")
-    except:
-        base = ""
-    return f"?portfolio={encoded}"
-
 # ─────────────────────────────────────────────
-# INITIALISE SESSION STATE FROM URL OR DEFAULTS
+# INITIALISE SESSION STATE
 # ─────────────────────────────────────────────
 def init_holdings():
-    """Load holdings from URL param if present, else use defaults."""
     if "holdings" not in st.session_state:
         url_param = st.query_params.get("portfolio", "")
         if url_param:
@@ -150,17 +135,22 @@ def init_holdings():
             if decoded:
                 st.session_state.holdings = decoded
                 return
-        # Default
         st.session_state.holdings = {
             t: {"shares": m["shares"], "avg_entry": m["avg_entry"], "name": m["name"]}
             for t, m in ACTUAL_HOLDINGS.items()
         }
-    if "pending_holdings" not in st.session_state:
-        st.session_state.pending_holdings = dict(st.session_state.holdings)
-    if "new_ticker" not in st.session_state:
-        st.session_state.new_ticker = ""
+    if "catalyst_data" not in st.session_state:
+        st.session_state.catalyst_data = None
+    if "catalyst_error" not in st.session_state:
+        st.session_state.catalyst_error = None
+    if "catalyst_generated_at" not in st.session_state:
+        st.session_state.catalyst_generated_at = None
 
 init_holdings()
+
+# ─────────────────────────────────────────────
+# ANTHROPIC CLIENT
+# ─────────────────────────────────────────────
 @st.cache_resource
 def get_anthropic_client():
     try:
@@ -176,7 +166,7 @@ def get_anthropic_client():
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_ticker(ticker, period="6mo"):
-    for attempt in range(3):  # retry up to 3 times
+    for _ in range(3):
         try:
             t = yf.Ticker(ticker)
             hist = t.history(period=period, interval="1d")
@@ -194,7 +184,7 @@ def fetch_ticker(ticker, period="6mo"):
 @st.cache_data(ttl=300)
 def fetch_comparison(tickers, start):
     try:
-        data = yf.download(tickers, start=start, auto_adjust=True)["Close"]
+        data = yf.download(list(tickers), start=start, auto_adjust=True)["Close"]
         if isinstance(data, pd.Series):
             data = data.to_frame()
         return (data / data.iloc[0]) * 100
@@ -240,50 +230,35 @@ def liquidity_ratio(volume, window=30):
     return round(volume.iloc[-1] / avg, 2) if avg else 0
 
 def compute_signal(hist):
-    """Rule-based signal scoring with safe fallbacks for thin/missing data."""
     try:
         close  = hist["Close"].dropna()
         volume = hist["Volume"].dropna()
-
         if len(close) < 5:
             return "HOLD", 0, {"rsi": 50, "obv_rising": False, "above_ma20": False,
                                 "above_ma50": False, "liq_ratio": 1.0, "day_chg": 0, "score": 0}
-
         price = close.iloc[-1]
         prev  = close.iloc[-2] if len(close) > 1 else price
-
         try:
             rsi_val = calc_rsi(close).iloc[-1]
             rsi_val = round(float(rsi_val), 1) if not np.isnan(rsi_val) else 50.0
-        except:
-            rsi_val = 50.0
-
+        except: rsi_val = 50.0
         try:
             obv_s = calc_obv(close, volume)
             obv_rising = obv_s.iloc[-1] > obv_s.iloc[-6] if len(obv_s) >= 6 else False
-        except:
-            obv_rising = False
-
+        except: obv_rising = False
         try:
             ma20 = close.rolling(20).mean().iloc[-1]
             above_ma20 = bool(price > ma20) if not np.isnan(ma20) else False
-        except:
-            above_ma20 = False
-
+        except: above_ma20 = False
         try:
             ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else np.nan
             above_ma50 = bool(price > ma50) if not np.isnan(ma50) else False
-        except:
-            above_ma50 = False
-
+        except: above_ma50 = False
         try:
-            liq = liquidity_ratio(volume)
-            liq = float(liq) if not np.isnan(liq) else 1.0
-        except:
-            liq = 1.0
-
+            liq = float(liquidity_ratio(volume))
+            liq = liq if not np.isnan(liq) else 1.0
+        except: liq = 1.0
         day_chg = round((price - prev) / prev * 100, 2) if prev else 0
-
         score = 0
         score += 2 if rsi_val < 30 else 1 if rsi_val < 45 else -2 if rsi_val > 70 else -1 if rsi_val > 60 else 0
         score += 1 if obv_rising else -1
@@ -291,28 +266,23 @@ def compute_signal(hist):
         score += 1 if above_ma50 else -1
         score += 1 if liq > 1.5 else -1 if liq < 0.5 else 0
         score += 1 if day_chg > 3 else -1 if day_chg < -3 else 0
-
         label = ("STRONG BUY" if score >= 4 else "ACCUMULATE" if score >= 2
                  else "HOLD" if score >= -1 else "SELL" if score >= -3 else "AVOID")
-
-        return label, score, {
-            "rsi": rsi_val, "obv_rising": obv_rising,
+        return label, score, {"rsi": rsi_val, "obv_rising": obv_rising,
             "above_ma20": above_ma20, "above_ma50": above_ma50,
-            "liq_ratio": liq, "day_chg": day_chg, "score": score,
-        }
-    except Exception as e:
+            "liq_ratio": liq, "day_chg": day_chg, "score": score}
+    except:
         return "HOLD", 0, {"rsi": 50, "obv_rising": False, "above_ma20": False,
                             "above_ma50": False, "liq_ratio": 1.0, "day_chg": 0, "score": 0}
 
 # ─────────────────────────────────────────────
-# AI RECOMMENDATION (ANTHROPIC SDK + WEB SEARCH)
+# AI RECOMMENDATION
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=1800, show_spinner=False)  # 30-min cache — avoid hammering API
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_ai_recommendation(ticker, name, price, signal_label, score, indicators):
     client = get_anthropic_client()
     if not client:
-        return None, "ANTHROPIC_API_KEY not configured in Streamlit secrets."
-
+        return None, "ANTHROPIC_API_KEY not configured."
     prompt = f"""You are a senior equities analyst specialising in ASX small-cap and micro-cap stocks.
 
 Ticker: {ticker} ({name})
@@ -327,20 +297,19 @@ Day Change: {indicators['day_chg']:+.2f}%
 
 Use your web search tool to find:
 1. Recent news, broker commentary, or sentiment for {ticker}
-2. Any ASX substantial holder notices (Form 603/604) or known institutional activity for {ticker}
+2. Any ASX substantial holder notices (Form 603/604) or known institutional activity
 3. Macro or sector tailwinds/headwinds relevant to this stock
 
-Then respond ONLY with a valid JSON object — no markdown fences, no preamble:
+Respond ONLY with a valid JSON object — no markdown fences, no preamble:
 {{
   "signal": "{signal_label}",
   "rationale": "2-3 sentence technical rationale referencing the indicators",
-  "sentiment": "Current market sentiment, recent news headlines, broker views, sector tailwinds/headwinds",
-  "holders": "Top holder activity — any substantial holder notices, institutional buying/selling, or note if data is limited for sub-5% positions",
+  "sentiment": "Current market sentiment, recent news, broker views, sector tailwinds/headwinds",
+  "holders": "Top holder activity — substantial holder notices, institutional buying/selling, or note if data is limited",
   "risks": "1-2 key risks to the thesis",
   "sources": ["source 1", "source 2"],
   "disclaimer": "Not financial advice. For informational purposes only."
 }}"""
-
     try:
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -348,28 +317,70 @@ Then respond ONLY with a valid JSON object — no markdown fences, no preamble:
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        # Extract text content blocks
         raw = "".join(b.text for b in response.content if hasattr(b, "text"))
-        # Strip markdown fences if present
         cleaned = raw.replace("```json", "").replace("```", "").strip()
-        # Find JSON object
-        start = cleaned.find("{")
-        end   = cleaned.rfind("}") + 1
+        start = cleaned.find("{"); end = cleaned.rfind("}") + 1
         if start == -1 or end == 0:
-            return None, "Could not parse AI response. Try again."
-        parsed = json.loads(cleaned[start:end])
-        return parsed, None
+            return None, "Could not parse AI response."
+        return json.loads(cleaned[start:end]), None
     except Exception as e:
         return None, f"API error: {str(e)}"
 
 # ─────────────────────────────────────────────
-# SIGNAL BADGE HTML
+# AI CATALYST PIPELINE
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=7200, show_spinner=False)
+def get_ai_catalysts(tickers_tuple):
+    client = get_anthropic_client()
+    if not client:
+        return None, "ANTHROPIC_API_KEY not configured."
+    tickers    = list(tickers_tuple)
+    ticker_str = ", ".join(tickers)
+    prompt = f"""You are an ASX equities analyst. Find upcoming catalysts, announcements, and key events for: {ticker_str}.
+
+Use your web search tool to find:
+1. Recent ASX announcements and quarterly reports for each ticker
+2. Upcoming scheduled events (AGMs, drilling results, resource estimates, capital raises, regulatory decisions)
+3. Any analyst coverage, broker notes, or sentiment shifts
+4. Macro or sector-level events that could materially impact these stocks
+
+Today's date is {date.today().strftime("%d %B %Y")}.
+
+Respond ONLY with a valid JSON array — no markdown fences, no preamble:
+[
+  {{
+    "date": "Month Year or specific date if known",
+    "ticker": "AKN.AX",
+    "event": "Clear description of the event or catalyst",
+    "impact": "High|Medium|Low",
+    "source": "Source name e.g. ASX announcement, Company website"
+  }}
+]
+
+Include 3-6 events per ticker. Order by date ascending."""
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(b.text for b in response.content if hasattr(b, "text"))
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        start = cleaned.find("["); end = cleaned.rfind("]") + 1
+        if start == -1 or end == 0:
+            return None, "Could not parse catalyst data."
+        return json.loads(cleaned[start:end]), None
+    except Exception as e:
+        return None, f"API error: {str(e)}"
+
+# ─────────────────────────────────────────────
+# HELPERS
 # ─────────────────────────────────────────────
 def signal_badge_html(label):
     color = SIGNAL_COLORS.get(label, "#8b949e")
-    return (f'<span class="signal-badge" style="'
-            f'background:{color}22;color:{color};border:2px solid {color};">'
-            f'{label}</span>')
+    return (f'<span class="signal-badge" style="background:{color}22;color:{color};'
+            f'border:2px solid {color};">{label}</span>')
 
 def pill_html(text, color):
     return f'<span class="pill" style="background:{color}22;color:{color};border:1px solid {color};">{text}</span>'
@@ -383,73 +394,55 @@ with st.sidebar:
     view = st.radio("View", ["Portfolio Overview", "Stock Deep-Dive", "Comparison Chart", "Catalyst Pipeline"])
     st.markdown("---")
     if view == "Stock Deep-Dive":
-        all_tickers = list(st.session_state.holdings.keys()) + list(WATCHLIST.keys())
+        all_tickers    = list(st.session_state.holdings.keys()) + list(WATCHLIST.keys())
         selected_ticker = st.selectbox("Select Ticker", all_tickers)
-        timeframe = st.selectbox("Timeframe", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+        timeframe       = st.selectbox("Timeframe", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
     else:
         selected_ticker = list(st.session_state.holdings.keys())[0]
-        timeframe = "6mo"
+        timeframe       = "6mo"
 
     st.markdown("---")
     st.markdown("### ✏️ Edit Portfolio")
-    st.caption("Update values, then click **✅ Apply Changes**.")
+    st.caption("Update values then click **✅ Apply Changes**.")
 
-    # Initialise form_holdings if not present
     if "form_holdings" not in st.session_state:
         st.session_state.form_holdings = {
             t: {"shares": h["shares"], "avg_entry": h["avg_entry"], "name": h.get("name", t)}
             for t, h in st.session_state.holdings.items()
         }
 
-    # Render editable rows with stable indexed keys
     tickers_list = list(st.session_state.form_holdings.keys())
     for i, ticker in enumerate(tickers_list):
         h = st.session_state.form_holdings[ticker]
         st.markdown(f"**{ticker}**")
-        s_val = st.number_input(
-            "Shares", min_value=0, step=1000,
-            value=int(h["shares"]),
-            key=f"fs_{i}"
-        )
-        e_val = st.number_input(
-            "Avg Entry $", min_value=0.0001, step=0.001, format="%.4f",
-            value=float(h["avg_entry"]),
-            key=f"fe_{i}"
-        )
+        s_val = st.number_input("Shares", min_value=0, step=1000,
+                                value=int(h["shares"]), key=f"fs_{i}")
+        e_val = st.number_input("Avg Entry $", min_value=0.0001, step=0.001,
+                                format="%.4f", value=float(h["avg_entry"]), key=f"fe_{i}")
         st.session_state.form_holdings[ticker]["shares"]    = s_val
         st.session_state.form_holdings[ticker]["avg_entry"] = e_val
         st.markdown("")
 
-    # Apply Changes button
     if st.button("✅ Apply Changes", use_container_width=True, type="primary"):
-        st.session_state.holdings = {
-            t: dict(h) for t, h in st.session_state.form_holdings.items()
-        }
+        st.session_state.holdings = {t: dict(h) for t, h in st.session_state.form_holdings.items()}
         encoded = encode_holdings(st.session_state.holdings)
         st.query_params["portfolio"] = encoded
         st.success("✅ Portfolio updated!")
         st.rerun()
 
     st.markdown("---")
-
-    # Add new ticker
     st.markdown("**➕ Add New Ticker**")
-    new_t     = st.text_input("Ticker symbol", placeholder="e.g. BHP.AX", key="add_ticker_input")
-    new_s     = st.number_input("Shares", min_value=0, step=1000, value=0, key="add_shares")
-    new_e     = st.number_input("Avg Entry $", min_value=0.0001, step=0.001,
-                                format="%.4f", value=0.010, key="add_entry")
+    new_t = st.text_input("Ticker symbol", placeholder="e.g. BHP.AX", key="add_ticker_input")
+    new_s = st.number_input("Shares", min_value=0, step=1000, value=0, key="add_shares")
+    new_e = st.number_input("Avg Entry $", min_value=0.0001, step=0.001,
+                            format="%.4f", value=0.010, key="add_entry")
     if st.button("➕ Add Ticker", use_container_width=True):
         if new_t.strip():
             t = new_t.strip().upper()
-            if not t.endswith(".AX"):
-                t += ".AX"
+            if not t.endswith(".AX"): t += ".AX"
             if t not in st.session_state.form_holdings:
-                st.session_state.form_holdings[t] = {
-                    "shares": new_s, "avg_entry": new_e, "name": t
-                }
-                st.session_state.holdings = {
-                    t2: dict(h) for t2, h in st.session_state.form_holdings.items()
-                }
+                st.session_state.form_holdings[t] = {"shares": new_s, "avg_entry": new_e, "name": t}
+                st.session_state.holdings = {t2: dict(h) for t2, h in st.session_state.form_holdings.items()}
                 encoded = encode_holdings(st.session_state.holdings)
                 st.query_params["portfolio"] = encoded
                 st.success(f"Added {t}!")
@@ -460,8 +453,6 @@ with st.sidebar:
             st.warning("Enter a ticker symbol first.")
 
     st.markdown("---")
-
-    # Remove ticker
     st.markdown("**🗑 Remove Ticker**")
     remove_opts = ["— select to remove —"] + list(st.session_state.form_holdings.keys())
     to_remove   = st.selectbox("", remove_opts, key="remove_sel", label_visibility="collapsed")
@@ -469,33 +460,25 @@ with st.sidebar:
         if to_remove != "— select to remove —":
             if len(st.session_state.form_holdings) > 1:
                 del st.session_state.form_holdings[to_remove]
-                st.session_state.holdings = {
-                    t: dict(h) for t, h in st.session_state.form_holdings.items()
-                }
+                st.session_state.holdings = {t: dict(h) for t, h in st.session_state.form_holdings.items()}
                 encoded = encode_holdings(st.session_state.holdings)
                 st.query_params["portfolio"] = encoded
                 st.success(f"Removed {to_remove}")
                 st.rerun()
             else:
-                st.warning("You must keep at least one holding.")
+                st.warning("Must keep at least one holding.")
 
     st.markdown("---")
-
-    # Reset to defaults
     if st.button("↺ Reset to Defaults", use_container_width=True):
         st.session_state.holdings = {
             t: {"shares": m["shares"], "avg_entry": m["avg_entry"], "name": m["name"]}
             for t, m in ACTUAL_HOLDINGS.items()
         }
-        st.session_state.form_holdings = {
-            t: dict(h) for t, h in st.session_state.holdings.items()
-        }
+        st.session_state.form_holdings = {t: dict(h) for t, h in st.session_state.holdings.items()}
         st.query_params.clear()
         st.rerun()
 
     st.markdown("---")
-
-    # Refresh Market Data — password protected
     st.markdown("**🔄 Refresh Market Data**")
     refresh_pw = st.text_input("Admin password", type="password", key="refresh_pw",
                                placeholder="Enter password to refresh")
@@ -506,19 +489,16 @@ with st.sidebar:
             st.success("Cache cleared — reloading prices...")
             st.rerun()
         elif not admin_pw:
-            # No password set — allow refresh (fallback for initial setup)
             st.cache_data.clear()
             st.rerun()
         else:
             st.error("Incorrect password.")
 
     st.markdown("---")
-
-    # Shareable URL
     st.markdown("**🔗 Share Portfolio URL**")
     st.caption("Anyone with this link sees your portfolio pre-loaded.")
-    encoded    = encode_holdings(st.session_state.holdings)
-    share_url  = f"https://nhe5bwk4jecpb5xjrkgnia.streamlit.app/?portfolio={encoded}"
+    encoded   = encode_holdings(st.session_state.holdings)
+    share_url = f"https://nhe5bwk4jecpb5xjrkgnia.streamlit.app/?portfolio={encoded}"
     st.code(share_url, language=None)
     st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S AEST')}")
 
@@ -528,7 +508,8 @@ with st.sidebar:
 col_title, col_refresh = st.columns([5, 1])
 with col_title:
     st.markdown("# 📈 ASX Portfolio Dashboard")
-    st.markdown(f"<span style='color:#8b949e'>Institutional-grade analytics · {date.today().strftime('%A, %d %B %Y')}</span>", unsafe_allow_html=True)
+    st.markdown(f"<span style='color:#8b949e'>Institutional-grade analytics · {date.today().strftime('%A, %d %B %Y')}</span>",
+                unsafe_allow_html=True)
 with col_refresh:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Refresh", help="Clear cache and reload all live data"):
@@ -540,9 +521,7 @@ st.markdown("---")
 # VIEW: PORTFOLIO OVERVIEW
 # ─────────────────────────────────────────────
 if view == "Portfolio Overview":
-
     st.subheader("🗂 Actual Holdings")
-
     total_value, total_cost = 0, 0
 
     for ticker, holding in st.session_state.holdings.items():
@@ -554,20 +533,17 @@ if view == "Portfolio Overview":
         shares    = holding["shares"]
         avg_entry = holding["avg_entry"]
         name      = holding.get("name", ticker)
-
-        price   = hist["Close"].iloc[-1]
-        prev    = hist["Close"].iloc[-2] if len(hist) > 1 else price
-        day_chg = (price - prev) / prev * 100
-        cost    = avg_entry * shares
-        value   = price * shares
-        unreal  = value - cost
-        unreal_p= (unreal / cost * 100) if cost else 0
-        be_dist = (avg_entry - price) / price * 100
-        mktcap  = info.get("marketCap", None)
+        price     = hist["Close"].iloc[-1]
+        prev      = hist["Close"].iloc[-2] if len(hist) > 1 else price
+        day_chg   = (price - prev) / prev * 100
+        cost      = avg_entry * shares
+        value     = price * shares
+        unreal    = value - cost
+        unreal_p  = (unreal / cost * 100) if cost else 0
+        be_dist   = (avg_entry - price) / price * 100
+        mktcap    = info.get("marketCap", None)
 
         sig_label, sig_score, indicators = compute_signal(hist)
-        sig_color = SIGNAL_COLORS[sig_label]
-
         total_value += value
         total_cost  += cost
 
@@ -585,14 +561,14 @@ if view == "Portfolio Overview":
             """, unsafe_allow_html=True)
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Avg Entry",    f"${avg_entry:.4f}")
-        c2.metric("Last Price",   f"${price:.4f}", f"{day_chg:+.2f}%")
-        c3.metric("Shares",       f"{shares:,}" if shares else "—")
-        c4.metric("Unrealised",   f"${unreal:+,.0f}" if shares else "—", f"{unreal_p:+.1f}%" if shares else None)
-        c5.metric("BE Distance",  f"{be_dist:+.1f}%")
-        c6.metric("Mkt Cap",      f"${mktcap/1e6:.1f}M" if mktcap else "N/A")
+        c1.metric("Avg Entry",   f"${avg_entry:.4f}")
+        c2.metric("Last Price",  f"${price:.4f}", f"{day_chg:+.2f}%")
+        c3.metric("Shares",      f"{shares:,}" if shares else "—")
+        c4.metric("Unrealised",  f"${unreal:+,.0f}" if shares else "—",
+                                 f"{unreal_p:+.1f}%" if shares else None)
+        c5.metric("BE Distance", f"{be_dist:+.1f}%")
+        c6.metric("Mkt Cap",     f"${mktcap/1e6:.1f}M" if mktcap else "N/A")
 
-        # Indicator pills
         pills = [
             (f"RSI {indicators['rsi']}", "#3fb950" if indicators['rsi'] < 30 else "#f85149" if indicators['rsi'] > 70 else "#8b949e"),
             (f"OBV {'↑ Accum.' if indicators['obv_rising'] else '↓ Distrib.'}", "#3fb950" if indicators['obv_rising'] else "#f85149"),
@@ -602,22 +578,19 @@ if view == "Portfolio Overview":
         ]
         st.markdown(" ".join(pill_html(t, c) for t, c in pills), unsafe_allow_html=True)
 
-        # ── AI Recommendation expander
         with st.expander(f"🤖 AI Recommendation · Market Sentiment · Holder Activity — {ticker}"):
             if st.button(f"Generate Analysis for {ticker}", key=f"btn_{ticker}"):
                 with st.spinner(f"Searching market data and analysing {ticker}…"):
                     rec, err = get_ai_recommendation(
-                       ticker, name, price, sig_label, sig_score, indicators
+                        ticker, name, price, sig_label, sig_score, indicators
                     )
                 if err:
                     st.error(err)
                 elif rec:
-                    # AI signal (may differ from rule-based)
-                    ai_sig = rec.get("signal", sig_label)
-                    ai_color = SIGNAL_COLORS.get(ai_sig, sig_color)
+                    ai_sig   = rec.get("signal", sig_label)
+                    ai_color = SIGNAL_COLORS.get(ai_sig, SIGNAL_COLORS[sig_label])
                     st.markdown(f"**AI Signal:** {signal_badge_html(ai_sig)}", unsafe_allow_html=True)
                     st.markdown("")
-
                     col_a, col_b = st.columns(2)
                     with col_a:
                         st.markdown(f"<div class='rec-section-title' style='color:#58a6ff;'>📊 Technical Rationale</div>", unsafe_allow_html=True)
@@ -629,7 +602,6 @@ if view == "Portfolio Overview":
                         st.markdown(rec.get("holders", ""))
                         st.markdown(f"<div class='rec-section-title' style='color:#f85149;margin-top:14px;'>⚠️ Key Risks</div>", unsafe_allow_html=True)
                         st.markdown(rec.get("risks", ""))
-
                     if rec.get("sources"):
                         st.markdown("**Sources:** " + " · ".join(rec["sources"]))
                     st.caption(rec.get("disclaimer", "Not financial advice."))
@@ -638,16 +610,14 @@ if view == "Portfolio Overview":
 
         st.markdown("---")
 
-    # Portfolio summary
     pnl   = total_value - total_cost
     pnl_p = (pnl / total_cost * 100) if total_cost else 0
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Portfolio Value", f"${total_value:,.0f}")
     c2.metric("Total Cost Basis",      f"${total_cost:,.0f}")
     c3.metric("Total Unrealised P&L",  f"${pnl:+,.0f}", f"{pnl_p:+.1f}%")
-    c4.metric("Positions",             len(ACTUAL_HOLDINGS))
+    c4.metric("Positions",             len(st.session_state.holdings))
 
-    # AKN Milestone tracker
     st.markdown("---")
     st.subheader("🎯 AKN Valuation Milestones")
     hist_akn, info_akn = fetch_ticker("AKN.AX")
@@ -667,7 +637,6 @@ if view == "Portfolio Overview":
                              yaxis_title="Market Cap ($M)", height=300, **PLOTLY_LAYOUT)
         st.plotly_chart(fig_ms, use_container_width=True)
 
-    # Watchlist
     st.markdown("---")
     st.subheader("👁 Watchlist / Prospect Portfolio")
     watch_rows = []
@@ -683,15 +652,11 @@ if view == "Portfolio Overview":
         mktcap  = info.get("marketCap", None)
         sig_label, _, _ = compute_signal(hist)
         watch_rows.append({
-            "Ticker":     ticker,
-            "Name":       meta["name"],
-            "Signal":     sig_label,
-            "Last Price": f"${price:.4f}",
-            "Day Chg%":   f"{day_chg:+.2f}%",
+            "Ticker":     ticker, "Name": meta["name"], "Signal": sig_label,
+            "Last Price": f"${price:.4f}", "Day Chg%": f"{day_chg:+.2f}%",
             "Mkt Cap":    f"${mktcap/1e6:.1f}M" if mktcap else "N/A",
         })
     st.dataframe(pd.DataFrame(watch_rows), use_container_width=True, hide_index=True)
-
 
 # ─────────────────────────────────────────────
 # VIEW: DEEP DIVE
@@ -715,93 +680,140 @@ elif view == "Stock Deep-Dive":
     ma50    = hist["Close"].rolling(50).mean()
     ma200   = hist["Close"].rolling(200).mean()
     fisher  = calc_fisher(hist["High"], hist["Low"])
-
     name    = info.get("longName", selected_ticker)
     mktcap  = info.get("marketCap", None)
-    hi52    = info.get("fiftyTwoWeekHigh", None)
-    lo52    = info.get("fiftyTwoWeekLow", None)
 
     st.subheader(f"{name} ({selected_ticker})")
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Last Price",      f"${price:.4f}", f"{day_chg:+.2f}%")
     c2.metric("Mkt Cap",         f"${mktcap/1e6:.1f}M" if mktcap else "N/A")
-    c3.metric("RSI (14)",        f"{rsi_val:.1f}", "Overbought" if rsi_val>70 else "Oversold" if rsi_val<30 else "Neutral")
+    c3.metric("RSI (14)",        f"{rsi_val:.1f}", "Overbought" if rsi_val > 70 else "Oversold" if rsi_val < 30 else "Neutral")
     c4.metric("Liquidity Ratio", f"{liq}x")
     c5.metric("OBV Trend",       obv_trend)
     st.markdown("---")
 
-    # Candlestick
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.03)
     fig.add_trace(go.Candlestick(x=hist.index, open=hist["Open"], high=hist["High"],
         low=hist["Low"], close=hist["Close"], name="Price",
         increasing_line_color="#3fb950", decreasing_line_color="#f85149",
         increasing_fillcolor="#1a3a2a", decreasing_fillcolor="#3a1a1a"), row=1, col=1)
     for ma, color, label in [(ma20,"#58a6ff","MA20"),(ma50,"#e3b341","MA50"),(ma200,"#bc8cff","MA200")]:
-        fig.add_trace(go.Scatter(x=hist.index, y=ma, line=dict(color=color,width=1), name=label), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist.index, y=vwap, line=dict(color="#ff7b72",width=1,dash="dot"), name="VWAP"), row=1, col=1)
-    colors = ["#3fb950" if c>=o else "#f85149" for c,o in zip(hist["Close"],hist["Open"])]
+        fig.add_trace(go.Scatter(x=hist.index, y=ma, line=dict(color=color, width=1), name=label), row=1, col=1)
+    fig.add_trace(go.Scatter(x=hist.index, y=vwap, line=dict(color="#ff7b72", width=1, dash="dot"), name="VWAP"), row=1, col=1)
+    colors = ["#3fb950" if c >= o else "#f85149" for c, o in zip(hist["Close"], hist["Open"])]
     fig.add_trace(go.Bar(x=hist.index, y=hist["Volume"], marker_color=colors, name="Volume", opacity=0.6), row=2, col=1)
     fig.update_layout(xaxis_rangeslider_visible=False, height=550, **PLOTLY_LAYOUT)
     st.plotly_chart(fig, use_container_width=True)
 
-    t1,t2,t3,t4 = st.tabs(["OBV","Fisher Transform","MACD","RSI"])
+    t1, t2, t3, t4 = st.tabs(["OBV", "Fisher Transform", "MACD", "RSI"])
     with t1:
-        fig2=go.Figure(); fig2.add_trace(go.Scatter(x=hist.index,y=obv_s,line=dict(color="#58a6ff"),name="OBV"))
-        fig2.update_layout(title="On-Balance Volume",height=280,**PLOTLY_LAYOUT); st.plotly_chart(fig2,use_container_width=True)
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=hist.index, y=obv_s, line=dict(color="#58a6ff"), name="OBV"))
+        fig2.update_layout(title="On-Balance Volume", height=280, **PLOTLY_LAYOUT)
+        st.plotly_chart(fig2, use_container_width=True)
     with t2:
-        fig3=go.Figure(); fig3.add_trace(go.Scatter(x=hist.index,y=fisher,line=dict(color="#e3b341"),name="Fisher"))
-        fig3.add_hline(y=1.5,line_color="#f85149",line_dash="dash"); fig3.add_hline(y=-1.5,line_color="#3fb950",line_dash="dash")
-        fig3.update_layout(title="Ehlers Fisher Transform (10-day)",height=280,**PLOTLY_LAYOUT); st.plotly_chart(fig3,use_container_width=True)
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=hist.index, y=fisher, line=dict(color="#e3b341"), name="Fisher"))
+        fig3.add_hline(y=1.5, line_color="#f85149", line_dash="dash")
+        fig3.add_hline(y=-1.5, line_color="#3fb950", line_dash="dash")
+        fig3.update_layout(title="Ehlers Fisher Transform (10-day)", height=280, **PLOTLY_LAYOUT)
+        st.plotly_chart(fig3, use_container_width=True)
     with t3:
-        fig4=make_subplots(rows=1,cols=1)
-        hc=["#3fb950" if v>=0 else "#f85149" for v in macd_h]
-        fig4.add_trace(go.Bar(x=hist.index,y=macd_h,marker_color=hc,name="Histogram"))
-        fig4.add_trace(go.Scatter(x=hist.index,y=macd,line=dict(color="#58a6ff"),name="MACD"))
-        fig4.add_trace(go.Scatter(x=hist.index,y=sig,line=dict(color="#e3b341",dash="dot"),name="Signal"))
-        fig4.update_layout(title="MACD (12/26/9)",height=280,**PLOTLY_LAYOUT); st.plotly_chart(fig4,use_container_width=True)
+        fig4 = go.Figure()
+        hc = ["#3fb950" if v >= 0 else "#f85149" for v in macd_h]
+        fig4.add_trace(go.Bar(x=hist.index, y=macd_h, marker_color=hc, name="Histogram"))
+        fig4.add_trace(go.Scatter(x=hist.index, y=macd, line=dict(color="#58a6ff"), name="MACD"))
+        fig4.add_trace(go.Scatter(x=hist.index, y=sig, line=dict(color="#e3b341", dash="dot"), name="Signal"))
+        fig4.update_layout(title="MACD (12/26/9)", height=280, **PLOTLY_LAYOUT)
+        st.plotly_chart(fig4, use_container_width=True)
     with t4:
-        rsi_s=calc_rsi(hist["Close"]); fig5=go.Figure()
-        fig5.add_trace(go.Scatter(x=hist.index,y=rsi_s,line=dict(color="#bc8cff"),name="RSI"))
-        fig5.add_hline(y=70,line_color="#f85149",line_dash="dash"); fig5.add_hline(y=30,line_color="#3fb950",line_dash="dash")
-        fig5.update_layout(title="RSI (14)",height=280,**PLOTLY_LAYOUT); st.plotly_chart(fig5,use_container_width=True)
-
+        rsi_s = calc_rsi(hist["Close"])
+        fig5  = go.Figure()
+        fig5.add_trace(go.Scatter(x=hist.index, y=rsi_s, line=dict(color="#bc8cff"), name="RSI"))
+        fig5.add_hline(y=70, line_color="#f85149", line_dash="dash")
+        fig5.add_hline(y=30, line_color="#3fb950", line_dash="dash")
+        fig5.update_layout(title="RSI (14)", height=280, **PLOTLY_LAYOUT)
+        st.plotly_chart(fig5, use_container_width=True)
 
 # ─────────────────────────────────────────────
 # VIEW: COMPARISON
 # ─────────────────────────────────────────────
 elif view == "Comparison Chart":
     st.subheader(f"📊 Normalised Performance — Base 100 from {COMPARISON_START}")
-    all_tickers = list(ACTUAL_HOLDINGS.keys()) + list(WATCHLIST.keys())
+    all_tickers = tuple(list(st.session_state.holdings.keys()) + list(WATCHLIST.keys()))
     normed = fetch_comparison(all_tickers, COMPARISON_START)
     if normed.empty:
         st.warning("No comparison data available."); st.stop()
     colors = {"AKN.AX":"#58a6ff","XST.AX":"#3fb950","G11.AX":"#e3b341","VRC.AX":"#bc8cff","RNX.AX":"#ff7b72"}
-    fig=go.Figure()
+    fig = go.Figure()
     for col in normed.columns:
-        fig.add_trace(go.Scatter(x=normed.index,y=normed[col],name=col,line=dict(color=colors.get(col,"#8b949e"),width=2)))
-    fig.add_hline(y=100,line_color="#30363d",line_dash="dash")
-    fig.update_layout(title=f"Normalised Return since {COMPARISON_START}",yaxis_title="Indexed Return",height=500,**PLOTLY_LAYOUT)
-    st.plotly_chart(fig,use_container_width=True)
-    summary=[{"Ticker":c,"Return since Jan 1 2026":f"{normed[c].dropna().iloc[-1]-100:+.1f}%","Last Index":f"{normed[c].dropna().iloc[-1]:.1f}"} for c in normed.columns if not normed[c].dropna().empty]
-    st.dataframe(pd.DataFrame(summary),use_container_width=True,hide_index=True)
-
+        fig.add_trace(go.Scatter(x=normed.index, y=normed[col], name=col,
+                                 line=dict(color=colors.get(col, "#8b949e"), width=2)))
+    fig.add_hline(y=100, line_color="#30363d", line_dash="dash")
+    fig.update_layout(title=f"Normalised Return since {COMPARISON_START}",
+                      yaxis_title="Indexed Return", height=500, **PLOTLY_LAYOUT)
+    st.plotly_chart(fig, use_container_width=True)
+    summary = [{"Ticker": c, "Return since Jan 1 2026": f"{normed[c].dropna().iloc[-1]-100:+.1f}%",
+                "Last Index": f"{normed[c].dropna().iloc[-1]:.1f}"}
+               for c in normed.columns if not normed[c].dropna().empty]
+    st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────
-# VIEW: CATALYSTS
+# VIEW: CATALYST PIPELINE (AI ON-DEMAND)
 # ─────────────────────────────────────────────
 elif view == "Catalyst Pipeline":
     st.subheader("⚡ Catalyst Pipeline")
-    impact_colors = {"High":"#f85149","Medium":"#e3b341","Low":"#58a6ff"}
-    for cat in CATALYST_PIPELINE:
-        c1,c2,c3,c4 = st.columns([1,1,3,1])
-        c1.markdown(f"**{cat['date']}**")
-        c2.markdown(f"`{cat['ticker']}`")
-        c3.markdown(cat["event"])
-        col = impact_colors.get(cat["impact"],"#8b949e")
-        c4.markdown(pill_html(cat["impact"].upper(), col), unsafe_allow_html=True)
-        st.markdown("<hr style='margin:4px 0;border-color:#21262d;'>", unsafe_allow_html=True)
-    st.info("💡 Update the `CATALYST_PIPELINE` list in `dashboard.py` to add new events.")
+    st.caption("AI-generated via live web search across your portfolio tickers.")
 
+    portfolio_tickers = tuple(st.session_state.holdings.keys())
+
+    if st.session_state.catalyst_generated_at:
+        st.caption(f"Last generated: {st.session_state.catalyst_generated_at}")
+
+    if st.button("🔍 Generate / Refresh Catalyst Pipeline", type="primary"):
+        with st.spinner("🔍 Searching ASX announcements and upcoming catalysts..."):
+            catalysts, err = get_ai_catalysts(portfolio_tickers)
+            st.session_state.catalyst_data         = catalysts
+            st.session_state.catalyst_error        = err
+            st.session_state.catalyst_generated_at = datetime.now().strftime("%d %b %Y %H:%M AEST")
+            get_ai_catalysts.clear()
+
+    st.markdown("---")
+
+    if st.session_state.catalyst_error:
+        st.error(f"Could not load catalysts: {st.session_state.catalyst_error}")
+    elif st.session_state.catalyst_data:
+        catalysts     = st.session_state.catalyst_data
+        impact_colors = {"High": "#f85149", "Medium": "#e3b341", "Low": "#58a6ff"}
+
+        high_count   = sum(1 for c in catalysts if c.get("impact") == "High")
+        medium_count = sum(1 for c in catalysts if c.get("impact") == "Medium")
+        low_count    = sum(1 for c in catalysts if c.get("impact") == "Low")
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Total Events",   len(catalysts))
+        cc2.metric("🔴 High Impact", high_count)
+        cc3.metric("🟡 Medium",      medium_count)
+        cc4.metric("🔵 Low",         low_count)
+        st.markdown("---")
+
+        for cat in catalysts:
+            impact = cat.get("impact", "Medium")
+            ticker = cat.get("ticker", "")
+            col    = impact_colors.get(impact, "#8b949e")
+            source = cat.get("source", "")
+            c1, c2, c3, c4, c5 = st.columns([1.2, 1, 3.5, 1, 1.2])
+            c1.markdown(f"**{cat.get('date', '—')}**")
+            c2.markdown(pill_html(ticker, "#58a6ff"), unsafe_allow_html=True)
+            c3.markdown(cat.get("event", ""))
+            c4.markdown(pill_html(impact.upper(), col), unsafe_allow_html=True)
+            c5.markdown(f"<span style='color:#8b949e;font-size:11px;'>{source}</span>",
+                        unsafe_allow_html=True)
+            st.markdown("<hr style='margin:4px 0;border-color:#21262d;'>", unsafe_allow_html=True)
+
+        st.caption("⚠️ AI-generated from public sources. Verify against official ASX announcements before making investment decisions.")
+    else:
+        st.info("👆 Click **Generate / Refresh Catalyst Pipeline** above to search for upcoming catalysts and ASX announcements across your holdings.")
 
 # ─────────────────────────────────────────────
 # FOOTER
