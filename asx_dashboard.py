@@ -607,7 +607,7 @@ if view == "Portfolio Overview":
             if st.button(f"Generate Analysis for {ticker}", key=f"btn_{ticker}"):
                 with st.spinner(f"Searching market data and analysing {ticker}…"):
                     rec, err = get_ai_recommendation(
-                        ticker, meta["name"], price, sig_label, sig_score, indicators
+                       ticker, name, price, sig_label, sig_score, indicators
                     )
                 if err:
                     st.error(err)
