@@ -377,11 +377,9 @@ Respond ONLY with a valid JSON array — no markdown fences, no preamble, no exp
 Include 3-6 events per ticker where data is available. Order by date ascending."""
 
     try:
-        # Pass Google Search grounding as a tool at generation time
-        from google.generativeai import types
         response = model.generate_content(
             prompt,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+            tools=[{"google_search": {}}],
         )
         raw     = response.text
         cleaned = raw.replace("```json", "").replace("```", "").strip()
