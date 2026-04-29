@@ -14,7 +14,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, date
 import anthropic
-import google.generativeai as genai
 import json
 import urllib.parse
 import warnings
@@ -152,14 +151,6 @@ init_holdings()
 # ─────────────────────────────────────────────
 # ANTHROPIC CLIENT
 # ─────────────────────────────────────────────
-@st.cache_resource
-def get_gemini_client():
-    try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel(model_name="gemini-2.0-flash")
-    except Exception as e:
-        return None
 
 
     try:
@@ -336,20 +327,18 @@ Respond ONLY with a valid JSON object — no markdown fences, no preamble:
         return None, f"API error: {str(e)}"
 
 # ─────────────────────────────────────────────
-# AI CATALYST PIPELINE (GEMINI 2.0 FLASH)
+# AI CATALYST PIPELINE (CLAUDE + WEB SEARCH)
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=7200, show_spinner=False)
 def get_ai_catalysts(tickers_tuple):
-    model = get_gemini_client()
-    if not model:
-        # Diagnostic — check what secrets are available
-        available = list(st.secrets.keys()) if hasattr(st, "secrets") else []
-        return None, f"Gemini client could not be initialised. Keys found in secrets: {available}"
+    client = get_anthropic_client()
+    if not client:
+        return None, "ANTHROPIC_API_KEY not configured."
 
     tickers    = list(tickers_tuple)
     ticker_str = ", ".join(tickers)
 
-    prompt = f"""You are an ASX equities analyst. Search the web and find upcoming catalysts, 
+    prompt = f"""You are an ASX equities analyst. Search the web and find upcoming catalysts,
 announcements, and key events for these ASX-listed stocks: {ticker_str}.
 
 Find:
@@ -360,7 +349,7 @@ Find:
 
 Today's date is {date.today().strftime("%d %B %Y")}.
 
-Respond ONLY with a valid JSON array — no markdown fences, no preamble, no explanation:
+Respond ONLY with a valid JSON array — no markdown fences, no preamble:
 [
   {{
     "date": "Month Year or specific date if known",
@@ -374,20 +363,21 @@ Respond ONLY with a valid JSON array — no markdown fences, no preamble, no exp
 Include 3-6 events per ticker where data is available. Order by date ascending."""
 
     try:
-        from google.generativeai import protos
-        response = model.generate_content(
-            prompt,
-            tools=[protos.Tool(google_search=protos.GoogleSearch())],
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
         )
-        raw     = response.text
+        raw     = "".join(b.text for b in response.content if hasattr(b, "text"))
         cleaned = raw.replace("```json", "").replace("```", "").strip()
         start   = cleaned.find("[")
         end     = cleaned.rfind("]") + 1
         if start == -1 or end == 0:
-            return None, "Could not parse Gemini response."
+            return None, "Could not parse response."
         return json.loads(cleaned[start:end]), None
     except Exception as e:
-        return None, f"Gemini API error: {str(e)}"
+        return None, f"API error: {str(e)}"
 
 # ─────────────────────────────────────────────
 # HELPERS
