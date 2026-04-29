@@ -360,7 +360,7 @@ Respond ONLY with a valid JSON array — no markdown fences, no preamble:
 Include 3-6 events per ticker. Order by date ascending."""
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=2000,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
