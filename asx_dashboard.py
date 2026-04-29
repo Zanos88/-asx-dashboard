@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, date
 import anthropic
 import json
+import urllib.parse
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -112,8 +113,54 @@ PLOTLY_LAYOUT = dict(
 )
 
 # ─────────────────────────────────────────────
-# ANTHROPIC CLIENT
+# URL PARAMETER HELPERS
 # ─────────────────────────────────────────────
+def encode_holdings(holdings: dict) -> str:
+    """Encode holdings dict to a compact URL-safe string."""
+    payload = {t: {"s": h["shares"], "e": h["avg_entry"], "n": h["name"]}
+               for t, h in holdings.items()}
+    return urllib.parse.quote(json.dumps(payload, separators=(",", ":")))
+
+def decode_holdings(encoded: str) -> dict:
+    """Decode URL parameter back to holdings dict."""
+    try:
+        payload = json.loads(urllib.parse.unquote(encoded))
+        return {t: {"shares": v["s"], "avg_entry": v["e"], "name": v.get("n", t)}
+                for t, v in payload.items()}
+    except:
+        return {}
+
+def build_share_url(holdings: dict) -> str:
+    encoded = encode_holdings(holdings)
+    try:
+        base = st.query_params.get("_stcore_query_param_base", "")
+    except:
+        base = ""
+    return f"?portfolio={encoded}"
+
+# ─────────────────────────────────────────────
+# INITIALISE SESSION STATE FROM URL OR DEFAULTS
+# ─────────────────────────────────────────────
+def init_holdings():
+    """Load holdings from URL param if present, else use defaults."""
+    if "holdings" not in st.session_state:
+        url_param = st.query_params.get("portfolio", "")
+        if url_param:
+            decoded = decode_holdings(url_param)
+            if decoded:
+                st.session_state.holdings = decoded
+                return
+        # Default
+        st.session_state.holdings = {
+            t: {"shares": m["shares"], "avg_entry": m["avg_entry"], "name": m["name"]}
+            for t, m in ACTUAL_HOLDINGS.items()
+        }
+    if "pending_holdings" not in st.session_state:
+        st.session_state.pending_holdings = dict(st.session_state.holdings)
+    if "new_ticker" not in st.session_state:
+        st.session_state.new_ticker = ""
+
+init_holdings()
 @st.cache_resource
 def get_anthropic_client():
     try:
@@ -409,16 +456,15 @@ if view == "Portfolio Overview":
 
     total_value, total_cost = 0, 0
 
-    for ticker, meta in ACTUAL_HOLDINGS.items():
+    for ticker, holding in st.session_state.holdings.items():
         hist, info = fetch_ticker(ticker)
         if hist.empty:
-            st.warning(f"Could not load data for {ticker}")
+            st.warning(f"Could not load data for {ticker}. Click 'Refresh Market Data' to retry.")
             continue
 
-        # Use session state values if available
-        live = st.session_state.get("holdings", {}).get(ticker, meta)
-        shares    = live["shares"]
-        avg_entry = live["avg_entry"]
+        shares    = holding["shares"]
+        avg_entry = holding["avg_entry"]
+        name      = holding.get("name", ticker)
 
         price   = hist["Close"].iloc[-1]
         prev    = hist["Close"].iloc[-2] if len(hist) > 1 else price
@@ -442,7 +488,7 @@ if view == "Portfolio Overview":
               <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
                 <div>
                   <span style="color:#58a6ff;font-weight:700;font-size:20px;">{ticker}</span>
-                  <span style="color:#8b949e;font-size:14px;margin-left:10px;">{meta['name']}</span>
+                  <span style="color:#8b949e;font-size:14px;margin-left:10px;">{name}</span>
                 </div>
                 {signal_badge_html(sig_label)}
               </div>
