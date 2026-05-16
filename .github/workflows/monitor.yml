@@ -22,17 +22,20 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests tenacity
+        run: pip install -r requirements.txt
 
       - name: Run holder monitor and sentiment digest
         env:
-          HELIUS_API_KEY:     ${{ secrets.HELIUS_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          XAI_API_KEY:        ${{ secrets.XAI_API_KEY }}
-          MOVE_THRESHOLD_PCT: "1.0"
+          HELIUS_API_KEY:             ${{ secrets.HELIUS_API_KEY }}
+          TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:           ${{ secrets.TELEGRAM_CHAT_ID }}
+          XAI_API_KEY:                ${{ secrets.XAI_API_KEY }}
+          ANTHROPIC_API_KEY:          ${{ secrets.ANTHROPIC_API_KEY }}
+          SUPABASE_URL:               ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY:  ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MOVE_THRESHOLD_PCT:         "0.1"
           # Set SKIP_SENTIMENT=1 on frequent runs to avoid excess Grok API calls
-          SKIP_SENTIMENT:     "0"
+          SKIP_SENTIMENT:             "0"
         run: python monitor.py
 
       - name: Commit updated snapshots
