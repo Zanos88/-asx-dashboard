@@ -6,42 +6,28 @@ Run standalone or via GitHub Actions cron job (see .github/workflows/monitor.yml
 What it does each run:
   1. Tests the Supabase connection and logs the result.
   2. Fetches top-20 holders for every tracked token via Helius RPC.
-  3. Diffs against the previous snapshot (local JSON kept in git).
-  4. Writes the current snapshot to Supabase ``wallet_snapshots`` table.
-  5. Writes each detected change to Supabase ``whale_alerts`` table.
-  6. Sends a Telegram alert for any significant change (NEW / EXIT / MOVE).
-  7. Saves updated local JSON snapshots so GitHub Actions can commit them back.
+  3. Fetches live price context from DexScreener.
+  4. Diffs against the previous snapshot (local JSON kept in git).
+  5. Writes the current snapshot to Supabase ``wallet_snapshots`` table.
+  6. For each significant change:
+       - Determines severity tier (CRITICAL / SIGNIFICANT / NOTABLE).
+       - Looks up wallet age from Supabase ``wallet_metadata``.
+       - Generates a one-line Claude AI interpretation.
+       - Sends a quant-style Telegram alert with inline keyboard buttons.
+       - Writes to Supabase ``whale_alerts`` and ``wallet_flow_changes``.
+  7. Sends an hourly net-flow digest after processing all changes.
+  8. Saves updated local JSON snapshots so GitHub Actions can commit them back.
 
 Environment variables:
-    HELIUS_API_KEY        Helius RPC API key
-    TELEGRAM_BOT_TOKEN    Telegram bot token from @BotFather
-    TELEGRAM_CHAT_ID      Target chat or channel ID
-    SUPABASE_URL          Supabase project URL (https://xxx.supabase.co)
-    SUPABASE_SERVICE_KEY  Supabase service-role key (bypasses RLS)
+    HELIUS_API_KEY            Helius RPC API key
+    TELEGRAM_BOT_TOKEN        Telegram bot token from @BotFather
+    TELEGRAM_CHAT_ID          Target chat or channel ID
+    SUPABASE_URL              Supabase project URL (https://xxx.supabase.co)
+    SUPABASE_SERVICE_KEY      Supabase service-role key (bypasses RLS)
+    ANTHROPIC_API_KEY         Anthropic API key for AI interpretation
     MOVE_THRESHOLD_PCT        % supply change to trigger an alert (default from config.json)
     MIN_HOLDER_CHANGE_TOKENS  raw token amount change to trigger an alert (default from config.json)
-    SKIP_SENTIMENT            Legacy flag — ignored (sentiment not active)
-
-Supabase table schemas expected:
-
-    wallet_snapshots
-        id            bigint (auto)
-        symbol        text
-        captured_at   timestamptz
-        holders       jsonb
-        holder_count  int
-        top10_pct     float8
-
-    whale_alerts
-        id            bigint (auto)
-        symbol        text
-        change_type   text          -- NEW | EXIT | MOVE
-        wallet_address text
-        old_pct       float8        -- nullable
-        new_pct       float8        -- nullable
-        delta_pct     float8
-        alerted_at    timestamptz
-        telegram_sent bool
+    SKIP_SENTIMENT            Legacy flag — ignored
 """
 
 from __future__ import annotations
@@ -49,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -75,6 +62,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_KEY", "")
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -98,36 +86,36 @@ MIN_HOLDER_CHANGE_TOKENS = float(
     os.environ.get("MIN_HOLDER_CHANGE_TOKENS", str(_cfg.get("min_holder_change_tokens", 1000)))
 )
 
-# Token registry: symbol → mint address (sourced from config.json)
+# Token registry sourced from config.json, with ALON as fallback
 TOKENS: dict[str, str] = {
     sym: info["address"]
     for sym, info in _cfg.get("solana_tokens", {}).items()
 } or {"ALON": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS"}
 
+# Alert rate limiting constants
+RATE_LIMIT_SECS    = 300   # 5 min per wallet
+MAX_ALERTS_PER_RUN = 20    # hard cap per cron run
+
+# ── Module-level run state ────────────────────────────────────────────────────
+_ai_cache: dict[str, tuple[str, float]] = {}   # cache_key → (text, unix_ts)
+_alert_timestamps: dict[str, float] = {}        # address → last alert unix ts
+_hourly_alert_count: int = 0
+_hourly_flows: list[dict[str, Any]] = []        # accumulated for end-of-run digest
+
 
 # ── Supabase client ───────────────────────────────────────────────────────────
 
 def init_supabase() -> Client | None:
-    """
-    Initialise and test the Supabase client.
-
-    Logs a clear success or failure message so the GitHub Actions log
-    shows immediately whether the connection is working.
-
-    Returns:
-        Authenticated ``supabase.Client`` on success, or ``None`` if
-        ``SUPABASE_URL`` / ``SUPABASE_KEY`` are not set or the connection fails.
-    """
+    """Initialise and test the Supabase client, logging success or failure."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         log.error(
-            "Supabase not configured — SUPABASE_URL and SUPABASE_KEY must be set. "
+            "Supabase not configured — SUPABASE_URL and SUPABASE_SERVICE_KEY must be set. "
             "Snapshots will be written to local JSON only."
         )
         return None
 
     try:
         client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Lightweight connectivity test: read one row from wallet_snapshots.
         client.table("wallet_snapshots").select("id").limit(1).execute()
         log.info("✅ Supabase connection OK — %s", SUPABASE_URL)
         return client
@@ -146,17 +134,7 @@ def write_snapshot_to_supabase(
     token_address: str,
     holders: list[dict[str, Any]],
 ) -> None:
-    """
-    Insert one row per holder into ``wallet_snapshots``.
-
-    Schema requires token_address, token_symbol, and wallet_address (all NOT NULL),
-    so we insert N rows — one per holder — rather than a single aggregate row.
-
-    Args:
-        symbol:        Token symbol (e.g. "ALON").
-        token_address: Solana mint address.
-        holders:       Holder list from ``fetch_holders()``.
-    """
+    """Insert one row per holder into wallet_snapshots."""
     if _supabase is None:
         return
 
@@ -194,21 +172,12 @@ def write_alert_to_supabase(
     change: dict[str, Any],
     telegram_sent: bool,
 ) -> None:
-    """
-    Insert a holder change event into ``whale_alerts`` and ``wallet_flow_changes``.
-
-    Args:
-        symbol:        Token symbol.
-        token_address: Solana mint address.
-        change:        Single change dict from ``compare_holders()``.
-        telegram_sent: Whether the Telegram alert was delivered successfully.
-    """
+    """Insert a holder change event into whale_alerts and wallet_flow_changes."""
     if _supabase is None:
         return
 
     now = datetime.now(timezone.utc).isoformat()
 
-    # ── whale_alerts ──────────────────────────────────────────────────────────
     alert_row = {
         "token_address":  token_address,
         "token_symbol":   symbol,
@@ -218,7 +187,7 @@ def write_alert_to_supabase(
         "old_pct":        change.get("old_pct"),
         "new_pct":        change.get("new_pct"),
         "delta_pct":      round(change["delta"], 6),
-        "token_delta":    change.get("token_delta"),
+        "token_delta":    change.get("tokens_delta") or change.get("token_delta"),
         "trigger":        change.get("trigger", "pct"),
         "alerted_at":     now,
         "telegram_sent":  telegram_sent,
@@ -230,38 +199,62 @@ def write_alert_to_supabase(
             symbol, change["type"], change["address"][:8],
         )
     except Exception as exc:
-        log.error(
-            "  ❌ Failed to write to whale_alerts for %s %s: %s",
-            symbol, change["address"][:8], exc,
-        )
+        log.error("  ❌ whale_alerts insert failed for %s %s: %s", symbol, change["address"][:8], exc)
 
-    # ── wallet_flow_changes (MOVE events only) ────────────────────────────────
-    if change["type"] == "MOVE":
-        token_delta = change.get("token_delta", 0) or 0
-        delta       = change.get("delta", 0)
-        flow_row = {
-            "token_address":  token_address,
-            "token_symbol":   symbol,
-            "symbol":         symbol,
-            "wallet_address": change["address"],
-            "prev_balance":   None,
-            "new_balance":    None,
-            "change_amount":  token_delta,
-            "change_pct":     round(delta, 6),
-            "flow_type":      "buy" if delta > 0 else "sell",
-            "detected_at":    now,
-        }
-        try:
-            _supabase.table("wallet_flow_changes").insert(flow_row).execute()
-            log.info(
-                "  ✅ Flow written to wallet_flow_changes (%s %s %s)",
-                symbol, flow_row["flow_type"], change["address"][:8],
-            )
-        except Exception as exc:
-            log.error(
-                "  ❌ Failed to write to wallet_flow_changes for %s %s: %s",
-                symbol, change["address"][:8], exc,
-            )
+    token_delta = change.get("tokens_delta") or change.get("token_delta") or 0
+    delta       = change.get("delta", 0)
+    flow_type   = (
+        "entry"         if change["type"] == "NEW"
+        else "exit"     if change["type"] == "EXIT"
+        else "buy"      if delta > 0
+        else "sell"
+    )
+    flow_row = {
+        "token_address":  token_address,
+        "token_symbol":   symbol,
+        "symbol":         symbol,
+        "wallet_address": change["address"],
+        "prev_balance":   change.get("old_tokens"),
+        "new_balance":    change.get("new_tokens"),
+        "change_amount":  token_delta if delta >= 0 else -token_delta,
+        "change_pct":     round(delta, 6),
+        "flow_type":      flow_type,
+        "detected_at":    now,
+    }
+    try:
+        _supabase.table("wallet_flow_changes").insert(flow_row).execute()
+        log.info(
+            "  ✅ Flow written to wallet_flow_changes (%s %s %s)",
+            symbol, flow_type, change["address"][:8],
+        )
+    except Exception as exc:
+        log.error("  ❌ wallet_flow_changes insert failed for %s %s: %s", symbol, change["address"][:8], exc)
+
+
+def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any]:
+    """Return first_seen age for a wallet; inserts a new row in wallet_metadata if unseen."""
+    default = {"age_days": None, "is_new_wallet": False}
+    if _supabase is None:
+        return default
+    try:
+        result = _supabase.table("wallet_metadata").select("first_seen").eq("address", address).execute()
+        now = datetime.now(timezone.utc)
+        if result.data:
+            fs_str    = result.data[0]["first_seen"]
+            first_seen = datetime.fromisoformat(fs_str.replace("Z", "+00:00"))
+            age_days   = (now - first_seen).days
+            return {"age_days": age_days, "is_new_wallet": age_days < 1}
+        else:
+            _supabase.table("wallet_metadata").insert({
+                "address":         address,
+                "symbol":          symbol,
+                "first_seen":      now.isoformat(),
+                "first_seen_rank": rank,
+            }).execute()
+            return {"age_days": 0, "is_new_wallet": True}
+    except Exception as exc:
+        log.warning("wallet_metadata lookup failed for %s: %s", address[:8], exc)
+        return default
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -273,26 +266,24 @@ def write_alert_to_supabase(
     before_sleep=before_sleep_log(log, logging.WARNING),
     reraise=False,
 )
-def send_telegram(msg: str) -> tuple[bool, str]:
-    """
-    Send an HTML-formatted message to Telegram via the Bot API.
-
-    Retries up to 3 times with exponential backoff on network errors.
-    Returns (False, reason) rather than raising on persistent failure.
-
-    Args:
-        msg: HTML-formatted message body (Telegram HTML subset).
-
-    Returns:
-        Tuple of (success: bool, error_description: str).
-    """
+def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Send an HTML-formatted message to Telegram, optionally with inline keyboard buttons."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
         return False, "not_configured"
 
+    payload: dict[str, Any] = {
+        "chat_id":                  TELEGRAM_CHAT_ID,
+        "text":                     msg,
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     resp = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+        json=payload,
         timeout=10,
     )
     try:
@@ -302,6 +293,106 @@ def send_telegram(msg: str) -> tuple[bool, str]:
         return False, str(exc)
 
     return True, ""
+
+
+def make_inline_keyboard(wallet_address: str, token_address: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [[
+            {"text": "📊 DexScreener", "url": f"https://dexscreener.com/solana/{token_address}"},
+            {"text": "🔍 Solscan",     "url": f"https://solscan.io/account/{wallet_address}"},
+            {"text": "🫧 Bubblemaps",  "url": f"https://app.bubblemaps.io/sol/token/{token_address}"},
+        ]]
+    }
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+def is_rate_limited(address: str) -> bool:
+    global _hourly_alert_count
+    if _hourly_alert_count >= MAX_ALERTS_PER_RUN:
+        return True
+    last_ts = _alert_timestamps.get(address, 0.0)
+    return (time.time() - last_ts) < RATE_LIMIT_SECS
+
+
+def record_alert_sent(address: str) -> None:
+    global _hourly_alert_count
+    _alert_timestamps[address] = time.time()
+    _hourly_alert_count += 1
+
+
+# ── Severity ──────────────────────────────────────────────────────────────────
+
+def get_severity(change: dict[str, Any]) -> tuple[str, str]:
+    abs_delta = abs(change["delta"])
+    if change["type"] in ("NEW", "EXIT") or abs_delta >= 1.0:
+        return "CRITICAL", "🔴"
+    elif abs_delta >= 0.5:
+        return "SIGNIFICANT", "🟡"
+    return "NOTABLE", "🟢"
+
+
+# ── DexScreener price ─────────────────────────────────────────────────────────
+
+def fetch_price_context(token_address: str) -> dict[str, Any]:
+    try:
+        resp = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        pairs = resp.json().get("pairs") or []
+        if not pairs:
+            return {}
+        best = max(
+            pairs,
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+        )
+        return {
+            "price":     float(best.get("priceUsd") or 0),
+            "change_1h": float((best.get("priceChange") or {}).get("h1") or 0),
+        }
+    except Exception as exc:
+        log.warning("DexScreener fetch failed: %s", exc)
+        return {}
+
+
+# ── AI interpretation ─────────────────────────────────────────────────────────
+
+def get_ai_interpretation(
+    symbol: str,
+    severity: str,
+    change_type: str,
+    delta: float,
+    rank: int,
+) -> str:
+    cache_key = f"{symbol}:{severity}:{change_type}:{delta:.1f}:{rank}"
+    cached = _ai_cache.get(cache_key)
+    if cached and (time.time() - cached[1]) < 300:
+        return cached[0]
+
+    if not ANTHROPIC_API_KEY:
+        return ""
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = (
+            f"Give a single concise sentence of quant interpretation for this on-chain event: "
+            f"{symbol} #{rank} holder {change_type} with {delta:+.2f}% supply change "
+            f"(severity: {severity}). Focus on market implications for traders."
+        )
+        msg = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=80,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        interp = msg.content[0].text.strip()
+        _ai_cache[cache_key] = (interp, time.time())
+        return interp
+    except Exception as exc:
+        log.warning("AI interpretation failed: %s", exc)
+        return ""
 
 
 # ── Helius RPC ────────────────────────────────────────────────────────────────
@@ -314,21 +405,7 @@ def send_telegram(msg: str) -> tuple[bool, str]:
     reraise=True,
 )
 def fetch_holders(token_address: str) -> list[dict[str, Any]]:
-    """
-    Fetch the top-20 token holders via the Helius ``getTokenLargestAccounts`` RPC method.
-
-    Args:
-        token_address: Solana token mint address.
-
-    Returns:
-        List of holder dicts with ``address``, ``amount``, ``uiAmount`` keys.
-
-    Raises:
-        requests.Timeout:         If the request times out after all retries.
-        requests.ConnectionError: If the host is unreachable after all retries.
-        requests.HTTPError:       If the API returns a non-2xx status code.
-        ValueError:               If ``HELIUS_API_KEY`` is not set.
-    """
+    """Fetch the top-20 token holders via Helius getTokenLargestAccounts."""
     if not HELIUS_API_KEY:
         raise ValueError("HELIUS_API_KEY is not set")
 
@@ -351,11 +428,8 @@ def fetch_holders(token_address: str) -> list[dict[str, Any]]:
 
 
 # ── Local JSON snapshot helpers ───────────────────────────────────────────────
-# Local snapshots are kept in git (committed by GitHub Actions) so the diff
-# mechanism works across runs even if Supabase is not yet queried for history.
 
 def load_snapshot(symbol: str) -> dict[str, Any] | None:
-    """Load the most recent local holder snapshot for diff comparison."""
     path = os.path.join(SNAPSHOT_DIR, f"{symbol}_holders.json")
     if not os.path.exists(path):
         return None
@@ -368,7 +442,6 @@ def load_snapshot(symbol: str) -> dict[str, Any] | None:
 
 
 def save_snapshot(symbol: str, holders: list[dict[str, Any]]) -> None:
-    """Persist the current holder list to the local JSON snapshot file."""
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     path = os.path.join(SNAPSHOT_DIR, f"{symbol}_holders.json")
     try:
@@ -385,7 +458,6 @@ def save_snapshot(symbol: str, holders: list[dict[str, Any]]) -> None:
 # ── Holder comparison ─────────────────────────────────────────────────────────
 
 def get_amount(holder: dict[str, Any]) -> float:
-    """Return the decimal-adjusted token amount from a holder dict."""
     ui = holder.get("uiAmount")
     return float(ui) if ui is not None else float(holder.get("amount", 0))
 
@@ -397,33 +469,54 @@ def compare_holders(
     """
     Diff two holder lists and return significant changes.
 
-    Change types:
-        NEW   — wallet entered the top-20.
-        EXIT  — wallet left the top-20.
-        MOVE  — existing wallet changed supply % by ≥ ``MOVE_THRESHOLD_PCT``.
-
-    Returns:
-        List of change dicts with keys:
-        ``type``, ``address``, ``old_pct``, ``new_pct``, ``delta``.
+    Each change dict includes: type, address, old_pct, new_pct, delta,
+    old_rank, new_rank, tokens_delta, old_tokens, new_tokens, trigger.
     """
     old_map   = {h["address"]: h for h in old_holders}
     new_map   = {h["address"]: h for h in new_holders}
     old_total = sum(get_amount(h) for h in old_holders) or 1.0
     new_total = sum(get_amount(h) for h in new_holders) or 1.0
 
+    old_rank_map = {h["address"]: i + 1 for i, h in enumerate(old_holders)}
+    new_rank_map = {h["address"]: i + 1 for i, h in enumerate(new_holders)}
+
     changes: list[dict[str, Any]] = []
 
     for addr, h in new_map.items():
         if addr not in old_map:
-            pct = get_amount(h) / new_total * 100
-            changes.append({"type": "NEW",  "address": addr,
-                            "old_pct": None, "new_pct": pct,  "delta": pct})
+            tokens = get_amount(h)
+            pct    = tokens / new_total * 100
+            changes.append({
+                "type":         "NEW",
+                "address":      addr,
+                "old_pct":      None,
+                "new_pct":      pct,
+                "delta":        pct,
+                "old_rank":     None,
+                "new_rank":     new_rank_map.get(addr),
+                "tokens_delta": tokens,
+                "old_tokens":   0.0,
+                "new_tokens":   tokens,
+                "trigger":      "entry",
+            })
 
     for addr, h in old_map.items():
         if addr not in new_map:
-            pct = get_amount(h) / old_total * 100
-            changes.append({"type": "EXIT", "address": addr,
-                            "old_pct": pct,  "new_pct": None, "delta": -pct})
+            tokens = get_amount(h)
+            pct    = tokens / old_total * 100
+            changes.append({
+                "type":         "EXIT",
+                "address":      addr,
+                "old_pct":      pct,
+                "new_pct":      None,
+                "delta":        -pct,
+                "old_rank":     old_rank_map.get(addr),
+                "new_rank":     None,
+                "tokens_delta": tokens,
+                "old_tokens":   tokens,
+                "new_tokens":   0.0,
+                "trigger":      "exit",
+            })
 
     for addr in set(old_map) & set(new_map):
         old_amt = get_amount(old_map[addr])
@@ -438,79 +531,210 @@ def compare_holders(
 
         if pct_triggered or token_triggered:
             changes.append({
-                "type":          "MOVE",
-                "address":       addr,
-                "old_pct":       old_pct,
-                "new_pct":       new_pct,
-                "delta":         delta,
-                "token_delta":   token_delta,
-                "trigger":       "pct+tokens" if (pct_triggered and token_triggered)
-                                 else ("pct" if pct_triggered else "tokens"),
+                "type":         "MOVE",
+                "address":      addr,
+                "old_pct":      old_pct,
+                "new_pct":      new_pct,
+                "delta":        delta,
+                "old_rank":     old_rank_map.get(addr),
+                "new_rank":     new_rank_map.get(addr),
+                "tokens_delta": token_delta,
+                "old_tokens":   old_amt,
+                "new_tokens":   new_amt,
+                "trigger":      "pct+tokens" if (pct_triggered and token_triggered)
+                                else ("pct" if pct_triggered else "tokens"),
             })
 
     return changes
 
 
-def format_holder_alert(
+# ── Alert formatting ──────────────────────────────────────────────────────────
+
+def format_quant_alert(
     symbol: str,
-    changes: list[dict[str, Any]],
-    snapshot_ts: str,
+    token_address: str,
+    change: dict[str, Any],
+    price_ctx: dict[str, Any],
+    wallet_info: dict[str, Any],
+    ai_interp: str,
 ) -> str:
-    """Build an HTML-formatted Telegram message summarising holder changes."""
-    lines = [
-        f"🚨 <b>Holder Alert — {symbol}</b>",
-        f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        f"vs snapshot: {snapshot_ts[:16].replace('T', ' ')} UTC\n",
-    ]
-    for c in changes:
-        addr = f"{c['address'][:6]}...{c['address'][-4:]}"
-        if c["type"] == "NEW":
-            lines.append(
-                f"🆕 <b>NEW</b> wallet entered top 20\n"
-                f"   <code>{addr}</code> → {c['new_pct']:.2f}%"
-            )
-        elif c["type"] == "EXIT":
-            lines.append(
-                f"🚪 <b>EXIT</b> wallet left top 20\n"
-                f"   <code>{addr}</code> was {c['old_pct']:.2f}%"
-            )
+    addr         = change["address"]
+    short_addr   = f"{addr[:6]}...{addr[-4:]}"
+    new_rank     = change.get("new_rank")
+    old_rank     = change.get("old_rank")
+    change_type  = change["type"]
+    delta        = change["delta"]
+    tokens_delta = change.get("tokens_delta", 0.0)
+    severity_name, severity_icon = get_severity(change)
+
+    # ── Alert label ───────────────────────────────────────────────────────────
+    if change_type == "NEW" and (change.get("new_pct") or 0) >= 0.5:
+        label = "🆕 NEW WHALE ENTRY"
+    elif change_type == "EXIT" and (change.get("old_pct") or 0) >= 1.0:
+        label = f"🚪 MAJOR EXIT — former #{old_rank} holder"
+    elif change_type == "NEW":
+        label = "NEW ENTRY"
+    elif change_type == "EXIT":
+        label = "EXIT"
+    else:
+        label = (
+            "CRITICAL MOVE"     if severity_name == "CRITICAL"
+            else "SIGNIFICANT MOVE" if severity_name == "SIGNIFICANT"
+            else "NOTABLE MOVE"
+        )
+
+    # ── Rank line ─────────────────────────────────────────────────────────────
+    if new_rank and old_rank:
+        if new_rank < old_rank:
+            rank_str = f"#{new_rank} Holder (↑ from #{old_rank})"
+        elif new_rank > old_rank:
+            rank_str = f"#{new_rank} Holder (↓ from #{old_rank})"
         else:
-            arrow   = "📈" if c["delta"] > 0 else "📉"
-            trigger = c.get("trigger", "pct")
-            tok_str = (
-                f"  {c['token_delta']:,.0f} tokens" if "token" in trigger else ""
-            )
-            lines.append(
-                f"{arrow} <b>MOVE</b>  <code>{addr}</code>\n"
-                f"   {c['old_pct']:.2f}% → {c['new_pct']:.2f}% ({c['delta']:+.2f}%){tok_str}"
-            )
+            rank_str = f"#{new_rank} Holder"
+    elif new_rank:
+        rank_str = f"#{new_rank} Holder (NEW)"
+    elif old_rank:
+        rank_str = f"Former #{old_rank} Holder (EXITED)"
+    else:
+        rank_str = "Unknown Rank"
+
+    # ── Supply line ───────────────────────────────────────────────────────────
+    if change_type == "NEW":
+        supply_str = f"0% → {change['new_pct']:.2f}% (+{change['new_pct']:.2f}%)"
+        sign = "+"
+    elif change_type == "EXIT":
+        supply_str = f"{change['old_pct']:.2f}% → 0% (-{change['old_pct']:.2f}%)"
+        sign = "-"
+    else:
+        sign = "+" if delta > 0 else ""
+        supply_str = f"{change['old_pct']:.2f}% → {change['new_pct']:.2f}% ({sign}{delta:.2f}%)"
+        sign = "+" if delta > 0 else ""
+
+    # ── Token / USD line ──────────────────────────────────────────────────────
+    price   = price_ctx.get("price") or 0.0
+    usd_val = tokens_delta * price
+    usd_str = f"~${usd_val:,.0f} USD" if usd_val >= 1 else f"~${usd_val:.4f} USD"
+    tokens_str = f"{sign}{tokens_delta:,.0f} ({usd_str})"
+
+    # ── Price line ────────────────────────────────────────────────────────────
+    if price:
+        price_str  = f"${price:.6f}".rstrip("0").rstrip(".")
+        change_1h  = price_ctx.get("change_1h")
+        price_line = f"{price_str} (1h: {change_1h:+.1f}%)" if change_1h is not None else price_str
+    else:
+        price_line = "N/A"
+
+    # ── Wallet age ────────────────────────────────────────────────────────────
+    age_days      = wallet_info.get("age_days")
+    is_new_wallet = wallet_info.get("is_new_wallet", False)
+    if age_days is None:
+        age_str = "Unknown"
+    elif is_new_wallet:
+        age_str = "🚨 NEW WALLET (< 24h)"
+    else:
+        age_str = f"{age_days} day{'s' if age_days != 1 else ''}"
+
+    new_wallet_flag = " 🚨" if is_new_wallet and change_type == "NEW" else ""
+
+    # ── Links ─────────────────────────────────────────────────────────────────
+    solscan_url    = f"https://solscan.io/account/{addr}"
+    dex_url        = f"https://dexscreener.com/solana/{token_address}"
+    bubblemaps_url = f"https://app.bubblemaps.io/sol/token/{token_address}"
+
+    lines = [
+        f"{severity_icon} <b>{symbol} — {label}</b>{new_wallet_flag}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Rank: {rank_str}",
+        f"🏦 Wallet: <code>{short_addr}</code>  |  Age: {age_str}",
+        f"📈 Supply: {supply_str}",
+        f"💰 Tokens: {tokens_str}",
+        f"💵 Price: {price_line}",
+        f"⏰ Time: {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if ai_interp:
+        lines.append(f"🤖 <i>Analysis: {ai_interp}</i>")
+
+    lines.append(
+        f'🔗 <a href="{solscan_url}">Solscan</a> | '
+        f'<a href="{dex_url}">DexScreener</a> | '
+        f'<a href="{bubblemaps_url}">Bubblemaps</a>'
+    )
+
     return "\n".join(lines)
+
+
+# ── Hourly digest ─────────────────────────────────────────────────────────────
+
+def send_hourly_digest(
+    symbol: str,
+    token_address: str,
+    flows: list[dict[str, Any]],
+    price_ctx: dict[str, Any],
+) -> None:
+    if not flows:
+        return
+
+    accumulators = [f for f in flows if f["delta"] > 0]
+    distributors = [f for f in flows if f["delta"] < 0]
+    net_flow     = sum(f["delta"] for f in flows)
+    acc_sum      = sum(f["delta"] for f in accumulators)
+    dist_sum     = sum(f["delta"] for f in distributors)
+    largest      = max(flows, key=lambda f: abs(f["delta"]))
+    sentiment    = "BULLISH 🟢" if net_flow > 0 else "BEARISH 🔴" if net_flow < 0 else "NEUTRAL ⚪"
+
+    now          = datetime.now(timezone.utc)
+    period_start = now.strftime("%H:00")
+    period_end   = now.strftime("%H:%M")
+
+    price      = price_ctx.get("price") or 0.0
+    change_1h  = price_ctx.get("change_1h")
+    price_str  = f"${price:.6f}".rstrip("0").rstrip(".") if price else "N/A"
+    price_line = f"{price_str} ({change_1h:+.1f}% 1h)" if (price and change_1h is not None) else price_str
+
+    largest_rank  = largest.get("rank", "?")
+    largest_delta = largest["delta"]
+
+    msg = (
+        f"📊 <b>{symbol} — Flow Digest</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Period: {period_start} - {period_end} UTC\n"
+        f"🟢 Accumulators: {len(accumulators)} wallet{'s' if len(accumulators) != 1 else ''}"
+        f" (+{acc_sum:.2f}% net)\n"
+        f"🔴 Distributors: {len(distributors)} wallet{'s' if len(distributors) != 1 else ''}"
+        f" ({dist_sum:.2f}% net)\n"
+        f"🏆 Net Flow: {net_flow:+.2f}% ({sentiment})\n"
+        f"🐋 Largest Move: #{largest_rank} holder {largest_delta:+.2f}%\n"
+        f"💵 {symbol} Price: {price_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    ok, err = send_telegram(msg)
+    if not ok:
+        log.error("Failed to send flow digest: %s", err)
+    else:
+        log.info("Flow digest sent for %s", symbol)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_holder_monitor() -> None:
-    """
-    Check holder concentration for every token in the registry.
+    """Check holder concentration for every token and send quant-style alerts."""
+    global _hourly_flows
 
-    For each token:
-    - Fetches the current top-20 holders via Helius RPC.
-    - Writes the snapshot to Supabase ``wallet_snapshots``.
-    - Diffs against the previous local JSON snapshot.
-    - For each significant change: writes to Supabase ``whale_alerts``
-      and sends a Telegram alert.
-    - Saves the updated local JSON snapshot for the next diff run.
-    """
     log.info(
-        "── Holder monitor starting — %s  threshold=%.1f%%",
+        "── Holder monitor starting — %s  threshold=%.2f%%",
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         MOVE_THRESHOLD_PCT,
     )
 
-    for symbol, address in TOKENS.items():
-        log.info("Checking %s (%s...)", symbol, address[:8])
+    for symbol, token_address in TOKENS.items():
+        log.info("Checking %s (%s...)", symbol, token_address[:8])
+        _hourly_flows = []
+        price_ctx: dict[str, Any] = {}
+
         try:
-            current = fetch_holders(address)
+            current = fetch_holders(token_address)
         except Exception as exc:
             log.error("fetch_holders failed for %s after retries: %s — skipping", symbol, exc)
             continue
@@ -521,8 +745,14 @@ def run_holder_monitor() -> None:
 
         log.info("  Fetched %d holders", len(current))
 
+        try:
+            price_ctx = fetch_price_context(token_address)
+            log.info("  Price: %s", price_ctx)
+        except Exception as exc:
+            log.warning("  Price fetch failed: %s", exc)
+
         # Write snapshot to Supabase regardless of whether changes are detected.
-        write_snapshot_to_supabase(symbol, address, current)
+        write_snapshot_to_supabase(symbol, token_address, current)
 
         snapshot = load_snapshot(symbol)
 
@@ -534,25 +764,47 @@ def run_holder_monitor() -> None:
                 save_snapshot(symbol, current)
                 continue
 
-            if changes:
-                log.info("  %d change(s) detected", len(changes))
-                msg = format_holder_alert(symbol, changes, snapshot["timestamp"])
+            log.info("  %d change(s) detected", len(changes))
 
-                # Send Telegram alert.
+            for change in changes:
+                addr        = change["address"]
+                change_type = change["type"]
+                delta       = change["delta"]
+
+                if is_rate_limited(addr):
+                    log.info("  Rate-limited: skipping alert for %s %s...", symbol, addr[:8])
+                    continue
+
+                new_rank = change.get("new_rank") or change.get("old_rank") or 0
+
+                wallet_info  = get_wallet_first_seen(addr, symbol, new_rank)
+                severity_name, _ = get_severity(change)
+                ai_interp    = get_ai_interpretation(symbol, severity_name, change_type, delta, new_rank)
+
+                msg = format_quant_alert(symbol, token_address, change, price_ctx, wallet_info, ai_interp)
+                kb  = make_inline_keyboard(addr, token_address)
+
                 telegram_sent = False
                 try:
-                    ok, err = send_telegram(msg)
+                    ok, err = send_telegram(msg, reply_markup=kb)
                     telegram_sent = ok
                     if not ok:
-                        log.error("Telegram delivery failed: %s", err)
+                        log.error("  Telegram delivery failed: %s", err)
                 except Exception as exc:
-                    log.error("Unexpected Telegram error for %s: %s", symbol, exc)
+                    log.error("  Unexpected Telegram error for %s: %s", symbol, exc)
 
-                # Write each individual change to Supabase.
-                for change in changes:
-                    write_alert_to_supabase(symbol, address, change, telegram_sent)
-            else:
+                if telegram_sent:
+                    record_alert_sent(addr)
+                    _hourly_flows.append({"address": addr, "delta": delta, "rank": new_rank})
+                    log.info("  Alert sent — %s #%s %s %+.2f%%", symbol, new_rank, change_type, delta)
+
+                write_alert_to_supabase(symbol, token_address, change, telegram_sent)
+
+            if not changes:
                 log.info("  No significant changes")
+
+            send_hourly_digest(symbol, token_address, _hourly_flows, price_ctx)
+
         else:
             log.info("  No previous snapshot — creating baseline")
             try:
@@ -569,12 +821,7 @@ def run_holder_monitor() -> None:
 
 
 def run() -> None:
-    """
-    Entry point — run the holder monitor.
-
-    Designed to be called from GitHub Actions cron or any scheduler.
-    Never raises; all errors are logged.
-    """
+    """Entry point — run the holder monitor. Never raises; all errors are logged."""
     run_holder_monitor()
     log.info("── Monitor complete")
 
