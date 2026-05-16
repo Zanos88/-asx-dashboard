@@ -1,0 +1,13 @@
+# Railway deployment configuration
+# Dashboard service — Streamlit app
+# Deploy the webhook service separately (see README.md)
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "streamlit run asx_dashboard.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 300
