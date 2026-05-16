@@ -17,7 +17,7 @@ Environment variables:
     TELEGRAM_BOT_TOKEN    Telegram bot token from @BotFather
     TELEGRAM_CHAT_ID      Target chat or channel ID
     SUPABASE_URL          Supabase project URL (https://xxx.supabase.co)
-    SUPABASE_KEY          Supabase service-role or anon key
+    SUPABASE_SERVICE_KEY  Supabase service-role key (bypasses RLS)
     MOVE_THRESHOLD_PCT        % supply change to trigger an alert (default from config.json)
     MIN_HOLDER_CHANGE_TOKENS  raw token amount change to trigger an alert (default from config.json)
     SKIP_SENTIMENT            Legacy flag — ignored (sentiment not active)
@@ -74,7 +74,7 @@ HELIUS_API_KEY     = os.environ.get("HELIUS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY       = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
