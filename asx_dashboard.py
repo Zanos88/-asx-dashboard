@@ -36,56 +36,110 @@ st.markdown("""
 <style>
     html, body, [class*="css"] {
         background-color: #0d1117;
-        color: #e6edf3;
+        color: #f0f6fc;
         font-family: 'Inter', sans-serif;
     }
     .stApp { background-color: #0d1117; }
+
+    /* Sidebar */
     section[data-testid="stSidebar"] {
         background-color: #161b22;
-        border-right: 1px solid #30363d;
+        border-right: 2px solid #30363d;
     }
+    section[data-testid="stSidebar"] * { color: #f0f6fc !important; }
+    section[data-testid="stSidebar"] label { color: #f0f6fc !important; font-weight: 600; }
+
+    /* Headings */
+    h1, h2, h3, h4, h5, h6 { color: #f0f6fc !important; font-weight: 700; }
+    p, li, span, div { color: #d1d9e0; }
+
+    /* Buttons */
     .stButton > button {
-        background-color: #21262d;
-        color: #e6edf3;
-        border: 1px solid #30363d;
+        background-color: #238636;
+        color: #ffffff;
+        border: 1px solid #2ea043;
         border-radius: 6px;
+        font-weight: 600;
     }
     .stButton > button:hover {
-        background-color: #30363d;
-        border-color: #8b949e;
+        background-color: #2ea043;
+        border-color: #3fb950;
+        color: #ffffff;
     }
+
+    /* Inputs */
     .stTextInput > div > div > input {
-        background-color: #161b22;
-        color: #e6edf3;
-        border: 1px solid #30363d;
+        background-color: #21262d;
+        color: #f0f6fc;
+        border: 1px solid #484f58;
     }
     .stSelectbox > div > div {
-        background-color: #161b22;
-        color: #e6edf3;
+        background-color: #21262d;
+        color: #f0f6fc;
+        border: 1px solid #484f58;
     }
+
+    /* Metric cards */
     div[data-testid="metric-container"] {
-        background-color: #161b22;
-        border: 1px solid #30363d;
+        background-color: #1c2128;
+        border: 1px solid #444c56;
         border-radius: 8px;
-        padding: 12px;
+        padding: 14px;
     }
-    .signal-badge {
-        padding: 4px 10px;
-        border-radius: 12px;
-        font-size: 12px;
+    div[data-testid="metric-container"] label {
+        color: #adbac7 !important;
+        font-size: 13px;
         font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+        color: #f0f6fc !important;
+        font-size: 22px;
+        font-weight: 700;
+    }
+    div[data-testid="metric-container"] div[data-testid="stMetricDelta"] {
+        font-size: 13px;
+        font-weight: 600;
+    }
+
+    /* Expanders */
+    details { background-color: #1c2128; border: 1px solid #444c56; border-radius: 8px; }
+    details summary { color: #f0f6fc !important; font-weight: 600; font-size: 15px; }
+
+    /* Dataframes */
+    .stDataFrame {
+        border: 1px solid #444c56;
+        border-radius: 8px;
+    }
+
+    /* Radio / checkboxes */
+    .stRadio label { color: #d1d9e0 !important; font-size: 14px; }
+    .stRadio div[role="radiogroup"] label[data-baseweb="radio"] { color: #f0f6fc !important; }
+
+    /* Captions */
+    .stCaption, small { color: #adbac7 !important; }
+
+    /* Warning / info / success boxes */
+    div[data-testid="stAlert"] { border-radius: 8px; }
+
+    /* Badges */
+    .signal-badge {
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 13px;
+        font-weight: 700;
         letter-spacing: 0.5px;
     }
     .pill {
-        padding: 2px 8px;
+        padding: 3px 10px;
         border-radius: 10px;
-        font-size: 11px;
-        font-weight: 500;
+        font-size: 12px;
+        font-weight: 600;
     }
-    .warn-flag { color: #f85149; font-size: 12px; }
-    .safe-flag { color: #3fb950; font-size: 12px; }
+    .warn-flag { color: #ff7b72; font-size: 13px; font-weight: 600; }
+    .safe-flag { color: #56d364; font-size: 13px; font-weight: 600; }
     hr { border-color: #30363d; }
-    .stDataFrame { border: 1px solid #30363d; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -396,7 +450,7 @@ with col_title:
     else:
         st.markdown("# 🪙 Solana Meme Dashboard")
     st.markdown(
-        f"<span style='color:#8b949e'>{date.today().strftime('%A, %d %B %Y')}</span>",
+        f"<span style='color:#adbac7;font-size:15px;'>{date.today().strftime('%A, %d %B %Y')}</span>",
         unsafe_allow_html=True,
     )
 with col_ref:
