@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-05-16T23:07:17.677494+00:00",
+  "timestamp": "2026-05-16T23:08:16.487717+00:00",
   "holders": [
     {
       "address": "7ecuyhdmuiCksyZZ3PMaPaafuW3c5TUvFud6PVp7tVwb",
@@ -31,10 +31,10 @@
     },
     {
       "address": "8SmW82qNZ7BpdBp5PZk7znqt3VswFzX3nkRgHBBE1x4e",
-      "uiAmount": 17748423.528267,
+      "uiAmount": 17649186.94085,
       "decimals": 6,
-      "amount": "17748423528267",
-      "uiAmountString": "17748423.528267"
+      "amount": "17649186940850",
+      "uiAmountString": "17649186.94085"
     },
     {
       "address": "FWebf3p1t7Gv4FEvPgRRqGfUjLm7q8Qa2N65eZwxp6VR",
