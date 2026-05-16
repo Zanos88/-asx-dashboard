@@ -391,6 +391,46 @@ def send_telegram(msg):
         return False, str(e)
 
 # ─────────────────────────────────────────────
+# GROK / X SENTIMENT
+# ─────────────────────────────────────────────
+def fetch_grok_sentiment(prompt):
+    try:
+        api_key = st.secrets.get("XAI_API_KEY", "")
+        if not api_key:
+            return None, "no_key"
+        url     = "https://api.x.ai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": "grok-3",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a financial sentiment analyst with real-time access to X (Twitter). "
+                        "Analyse recent X posts and provide structured, actionable sentiment insights. "
+                        "Be concise and specific — cite post themes, not individual accounts unless very notable."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1200,
+            "search_parameters": {
+                "mode": "auto",
+                "return_citations": True,
+                "sources": [{"type": "x"}, {"type": "news"}],
+            },
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=45)
+        if resp.ok:
+            data    = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return content, None
+        return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return None, str(e)
+
+# ─────────────────────────────────────────────
 # HOLDER SNAPSHOTS
 # ─────────────────────────────────────────────
 import os
@@ -530,12 +570,12 @@ with st.sidebar:
     if dashboard_mode == "🇦🇺 ASX Portfolio":
         view = st.radio(
             "View",
-            ["Portfolio Overview", "Watchlist", "AKN Analysis", "Price Charts", "AI Analysis"],
+            ["Portfolio Overview", "Watchlist", "AKN Analysis", "Price Charts", "AI Analysis", "X Sentiment"],
         )
     else:
         view = st.radio(
             "View",
-            ["Token Overview", "On-Chain Health", "Whale Detection", "Holder Alerts", "Manage Tokens"],
+            ["Token Overview", "On-Chain Health", "Whale Detection", "Holder Alerts", "X Sentiment", "Manage Tokens"],
         )
 
     st.markdown("---")
@@ -788,6 +828,57 @@ if dashboard_mode == "🇦🇺 ASX Portfolio":
                     with st.spinner("Analysing with Claude..."):
                         result = run_ai_analysis(prompts[analysis_type], client)
                     st.markdown(result)
+
+    # ── X Sentiment (ASX) ───────────────────────
+    elif view == "X Sentiment":
+        st.subheader("𝕏 X / Grok Sentiment Analysis")
+
+        xai_key = st.secrets.get("XAI_API_KEY", "")
+        if not xai_key:
+            st.error("XAI_API_KEY not set in secrets. Get one at console.x.ai")
+        else:
+            all_tickers = list(st.session_state.holdings.keys()) + list(WATCHLIST.keys())
+            selected    = st.selectbox("Select ticker", all_tickers)
+            name        = (
+                st.session_state.holdings.get(selected, {}).get("name")
+                or WATCHLIST.get(selected, {}).get("name")
+                or selected
+            )
+            period = st.radio("Lookback period", ["24 hours", "7 days", "30 days"], index=1, horizontal=True)
+
+            prompt = f"""Search X (Twitter) for posts about {selected} ({name}) ASX stock from the last {period}.
+
+Provide a structured analysis with these sections:
+
+**1. Sentiment Score**
+Overall: Bullish / Neutral / Bearish — with a confidence % and brief reason.
+
+**2. Key Themes**
+What are the main narratives, topics, or catalysts being discussed?
+
+**3. Community Signals**
+- Volume of discussion (low / moderate / high)
+- Notable sentiment shifts or spikes
+- Any coordinated activity or pumping behaviour
+
+**4. Catalysts & News**
+Any announcements, drill results, regulatory news, or upcoming events being mentioned?
+
+**5. Red Flags**
+Any concerns, FUD, or warnings being raised by the community?
+
+**6. Summary**
+2-3 sentence overall take for an investor holding this stock.
+"""
+            if st.button("🔍 Analyse X Sentiment", type="primary"):
+                with st.spinner(f"Grok is searching X for {selected} sentiment..."):
+                    result, err = fetch_grok_sentiment(prompt)
+                if result:
+                    st.markdown(result)
+                elif err == "no_key":
+                    st.error("XAI_API_KEY not configured.")
+                else:
+                    st.error(f"Grok API error: {err}")
 
 # ═══════════════════════════════════════════════
 # SOLANA MEME DASHBOARD VIEWS
@@ -1111,6 +1202,79 @@ else:
                 st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
             elif h_err == "no_key":
                 st.caption("Add HELIUS_API_KEY to secrets.")
+
+    # ── X Sentiment (Solana) ────────────────────
+    elif view == "X Sentiment":
+        st.subheader("𝕏 X / Grok Sentiment Analysis")
+
+        xai_key = st.secrets.get("XAI_API_KEY", "")
+        if not xai_key:
+            st.error("XAI_API_KEY not set in secrets. Get one at console.x.ai")
+        else:
+            if not st.session_state.tokens:
+                st.info("No tokens added. Go to **Manage Tokens** first.")
+            else:
+                selected_sym = st.selectbox("Select token", list(st.session_state.tokens.keys()))
+                token        = st.session_state.tokens[selected_sym]
+                name         = token.get("name", selected_sym)
+                addr         = token["address"]
+                period       = st.radio("Lookback period", ["24 hours", "7 days", "30 days"], index=0, horizontal=True)
+
+                # Pull live price context from DexScreener to enrich the prompt
+                pair      = fetch_dexscreener(addr)
+                price_ctx = ""
+                if pair:
+                    price_usd = float(pair.get("priceUsd", 0) or 0)
+                    chg24h    = float(pair.get("priceChange", {}).get("h24", 0) or 0)
+                    mktcap    = pair.get("marketCap") or pair.get("fdv")
+                    price_ctx = (
+                        f"Current price: ${price_usd:.6f} USD | "
+                        f"24h change: {chg24h:+.1f}% | "
+                        f"Market cap: {fmt_usd(float(mktcap)) if mktcap else 'unknown'}"
+                    )
+
+                prompt = f"""Search X (Twitter) for posts about {selected_sym} ({name}), a Solana meme coin token, from the last {period}.
+{f'Live market context: {price_ctx}' if price_ctx else ''}
+Token mint: {addr}
+
+Provide a structured analysis with these sections:
+
+**1. Sentiment Score**
+Overall: Bullish / Neutral / Bearish — with a confidence % and brief reason.
+
+**2. Community & Hype Level**
+- Size and activity of the community on X
+- Is this organic or coordinated/bot-driven hype?
+- Key hashtags or cashtags in use
+
+**3. Key Narratives**
+What are people saying? Utility claims, meme themes, dev activity, partnerships?
+
+**4. Influencer & KOL Activity**
+Are any notable crypto influencers or key opinion leaders posting about this? Bullish or bearish?
+
+**5. Risk Signals**
+- Rug pull concerns, whale dump warnings, honeypot allegations
+- Suspicious pump coordination signs
+- Dev wallet or insider selling chatter
+
+**6. Momentum Assessment**
+Is interest growing, peaking, or fading? Any upcoming catalysts mentioned?
+
+**7. Summary**
+2-3 sentence verdict for a speculative trader considering this token.
+"""
+                if st.button("🔍 Analyse X Sentiment", type="primary"):
+                    with st.spinner(f"Grok is searching X for {selected_sym} sentiment..."):
+                        result, err = fetch_grok_sentiment(prompt)
+                    if result:
+                        if price_ctx:
+                            st.caption(f"📊 Market snapshot: {price_ctx}")
+                        st.markdown(result)
+                    elif err == "no_key":
+                        st.error("XAI_API_KEY not configured.")
+                    else:
+                        st.error(f"Grok API error: {err}")
 
     # ── Manage Tokens ───────────────────────────
     elif view == "Manage Tokens":
