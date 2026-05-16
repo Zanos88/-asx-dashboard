@@ -1,22 +1,46 @@
 """
-Holder Concentration Monitor + X Sentiment Dispatcher
-======================================================
+Holder Concentration Monitor
+=============================
 Run standalone or via GitHub Actions cron job (see .github/workflows/monitor.yml).
 
 What it does each run:
-  1. Fetches top-20 holders for every tracked token via Helius RPC.
-  2. Diffs against the previous snapshot; sends a Telegram alert for any
-     significant changes (new wallets, exits, supply % moves ≥ threshold).
-  3. Fetches X / Grok sentiment for each token and sends a digest to Telegram.
-  4. Saves updated snapshots to disk so GitHub Actions can commit them back.
+  1. Tests the Supabase connection and logs the result.
+  2. Fetches top-20 holders for every tracked token via Helius RPC.
+  3. Diffs against the previous snapshot (local JSON kept in git).
+  4. Writes the current snapshot to Supabase ``wallet_snapshots`` table.
+  5. Writes each detected change to Supabase ``whale_alerts`` table.
+  6. Sends a Telegram alert for any significant change (NEW / EXIT / MOVE).
+  7. Saves updated local JSON snapshots so GitHub Actions can commit them back.
 
 Environment variables:
     HELIUS_API_KEY        Helius RPC API key
     TELEGRAM_BOT_TOKEN    Telegram bot token from @BotFather
     TELEGRAM_CHAT_ID      Target chat or channel ID
-    XAI_API_KEY           xAI / Grok API key for X sentiment analysis
-    MOVE_THRESHOLD_PCT    % supply change to trigger an alert (default 1.0)
-    SKIP_SENTIMENT        Set to "1" to skip sentiment (e.g. on frequent runs)
+    SUPABASE_URL          Supabase project URL (https://xxx.supabase.co)
+    SUPABASE_KEY          Supabase service-role or anon key
+    MOVE_THRESHOLD_PCT    % supply change to trigger an alert (default from config.json)
+    SKIP_SENTIMENT        Legacy flag — ignored (sentiment not active)
+
+Supabase table schemas expected:
+
+    wallet_snapshots
+        id            bigint (auto)
+        symbol        text
+        captured_at   timestamptz
+        holders       jsonb
+        holder_count  int
+        top10_pct     float8
+
+    whale_alerts
+        id            bigint (auto)
+        symbol        text
+        change_type   text          -- NEW | EXIT | MOVE
+        wallet_address text
+        old_pct       float8        -- nullable
+        new_pct       float8        -- nullable
+        delta_pct     float8
+        alerted_at    timestamptz
+        telegram_sent bool
 """
 
 from __future__ import annotations
@@ -24,11 +48,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
+from supabase import Client, create_client
 from tenacity import (
     before_sleep_log,
     retry,
@@ -48,11 +72,12 @@ log = logging.getLogger(__name__)
 HELIUS_API_KEY     = os.environ.get("HELIUS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-XAI_API_KEY        = os.environ.get("XAI_API_KEY", "")
+SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY       = os.environ.get("SUPABASE_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
-SKIP_SENTIMENT     = os.environ.get("SKIP_SENTIMENT", "0") == "1"
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
 
 def _load_config() -> dict[str, Any]:
     try:
@@ -62,15 +87,129 @@ def _load_config() -> dict[str, Any]:
         log.warning("Could not load config.json (%s) — using defaults", exc)
         return {}
 
+
 _cfg = _load_config()
 
-MOVE_THRESHOLD_PCT = float(os.environ.get("MOVE_THRESHOLD_PCT", str(_cfg.get("move_threshold_pct", 1.0))))
+MOVE_THRESHOLD_PCT = float(
+    os.environ.get("MOVE_THRESHOLD_PCT", str(_cfg.get("move_threshold_pct", 1.0)))
+)
 
 # Token registry: symbol → mint address (sourced from config.json)
 TOKENS: dict[str, str] = {
     sym: info["address"]
     for sym, info in _cfg.get("solana_tokens", {}).items()
 } or {"ALON": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS"}
+
+
+# ── Supabase client ───────────────────────────────────────────────────────────
+
+def init_supabase() -> Client | None:
+    """
+    Initialise and test the Supabase client.
+
+    Logs a clear success or failure message so the GitHub Actions log
+    shows immediately whether the connection is working.
+
+    Returns:
+        Authenticated ``supabase.Client`` on success, or ``None`` if
+        ``SUPABASE_URL`` / ``SUPABASE_KEY`` are not set or the connection fails.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.error(
+            "Supabase not configured — SUPABASE_URL and SUPABASE_KEY must be set. "
+            "Snapshots will be written to local JSON only."
+        )
+        return None
+
+    try:
+        client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Lightweight connectivity test: read one row from wallet_snapshots.
+        client.table("wallet_snapshots").select("id").limit(1).execute()
+        log.info("✅ Supabase connection OK — %s", SUPABASE_URL)
+        return client
+    except Exception as exc:
+        log.error("❌ Supabase connection FAILED: %s", exc)
+        return None
+
+
+_supabase: Client | None = init_supabase()
+
+
+# ── Supabase writers ──────────────────────────────────────────────────────────
+
+def write_snapshot_to_supabase(
+    symbol: str,
+    holders: list[dict[str, Any]],
+) -> None:
+    """
+    Insert the current holder snapshot into the ``wallet_snapshots`` table.
+
+    Args:
+        symbol:  Token symbol (e.g. "ALON").
+        holders: Holder list from ``fetch_holders()``.
+    """
+    if _supabase is None:
+        return
+
+    total = sum(get_amount(h) for h in holders) or 1.0
+    top10_pct = sum(
+        get_amount(h) / total * 100
+        for h in holders[:10]
+    )
+
+    row = {
+        "symbol":       symbol,
+        "captured_at":  datetime.now(timezone.utc).isoformat(),
+        "holders":      holders,
+        "holder_count": len(holders),
+        "top10_pct":    round(top10_pct, 4),
+    }
+
+    try:
+        _supabase.table("wallet_snapshots").insert(row).execute()
+        log.info("  ✅ Snapshot written to Supabase wallet_snapshots (%s)", symbol)
+    except Exception as exc:
+        log.error("  ❌ Failed to write snapshot to Supabase for %s: %s", symbol, exc)
+
+
+def write_alert_to_supabase(
+    symbol: str,
+    change: dict[str, Any],
+    telegram_sent: bool,
+) -> None:
+    """
+    Insert a single holder change event into the ``whale_alerts`` table.
+
+    Args:
+        symbol:        Token symbol.
+        change:        Single change dict from ``compare_holders()``.
+        telegram_sent: Whether the Telegram alert was delivered successfully.
+    """
+    if _supabase is None:
+        return
+
+    row = {
+        "symbol":         symbol,
+        "change_type":    change["type"],
+        "wallet_address": change["address"],
+        "old_pct":        change.get("old_pct"),
+        "new_pct":        change.get("new_pct"),
+        "delta_pct":      round(change["delta"], 6),
+        "alerted_at":     datetime.now(timezone.utc).isoformat(),
+        "telegram_sent":  telegram_sent,
+    }
+
+    try:
+        _supabase.table("whale_alerts").insert(row).execute()
+        log.info(
+            "  ✅ Alert written to Supabase whale_alerts (%s %s %s)",
+            symbol, change["type"], change["address"][:8],
+        )
+    except Exception as exc:
+        log.error(
+            "  ❌ Failed to write alert to Supabase for %s %s: %s",
+            symbol, change["address"][:8], exc,
+        )
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -96,7 +235,7 @@ def send_telegram(msg: str) -> tuple[bool, str]:
         Tuple of (success: bool, error_description: str).
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — skipping")
+        log.warning("Telegram not configured — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
         return False, "not_configured"
 
     resp = requests.post(
@@ -126,20 +265,17 @@ def fetch_holders(token_address: str) -> list[dict[str, Any]]:
     """
     Fetch the top-20 token holders via the Helius ``getTokenLargestAccounts`` RPC method.
 
-    Retries up to 3 times with exponential backoff on transient network errors.
-    Raises on persistent failure so the caller can decide whether to skip or abort.
-
     Args:
         token_address: Solana token mint address.
 
     Returns:
-        List of holder dicts; each has ``address``, ``amount``, ``uiAmount`` and
-        ``uiAmountString`` keys as returned by the Solana RPC specification.
+        List of holder dicts with ``address``, ``amount``, ``uiAmount`` keys.
 
     Raises:
-        requests.Timeout:        If the request times out after all retries.
+        requests.Timeout:         If the request times out after all retries.
         requests.ConnectionError: If the host is unreachable after all retries.
-        requests.HTTPError:      If the API returns a non-2xx status code.
+        requests.HTTPError:       If the API returns a non-2xx status code.
+        ValueError:               If ``HELIUS_API_KEY`` is not set.
     """
     if not HELIUS_API_KEY:
         raise ValueError("HELIUS_API_KEY is not set")
@@ -162,97 +298,12 @@ def fetch_holders(token_address: str) -> list[dict[str, Any]]:
     return data.get("result", {}).get("value", [])
 
 
-# ── Grok / X Sentiment ────────────────────────────────────────────────────────
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=3, max=15),
-    retry=retry_if_exception_type((requests.Timeout, requests.ConnectionError)),
-    before_sleep=before_sleep_log(log, logging.WARNING),
-    reraise=False,
-)
-def fetch_grok_sentiment(symbol: str) -> str | None:
-    """
-    Query the xAI / Grok API for real-time X (Twitter) sentiment on a token.
-
-    Uses Grok's live X search via ``search_parameters`` to retrieve the latest
-    community posts and synthesise a sentiment summary.
-
-    Args:
-        symbol: Token symbol to analyse (e.g. "ALON").
-
-    Returns:
-        Formatted sentiment string on success, or None if the API is unavailable
-        or ``XAI_API_KEY`` is not configured.
-    """
-    if not XAI_API_KEY:
-        log.warning("XAI_API_KEY not configured — skipping sentiment for %s", symbol)
-        return None
-
-    prompt = (
-        f"Search X (Twitter) for posts about the Solana meme coin ${symbol} from the last 24 hours.\n\n"
-        f"Provide a concise summary (under 300 words) covering:\n"
-        f"1. Sentiment: Bullish / Neutral / Bearish with confidence %\n"
-        f"2. Key narratives and themes\n"
-        f"3. KOL / influencer activity\n"
-        f"4. Rug, whale dump, or insider selling concerns\n"
-        f"5. One-line trader verdict\n"
-    )
-
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
-    payload: dict[str, Any] = {
-        "model": "grok-3",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a crypto trading sentiment analyst with real-time X access. "
-                    "Be direct, specific, and flag risks clearly."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 600,
-        "search_parameters": {
-            "mode": "auto",
-            "return_citations": True,
-            "sources": [{"type": "x"}, {"type": "news"}],
-        },
-    }
-
-    resp = requests.post(
-        "https://api.x.ai/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=45,
-    )
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        log.error("Grok HTTP %s for %s: %s", resp.status_code, symbol, resp.text[:200])
-        return None
-
-    try:
-        return resp.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError) as exc:
-        log.error("Unexpected Grok response structure for %s: %s", symbol, exc)
-        return None
-
-
-# ── Snapshot helpers ──────────────────────────────────────────────────────────
+# ── Local JSON snapshot helpers ───────────────────────────────────────────────
+# Local snapshots are kept in git (committed by GitHub Actions) so the diff
+# mechanism works across runs even if Supabase is not yet queried for history.
 
 def load_snapshot(symbol: str) -> dict[str, Any] | None:
-    """
-    Load the most recent holder snapshot from disk for a given token.
-
-    Args:
-        symbol: Token symbol (e.g. "ALON").
-
-    Returns:
-        Snapshot dict with ``timestamp`` (ISO string) and ``holders`` (list),
-        or ``None`` if no snapshot file exists or parsing fails.
-    """
+    """Load the most recent local holder snapshot for diff comparison."""
     path = os.path.join(SNAPSHOT_DIR, f"{symbol}_holders.json")
     if not os.path.exists(path):
         return None
@@ -260,46 +311,29 @@ def load_snapshot(symbol: str) -> dict[str, Any] | None:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
-        log.error("Could not load snapshot for %s: %s", symbol, exc)
+        log.error("Could not load local snapshot for %s: %s", symbol, exc)
         return None
 
 
 def save_snapshot(symbol: str, holders: list[dict[str, Any]]) -> None:
-    """
-    Persist the current holder list as a timestamped JSON snapshot.
-
-    Args:
-        symbol:  Token symbol (e.g. "ALON").
-        holders: Holder list from ``fetch_holders()``.
-    """
+    """Persist the current holder list to the local JSON snapshot file."""
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     path = os.path.join(SNAPSHOT_DIR, f"{symbol}_holders.json")
     try:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(
-                {"timestamp": datetime.utcnow().isoformat(), "holders": holders},
+                {"timestamp": datetime.now(timezone.utc).isoformat(), "holders": holders},
                 fh,
                 indent=2,
             )
     except OSError as exc:
-        log.error("Could not save snapshot for %s: %s", symbol, exc)
+        log.error("Could not save local snapshot for %s: %s", symbol, exc)
 
 
-# ── Comparison ────────────────────────────────────────────────────────────────
+# ── Holder comparison ─────────────────────────────────────────────────────────
 
 def get_amount(holder: dict[str, Any]) -> float:
-    """
-    Extract the decimal-adjusted token amount from a holder dict.
-
-    Prefers ``uiAmount`` (decimal-adjusted float). Falls back to the raw
-    ``amount`` string if ``uiAmount`` is absent or null.
-
-    Args:
-        holder: Single holder dict from the Helius RPC response.
-
-    Returns:
-        Float token amount.
-    """
+    """Return the decimal-adjusted token amount from a holder dict."""
     ui = holder.get("uiAmount")
     return float(ui) if ui is not None else float(holder.get("amount", 0))
 
@@ -311,20 +345,14 @@ def compare_holders(
     """
     Diff two holder lists and return significant changes.
 
-    A change is considered significant when:
-    - A wallet address appears in the new list but not the old (NEW).
-    - A wallet address appears in the old list but not the new (EXIT).
-    - An existing wallet's percentage of total supply changes by at least
-      ``MOVE_THRESHOLD_PCT`` percent (MOVE).
-
-    Args:
-        old_holders: Holder list from the previous snapshot.
-        new_holders: Current holder list from the RPC.
+    Change types:
+        NEW   — wallet entered the top-20.
+        EXIT  — wallet left the top-20.
+        MOVE  — existing wallet changed supply % by ≥ ``MOVE_THRESHOLD_PCT``.
 
     Returns:
-        List of change dicts, each with keys:
-        ``type`` (str), ``address`` (str), ``old_pct`` (float | None),
-        ``new_pct`` (float | None), ``delta`` (float).
+        List of change dicts with keys:
+        ``type``, ``address``, ``old_pct``, ``new_pct``, ``delta``.
     """
     old_map   = {h["address"]: h for h in old_holders}
     new_map   = {h["address"]: h for h in new_holders}
@@ -336,14 +364,14 @@ def compare_holders(
     for addr, h in new_map.items():
         if addr not in old_map:
             pct = get_amount(h) / new_total * 100
-            changes.append({"type": "NEW", "address": addr,
-                            "old_pct": None, "new_pct": pct, "delta": pct})
+            changes.append({"type": "NEW",  "address": addr,
+                            "old_pct": None, "new_pct": pct,  "delta": pct})
 
     for addr, h in old_map.items():
         if addr not in new_map:
             pct = get_amount(h) / old_total * 100
             changes.append({"type": "EXIT", "address": addr,
-                            "old_pct": pct, "new_pct": None, "delta": -pct})
+                            "old_pct": pct,  "new_pct": None, "delta": -pct})
 
     for addr in set(old_map) & set(new_map):
         old_pct = get_amount(old_map[addr]) / old_total * 100
@@ -361,20 +389,10 @@ def format_holder_alert(
     changes: list[dict[str, Any]],
     snapshot_ts: str,
 ) -> str:
-    """
-    Build an HTML-formatted Telegram message summarising holder changes.
-
-    Args:
-        symbol:      Token symbol.
-        changes:     Output of ``compare_holders()``.
-        snapshot_ts: ISO timestamp string of the previous snapshot.
-
-    Returns:
-        HTML string suitable for sending via the Telegram Bot API.
-    """
+    """Build an HTML-formatted Telegram message summarising holder changes."""
     lines = [
         f"🚨 <b>Holder Alert — {symbol}</b>",
-        f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"vs snapshot: {snapshot_ts[:16].replace('T', ' ')} UTC\n",
     ]
     for c in changes:
@@ -405,15 +423,18 @@ def run_holder_monitor() -> None:
     Check holder concentration for every token in the registry.
 
     For each token:
-    - Fetches the current top-20 holders.
-    - Diffs against the stored snapshot.
-    - Sends a Telegram alert if significant changes are found.
-    - Saves the updated snapshot to disk.
-
-    A failure on any single token is logged and skipped; the loop always
-    continues to the next token.
+    - Fetches the current top-20 holders via Helius RPC.
+    - Writes the snapshot to Supabase ``wallet_snapshots``.
+    - Diffs against the previous local JSON snapshot.
+    - For each significant change: writes to Supabase ``whale_alerts``
+      and sends a Telegram alert.
+    - Saves the updated local JSON snapshot for the next diff run.
     """
-    log.info("── Holder monitor starting — %s", datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    log.info(
+        "── Holder monitor starting — %s  threshold=%.1f%%",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        MOVE_THRESHOLD_PCT,
+    )
 
     for symbol, address in TOKENS.items():
         log.info("Checking %s (%s...)", symbol, address[:8])
@@ -428,6 +449,10 @@ def run_holder_monitor() -> None:
             continue
 
         log.info("  Fetched %d holders", len(current))
+
+        # Write snapshot to Supabase regardless of whether changes are detected.
+        write_snapshot_to_supabase(symbol, current)
+
         snapshot = load_snapshot(symbol)
 
         if snapshot:
@@ -441,12 +466,20 @@ def run_holder_monitor() -> None:
             if changes:
                 log.info("  %d change(s) detected", len(changes))
                 msg = format_holder_alert(symbol, changes, snapshot["timestamp"])
+
+                # Send Telegram alert.
+                telegram_sent = False
                 try:
                     ok, err = send_telegram(msg)
+                    telegram_sent = ok
                     if not ok:
                         log.error("Telegram delivery failed: %s", err)
                 except Exception as exc:
                     log.error("Unexpected Telegram error for %s: %s", symbol, exc)
+
+                # Write each individual change to Supabase whale_alerts.
+                for change in changes:
+                    write_alert_to_supabase(symbol, change, telegram_sent)
             else:
                 log.info("  No significant changes")
         else:
@@ -455,60 +488,23 @@ def run_holder_monitor() -> None:
                 send_telegram(
                     f"📸 <b>{symbol}</b> — baseline snapshot created.\n"
                     f"Tracking {len(current)} holders.\n"
-                    f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+                    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
                 )
             except Exception as exc:
                 log.error("Failed to send baseline notification for %s: %s", symbol, exc)
 
         save_snapshot(symbol, current)
-        log.info("  Snapshot saved → snapshots/%s_holders.json", symbol)
-
-
-def run_sentiment_digest() -> None:
-    """
-    Fetch and broadcast X / Grok sentiment for every token in the registry.
-
-    Each token is processed independently; a failure on one does not prevent
-    the others from being dispatched.
-    """
-    if SKIP_SENTIMENT:
-        log.info("SKIP_SENTIMENT=1 — skipping sentiment digest")
-        return
-
-    log.info("── Sentiment digest starting — %s", datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
-
-    for symbol in TOKENS:
-        log.info("Fetching X sentiment for %s", symbol)
-        try:
-            sentiment = fetch_grok_sentiment(symbol)
-            if not sentiment:
-                log.warning("No sentiment returned for %s", symbol)
-                continue
-
-            msg = (
-                f"𝕏 <b>X Sentiment — ${symbol}</b>\n"
-                f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-                f"{sentiment}"
-            )
-            ok, err = send_telegram(msg)
-            if not ok:
-                log.error("Failed to send sentiment for %s: %s", symbol, err)
-            else:
-                log.info("  Sentiment digest sent for %s", symbol)
-        except Exception as exc:
-            log.error("Unexpected error in sentiment for %s: %s — skipping", symbol, exc)
-            continue
+        log.info("  Local snapshot saved → snapshots/%s_holders.json", symbol)
 
 
 def run() -> None:
     """
-    Entry point — run holder monitor then sentiment digest.
+    Entry point — run the holder monitor.
 
     Designed to be called from GitHub Actions cron or any scheduler.
     Never raises; all errors are logged.
     """
     run_holder_monitor()
-    run_sentiment_digest()
     log.info("── Monitor complete")
 
 
