@@ -1,6 +1,10 @@
 # Secrets — never commit
 .streamlit/secrets.toml
 
+# Keep snapshot JSON files (tracked by GitHub Actions)
+!snapshots/
+!snapshots/*.json
+
 # Python
 __pycache__/
 *.py[cod]

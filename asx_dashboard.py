@@ -375,6 +375,103 @@ def fetch_helius_transactions(token_address, limit=100):
         return None, str(e)
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
+def send_telegram(msg):
+    try:
+        token   = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
+        if not token or not chat_id:
+            return False, "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in secrets"
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=10)
+        return resp.ok, resp.text
+    except Exception as e:
+        return False, str(e)
+
+# ─────────────────────────────────────────────
+# HOLDER SNAPSHOTS
+# ─────────────────────────────────────────────
+import os
+
+SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "snapshots")
+
+def load_snapshot(symbol):
+    path = os.path.join(SNAPSHOT_DIR, f"{symbol}_holders.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+def save_snapshot(symbol, holders):
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    path = os.path.join(SNAPSHOT_DIR, f"{symbol}_holders.json")
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "holders": holders}, f, indent=2)
+
+def _get_amt(h):
+    ui = h.get("uiAmount")
+    return float(ui) if ui is not None else float(h.get("amount", 0))
+
+def compare_holders(old_holders, new_holders, symbol):
+    old_map   = {h["address"]: h for h in old_holders}
+    new_map   = {h["address"]: h for h in new_holders}
+    old_total = sum(_get_amt(h) for h in old_holders) or 1
+    new_total = sum(_get_amt(h) for h in new_holders) or 1
+
+    changes = []
+
+    for addr, h in new_map.items():
+        if addr not in old_map:
+            pct = _get_amt(h) / new_total * 100
+            changes.append({
+                "type": "NEW", "address": addr,
+                "old_pct": None, "new_pct": pct,
+                "delta": pct,
+            })
+
+    for addr, h in old_map.items():
+        if addr not in new_map:
+            pct = _get_amt(h) / old_total * 100
+            changes.append({
+                "type": "EXIT", "address": addr,
+                "old_pct": pct, "new_pct": None,
+                "delta": -pct,
+            })
+
+    for addr in set(old_map) & set(new_map):
+        old_pct = _get_amt(old_map[addr]) / old_total * 100
+        new_pct = _get_amt(new_map[addr]) / new_total * 100
+        delta   = new_pct - old_pct
+        if abs(delta) >= 1.0:
+            changes.append({
+                "type": "MOVE", "address": addr,
+                "old_pct": old_pct, "new_pct": new_pct,
+                "delta": delta,
+            })
+
+    return changes
+
+def format_alert_message(symbol, changes, snapshot_ts):
+    lines = [f"🚨 <b>Holder Alert — {symbol}</b>",
+             f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+             f"vs snapshot: {snapshot_ts[:16].replace('T', ' ')} UTC\n"]
+    for c in changes:
+        addr = f"{c['address'][:6]}...{c['address'][-4:]}"
+        if c["type"] == "NEW":
+            lines.append(f"🆕 <b>NEW</b> wallet entered top 20\n   <code>{addr}</code> → {c['new_pct']:.2f}%")
+        elif c["type"] == "EXIT":
+            lines.append(f"🚪 <b>EXIT</b> wallet left top 20\n   <code>{addr}</code> was {c['old_pct']:.2f}%")
+        else:
+            arrow = "📈" if c["delta"] > 0 else "📉"
+            lines.append(f"{arrow} <b>MOVE</b> <code>{addr}</code>  {c['old_pct']:.2f}% → {c['new_pct']:.2f}% ({c['delta']:+.2f}%)")
+    return "\n".join(lines)
+
+# ─────────────────────────────────────────────
 # AI ANALYSIS
 # ─────────────────────────────────────────────
 def run_ai_analysis(prompt, client):
@@ -438,7 +535,7 @@ with st.sidebar:
     else:
         view = st.radio(
             "View",
-            ["Token Overview", "On-Chain Health", "Whale Detection", "Manage Tokens"],
+            ["Token Overview", "On-Chain Health", "Whale Detection", "Holder Alerts", "Manage Tokens"],
         )
 
     st.markdown("---")
@@ -915,6 +1012,105 @@ else:
                 st.caption("Add HELIUS_API_KEY to secrets for transaction data.")
             else:
                 st.info("No transaction data available.")
+
+    # ── Holder Alerts ───────────────────────────
+    elif view == "Holder Alerts":
+        st.subheader("🔔 Holder Concentration Alerts")
+        if not st.session_state.tokens:
+            st.info("No tokens added. Go to **Manage Tokens** first.")
+        else:
+            selected_sym = st.selectbox("Select token", list(st.session_state.tokens.keys()))
+            token = st.session_state.tokens[selected_sym]
+            addr  = token["address"]
+
+            # Load current live holders
+            current_holders, h_err = fetch_helius_token_holders(addr)
+            snapshot = load_snapshot(selected_sym)
+
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.markdown("#### 📸 Snapshot")
+                if snapshot:
+                    ts = snapshot["timestamp"][:16].replace("T", " ")
+                    st.caption(f"Last saved: {ts} UTC  •  {len(snapshot['holders'])} holders")
+                else:
+                    st.caption("No snapshot saved yet.")
+
+                if st.button("💾 Save current as baseline"):
+                    if current_holders:
+                        save_snapshot(selected_sym, current_holders)
+                        st.success("Snapshot saved.")
+                        st.rerun()
+                    else:
+                        st.error("Could not fetch current holders.")
+
+            with col_b:
+                st.markdown("#### 📡 Telegram")
+                tg_token  = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+                tg_chatid = st.secrets.get("TELEGRAM_CHAT_ID", "")
+                if tg_token and tg_chatid:
+                    st.markdown(pill_html("Configured ✓", "#3fb950"), unsafe_allow_html=True)
+                else:
+                    st.markdown(pill_html("Not configured", "#f85149"), unsafe_allow_html=True)
+                    st.caption("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to secrets.")
+
+                if st.button("🧪 Send test message"):
+                    ok, msg = send_telegram(f"✅ <b>Test alert</b> — {selected_sym} monitoring is active.")
+                    st.success("Sent!") if ok else st.error(f"Failed: {msg}")
+
+            st.markdown("---")
+
+            # Compare live vs snapshot
+            if current_holders and snapshot:
+                changes = compare_holders(snapshot["holders"], current_holders, selected_sym)
+
+                if changes:
+                    st.markdown(f"### ⚠️ {len(changes)} change(s) detected since last snapshot")
+
+                    rows = []
+                    for c in changes:
+                        type_label = {"NEW": "🆕 New", "EXIT": "🚪 Exit", "MOVE": "📊 Move"}[c["type"]]
+                        rows.append({
+                            "Type":    type_label,
+                            "Address": shorten_addr(c["address"]),
+                            "Old %":   f"{c['old_pct']:.2f}%" if c["old_pct"] is not None else "—",
+                            "New %":   f"{c['new_pct']:.2f}%" if c["new_pct"] is not None else "—",
+                            "Δ":       f"{c['delta']:+.2f}%",
+                        })
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+                    if st.button("📤 Send alert to Telegram"):
+                        msg  = format_alert_message(selected_sym, changes, snapshot["timestamp"])
+                        ok, resp = send_telegram(msg)
+                        st.success("Alert sent!") if ok else st.error(f"Failed: {resp}")
+                else:
+                    st.success("✅ No significant changes since last snapshot.")
+
+            elif not snapshot:
+                st.info("Save a baseline snapshot first, then come back after some time to see changes.")
+            elif h_err == "no_key":
+                st.caption("Add HELIUS_API_KEY to secrets.")
+            else:
+                st.warning("Could not fetch current holder data.")
+
+            # Current top 20 for reference
+            st.markdown("---")
+            st.markdown("#### Current top 20 holders")
+            if current_holders:
+                total = sum(_get_amt(h) for h in current_holders) or 1
+                ref_rows = []
+                for i, h in enumerate(current_holders, 1):
+                    amt = _get_amt(h)
+                    ref_rows.append({
+                        "Rank":     i,
+                        "Address":  shorten_addr(h.get("address", "—")),
+                        "Amount":   f"{amt:,.2f}",
+                        "% Supply": f"{amt/total*100:.2f}%",
+                    })
+                st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
+            elif h_err == "no_key":
+                st.caption("Add HELIUS_API_KEY to secrets.")
 
     # ── Manage Tokens ───────────────────────────
     elif view == "Manage Tokens":
