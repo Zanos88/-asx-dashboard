@@ -820,8 +820,45 @@ def run_holder_monitor() -> None:
         log.info("  Local snapshot saved → snapshots/%s_holders.json", symbol)
 
 
+def log_startup_diagnostics() -> None:
+    """Log which secrets are configured and send a Telegram connectivity test."""
+    log.info("── Startup diagnostics ──────────────────────────────────────")
+    log.info("HELIUS_API_KEY       : %s", "✅ set" if HELIUS_API_KEY      else "❌ MISSING")
+    log.info("TELEGRAM_BOT_TOKEN   : %s", "✅ set" if TELEGRAM_BOT_TOKEN  else "❌ MISSING")
+    log.info("TELEGRAM_CHAT_ID     : %s", "✅ set" if TELEGRAM_CHAT_ID    else "❌ MISSING")
+    log.info("SUPABASE_URL         : %s", "✅ set" if SUPABASE_URL        else "❌ MISSING")
+    log.info("SUPABASE_SERVICE_KEY : %s", "✅ set" if SUPABASE_KEY        else "❌ MISSING")
+    log.info("ANTHROPIC_API_KEY    : %s", "✅ set" if ANTHROPIC_API_KEY   else "❌ MISSING")
+    log.info("MOVE_THRESHOLD_PCT   : %.4f%%", MOVE_THRESHOLD_PCT)
+    log.info("MIN_HOLDER_CHANGE_TOKENS: %.0f", MIN_HOLDER_CHANGE_TOKENS)
+    log.info("Tokens tracked       : %s", list(TOKENS.keys()))
+    log.info("────────────────────────────────────────────────────────────")
+
+    # Telegram connectivity test — confirms bot token + chat ID are correct.
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "text":       f"🟢 <b>Monitor online</b> — {datetime.now(timezone.utc).strftime('%H:%M UTC')}\nThreshold: {MOVE_THRESHOLD_PCT:.4f}%  |  Tokens: {', '.join(TOKENS)}",
+                    "parse_mode": "HTML",
+                },
+                timeout=10,
+            )
+            if resp.ok:
+                log.info("✅ Telegram connectivity OK")
+            else:
+                log.error("❌ Telegram test failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            log.error("❌ Telegram test exception: %s", exc)
+    else:
+        log.error("❌ Telegram not tested — token or chat ID missing")
+
+
 def run() -> None:
     """Entry point — run the holder monitor. Never raises; all errors are logged."""
+    log_startup_diagnostics()
     run_holder_monitor()
     log.info("── Monitor complete")
 
