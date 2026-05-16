@@ -1,0 +1,39 @@
+{
+  "_comment": "Edit this file from the GitHub mobile app to update tokens, holdings, and thresholds. Changes take effect on the next run.",
+
+  "solana_tokens": {
+    "ALON": {
+      "address": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS",
+      "name": "Alon",
+      "emoji": "🤖"
+    }
+  },
+
+  "asx_holdings": {
+    "AKN.AX": {
+      "name": "AuKing Mining",
+      "avg_entry": 0.043,
+      "shares": 212782
+    },
+    "XST.AX": {
+      "name": "Xstate Resources",
+      "avg_entry": 0.120,
+      "shares": 0
+    }
+  },
+
+  "asx_watchlist": {
+    "G11.AX": { "name": "Group 11 Technologies" },
+    "VRC.AX": { "name": "Volt Resources" },
+    "RNX.AX": { "name": "Renegade Exploration" }
+  },
+
+  "akn_milestones": [
+    { "stage": "Discovery",  "target_cap_m": 55  },
+    { "stage": "Resource",   "target_cap_m": 100 },
+    { "stage": "Developer",  "target_cap_m": 250 }
+  ],
+
+  "move_threshold_pct": 1.0,
+  "whale_threshold_usd": 10000
+}

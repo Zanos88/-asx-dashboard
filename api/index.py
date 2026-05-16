@@ -48,13 +48,28 @@ HELIUS_API_KEY        = os.environ.get("HELIUS_API_KEY", "")
 XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
 HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
 CRON_SECRET           = os.environ.get("CRON_SECRET", "")
-WHALE_THRESHOLD_USD   = float(os.environ.get("WHALE_THRESHOLD_USD", "10000"))
-SENTIMENT_TOKENS      = [t.strip() for t in os.environ.get("SENTIMENT_TOKENS", "ALON").split(",") if t.strip()]
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
-# Mint address → symbol — extend as you add tokens
+def _load_config() -> dict[str, Any]:
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not load config.json (%s) — using defaults", exc)
+        return {}
+
+_cfg = _load_config()
+_default_whale = str(int(_cfg.get("whale_threshold_usd", 10000)))
+_default_symbols = ",".join(_cfg.get("solana_tokens", {}).keys()) or "ALON"
+
+WHALE_THRESHOLD_USD   = float(os.environ.get("WHALE_THRESHOLD_USD", _default_whale))
+SENTIMENT_TOKENS      = [t.strip() for t in os.environ.get("SENTIMENT_TOKENS", _default_symbols).split(",") if t.strip()]
+
+# Mint address → symbol (sourced from config.json)
 TOKEN_REGISTRY: dict[str, str] = {
-    "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS": "ALON",
-}
+    info["address"]: sym
+    for sym, info in _cfg.get("solana_tokens", {}).items()
+} or {"8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS": "ALON"}
 
 # Reverse lookup: symbol → mint
 SYMBOL_TO_MINT: dict[str, str] = {v: k for k, v in TOKEN_REGISTRY.items()}

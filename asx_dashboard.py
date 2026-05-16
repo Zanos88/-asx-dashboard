@@ -119,19 +119,31 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── Config (config.json — editable from GitHub mobile app) ───────────────────
+def _load_config() -> dict[str, Any]:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not load config.json (%s) — using defaults", exc)
+        return {}
+
+_cfg = _load_config()
+
 # ── Constants — ASX ───────────────────────────────────────────────────────────
-ACTUAL_HOLDINGS: dict[str, dict[str, Any]] = {
+ACTUAL_HOLDINGS: dict[str, dict[str, Any]] = _cfg.get("asx_holdings") or {
     "AKN.AX": {"avg_entry": 0.043, "shares": 212782, "name": "AuKing Mining"},
     "XST.AX": {"avg_entry": 0.120, "shares": 0,      "name": "Xstate Resources"},
 }
 
-WATCHLIST: dict[str, dict[str, Any]] = {
+WATCHLIST: dict[str, dict[str, Any]] = _cfg.get("asx_watchlist") or {
     "G11.AX": {"name": "Group 11 Technologies"},
     "VRC.AX": {"name": "Volt Resources"},
     "RNX.AX": {"name": "Renegade Exploration"},
 }
 
-AKN_MILESTONES: list[dict[str, Any]] = [
+AKN_MILESTONES: list[dict[str, Any]] = _cfg.get("akn_milestones") or [
     {"stage": "Discovery",  "target_cap_m": 55},
     {"stage": "Resource",   "target_cap_m": 100},
     {"stage": "Developer",  "target_cap_m": 250},
@@ -140,7 +152,7 @@ AKN_MILESTONES: list[dict[str, Any]] = [
 COMPARISON_START = "2026-01-01"
 
 # ── Constants — Crypto ────────────────────────────────────────────────────────
-DEFAULT_TOKENS: dict[str, dict[str, Any]] = {
+DEFAULT_TOKENS: dict[str, dict[str, Any]] = _cfg.get("solana_tokens") or {
     "ALON": {
         "address": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS",
         "name":    "Alon",

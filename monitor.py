@@ -50,13 +50,27 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 XAI_API_KEY        = os.environ.get("XAI_API_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
-MOVE_THRESHOLD_PCT = float(os.environ.get("MOVE_THRESHOLD_PCT", "1.0"))
 SKIP_SENTIMENT     = os.environ.get("SKIP_SENTIMENT", "0") == "1"
 
-# Token registry: symbol → mint address
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _load_config() -> dict[str, Any]:
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not load config.json (%s) — using defaults", exc)
+        return {}
+
+_cfg = _load_config()
+
+MOVE_THRESHOLD_PCT = float(os.environ.get("MOVE_THRESHOLD_PCT", str(_cfg.get("move_threshold_pct", 1.0))))
+
+# Token registry: symbol → mint address (sourced from config.json)
 TOKENS: dict[str, str] = {
-    "ALON": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS",
-}
+    sym: info["address"]
+    for sym, info in _cfg.get("solana_tokens", {}).items()
+} or {"ALON": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS"}
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
