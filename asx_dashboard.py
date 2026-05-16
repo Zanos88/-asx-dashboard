@@ -345,9 +345,17 @@ def fetch_helius_token_holders(token_address):
         api_key = st.secrets.get("HELIUS_API_KEY", "")
         if not api_key:
             return None, "no_key"
-        url  = f"https://api.helius.xyz/v1/token-holders?api-key={api_key}"
-        resp = requests.post(url, json={"mint": token_address, "limit": 20}, timeout=15)
-        return resp.json(), None
+        url     = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+        payload = {
+            "jsonrpc": "2.0",
+            "id":      1,
+            "method":  "getTokenLargestAccounts",
+            "params":  [token_address],
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        data = resp.json()
+        holders = data.get("result", {}).get("value", [])
+        return holders, None
     except Exception as e:
         return None, str(e)
 
@@ -798,40 +806,43 @@ else:
             h_data, h_err = fetch_helius_token_holders(addr)
 
             if h_data and isinstance(h_data, list) and len(h_data) > 0:
-                holders = h_data
-                if isinstance(holders[0], dict) and "amount" in holders[0]:
-                    total_supply = sum(float(h.get("amount", 0)) for h in holders)
-                    top3         = sum(float(h.get("amount", 0)) for h in holders[:3])
-                    top3_pct     = top3 / total_supply * 100 if total_supply else 0
+                # uiAmount is decimal-adjusted; fall back to raw amount string if absent
+                def get_amt(h):
+                    ui = h.get("uiAmount")
+                    if ui is not None:
+                        return float(ui)
+                    return float(h.get("amount", 0))
 
-                    holder_rows = []
-                    for i, h in enumerate(holders[:10], 1):
-                        amt = float(h.get("amount", 0))
-                        pct = amt / total_supply * 100 if total_supply else 0
-                        holder_rows.append({
-                            "Rank":     i,
-                            "Address":  shorten_addr(h.get("address", "—")),
-                            "Amount":   f"{amt:,.0f}",
-                            "% Supply": f"{pct:.2f}%",
-                        })
-                    st.dataframe(
-                        pd.DataFrame(holder_rows), use_container_width=True, hide_index=True
+                total_supply = sum(get_amt(h) for h in h_data)
+                top3         = sum(get_amt(h) for h in h_data[:3])
+                top3_pct     = top3 / total_supply * 100 if total_supply else 0
+
+                holder_rows = []
+                for i, h in enumerate(h_data[:10], 1):
+                    amt = get_amt(h)
+                    pct = amt / total_supply * 100 if total_supply else 0
+                    holder_rows.append({
+                        "Rank":     i,
+                        "Address":  shorten_addr(h.get("address", "—")),
+                        "Amount":   f"{amt:,.2f}",
+                        "% Supply": f"{pct:.2f}%",
+                    })
+                st.dataframe(
+                    pd.DataFrame(holder_rows), use_container_width=True, hide_index=True
+                )
+
+                if top3_pct > 50:
+                    st.markdown(
+                        f'<span class="warn-flag">⚠️ Top 3 holders: {top3_pct:.1f}% '
+                        f'— high concentration risk</span>',
+                        unsafe_allow_html=True,
                     )
-
-                    if top3_pct > 50:
-                        st.markdown(
-                            f'<span class="warn-flag">⚠️ Top 3 holders: {top3_pct:.1f}% '
-                            f'— high concentration risk</span>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(
-                            f'<span class="safe-flag">✅ Top 3 holders: {top3_pct:.1f}% '
-                            f'— reasonable distribution</span>',
-                            unsafe_allow_html=True,
-                        )
                 else:
-                    st.info("Holder data format not recognised.")
+                    st.markdown(
+                        f'<span class="safe-flag">✅ Top 3 holders: {top3_pct:.1f}% '
+                        f'— reasonable distribution</span>',
+                        unsafe_allow_html=True,
+                    )
             elif h_err == "no_key":
                 st.caption("Add HELIUS_API_KEY to secrets for holder data.")
             else:
