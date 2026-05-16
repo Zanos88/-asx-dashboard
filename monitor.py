@@ -18,8 +18,9 @@ Environment variables:
     TELEGRAM_CHAT_ID      Target chat or channel ID
     SUPABASE_URL          Supabase project URL (https://xxx.supabase.co)
     SUPABASE_KEY          Supabase service-role or anon key
-    MOVE_THRESHOLD_PCT    % supply change to trigger an alert (default from config.json)
-    SKIP_SENTIMENT        Legacy flag — ignored (sentiment not active)
+    MOVE_THRESHOLD_PCT        % supply change to trigger an alert (default from config.json)
+    MIN_HOLDER_CHANGE_TOKENS  raw token amount change to trigger an alert (default from config.json)
+    SKIP_SENTIMENT            Legacy flag — ignored (sentiment not active)
 
 Supabase table schemas expected:
 
@@ -92,6 +93,9 @@ _cfg = _load_config()
 
 MOVE_THRESHOLD_PCT = float(
     os.environ.get("MOVE_THRESHOLD_PCT", str(_cfg.get("move_threshold_pct", 1.0)))
+)
+MIN_HOLDER_CHANGE_TOKENS = float(
+    os.environ.get("MIN_HOLDER_CHANGE_TOKENS", str(_cfg.get("min_holder_change_tokens", 1000)))
 )
 
 # Token registry: symbol → mint address (sourced from config.json)
@@ -195,6 +199,8 @@ def write_alert_to_supabase(
         "old_pct":        change.get("old_pct"),
         "new_pct":        change.get("new_pct"),
         "delta_pct":      round(change["delta"], 6),
+        "token_delta":    change.get("token_delta"),
+        "trigger":        change.get("trigger", "pct"),
         "alerted_at":     datetime.now(timezone.utc).isoformat(),
         "telegram_sent":  telegram_sent,
     }
@@ -374,12 +380,27 @@ def compare_holders(
                             "old_pct": pct,  "new_pct": None, "delta": -pct})
 
     for addr in set(old_map) & set(new_map):
-        old_pct = get_amount(old_map[addr]) / old_total * 100
-        new_pct = get_amount(new_map[addr]) / new_total * 100
+        old_amt = get_amount(old_map[addr])
+        new_amt = get_amount(new_map[addr])
+        old_pct = old_amt / old_total * 100
+        new_pct = new_amt / new_total * 100
         delta   = new_pct - old_pct
-        if abs(delta) >= MOVE_THRESHOLD_PCT:
-            changes.append({"type": "MOVE", "address": addr,
-                            "old_pct": old_pct, "new_pct": new_pct, "delta": delta})
+        token_delta = abs(new_amt - old_amt)
+
+        pct_triggered   = abs(delta) >= MOVE_THRESHOLD_PCT
+        token_triggered = token_delta >= MIN_HOLDER_CHANGE_TOKENS
+
+        if pct_triggered or token_triggered:
+            changes.append({
+                "type":          "MOVE",
+                "address":       addr,
+                "old_pct":       old_pct,
+                "new_pct":       new_pct,
+                "delta":         delta,
+                "token_delta":   token_delta,
+                "trigger":       "pct+tokens" if (pct_triggered and token_triggered)
+                                 else ("pct" if pct_triggered else "tokens"),
+            })
 
     return changes
 
@@ -408,10 +429,14 @@ def format_holder_alert(
                 f"   <code>{addr}</code> was {c['old_pct']:.2f}%"
             )
         else:
-            arrow = "📈" if c["delta"] > 0 else "📉"
+            arrow   = "📈" if c["delta"] > 0 else "📉"
+            trigger = c.get("trigger", "pct")
+            tok_str = (
+                f"  {c['token_delta']:,.0f} tokens" if "token" in trigger else ""
+            )
             lines.append(
                 f"{arrow} <b>MOVE</b>  <code>{addr}</code>\n"
-                f"   {c['old_pct']:.2f}% → {c['new_pct']:.2f}% ({c['delta']:+.2f}%)"
+                f"   {c['old_pct']:.2f}% → {c['new_pct']:.2f}% ({c['delta']:+.2f}%){tok_str}"
             )
     return "\n".join(lines)
 

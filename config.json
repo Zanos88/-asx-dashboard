@@ -34,6 +34,7 @@
     { "stage": "Developer",  "target_cap_m": 250 }
   ],
 
-  "move_threshold_pct": 1.0,
-  "whale_threshold_usd": 10000
+  "move_threshold_pct": 0.1,
+  "whale_threshold_usd": 500,
+  "min_holder_change_tokens": 1000
 }
