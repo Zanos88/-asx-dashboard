@@ -301,67 +301,154 @@ def send_holder_status(symbol: str, mint: str) -> None:
 
 # ── Webhook processing ────────────────────────────────────────────────────────
 
-def verify_helius_signature(body: bytes, signature: str, secret: str) -> bool:
+def verify_helius_signature(header_value: str, secret: str) -> bool:
     """
-    Verify the HMAC-SHA256 signature on an incoming Helius webhook request.
+    Verify the Authorization header on an incoming Helius webhook request.
+
+    Helius sends the raw auth token string you configured in the dashboard
+    as the ``Authorization`` header value — it is NOT an HMAC digest.
 
     Args:
-        body:      Raw request body bytes.
-        signature: Value of the ``authorization`` header from Helius.
-        secret:    Shared secret configured in the Helius dashboard.
+        header_value: Value of the ``Authorization`` header from Helius.
+        secret:       Auth token configured in the Helius webhook dashboard.
 
     Returns:
         True if valid, or if no secret is configured (verification skipped).
     """
     if not secret:
         return True
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    return hmac.compare_digest(header_value.strip(), secret.strip())
+
+
+# Module-level price cache — lives for the duration of one Vercel function invocation
+_price_cache: dict[str, float] = {}
+
+
+def get_token_price_usd(mint: str) -> float:
+    """
+    Fetch the current USD price for a token from DexScreener.
+
+    Results are cached in ``_price_cache`` for the lifetime of the invocation.
+    Returns 0.0 on any failure so callers can fall back gracefully.
+
+    Args:
+        mint: Solana token mint address.
+
+    Returns:
+        Price in USD as a float, or 0.0 if unavailable.
+    """
+    if mint in _price_cache:
+        return _price_cache[mint]
+    try:
+        resp = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+            timeout=4,
+        )
+        resp.raise_for_status()
+        pairs = resp.json().get("pairs") or []
+        # Use highest-liquidity pair
+        pairs = sorted(
+            pairs,
+            key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0),
+            reverse=True,
+        )
+        price = float(pairs[0].get("priceUsd", 0) or 0) if pairs else 0.0
+        _price_cache[mint] = price
+        return price
+    except Exception as exc:
+        log.warning("DexScreener price lookup failed for %s: %s", mint[:8], exc)
+        return 0.0
+
+
+def _transfer_direction(tx: dict[str, Any], mint: str) -> str:
+    """
+    Determine transfer direction from Helius swap event data.
+
+    Checks ``events.swap.tokenInputs`` and ``tokenOutputs`` to classify the
+    transfer as BUY or SELL relative to the tracked token. Falls back to
+    TRANSFER for non-swap transactions.
+
+    Args:
+        tx:   Full Helius enhanced transaction dict.
+        mint: Token mint address to check direction for.
+
+    Returns:
+        One of ``"📥 BUY"``, ``"📤 SELL"``, or ``"🔀 TRANSFER"``.
+    """
+    swap = (tx.get("events") or {}).get("swap") or {}
+    for out in swap.get("tokenOutputs", []):
+        if out.get("mint") == mint:
+            return "📥 BUY"
+    for inp in swap.get("tokenInputs", []):
+        if inp.get("mint") == mint:
+            return "📤 SELL"
+    return "🔀 TRANSFER"
 
 
 def process_transaction(tx: dict[str, Any]) -> list[str]:
     """
-    Parse a Helius transaction dict and return Telegram alert strings for any
-    token transfers that exceed the whale threshold.
+    Parse a Helius enhanced transaction and return Telegram alert strings for
+    any token transfers that exceed the whale threshold.
+
+    USD value is estimated via DexScreener price lookup. If DexScreener is
+    unavailable, falls back to token count vs ``min_holder_change_tokens``
+    from config.json.
 
     Individual transfer parse errors are logged and skipped rather than raised.
 
     Args:
-        tx: Raw transaction dict from a Helius webhook payload.
+        tx: Raw enhanced transaction dict from a Helius webhook payload.
 
     Returns:
         List of HTML-formatted alert strings (empty if no whale activity).
     """
-    alerts: list[str] = []
-    sig      = tx.get("signature", "unknown")[:12]
+    alerts:   list[str] = []
+    sig      = tx.get("signature", "unknown")
     tx_type  = tx.get("type", "UNKNOWN")
     ts       = tx.get("timestamp", 0)
     time_str = datetime.utcfromtimestamp(ts).strftime("%H:%M:%S UTC") if ts else "—"
 
     for tt in tx.get("tokenTransfers", []):
         try:
-            mint      = tt.get("mint", "")
-            symbol    = TOKEN_REGISTRY.get(mint, f"{mint[:8]}...")
-            amount    = float(tt.get("tokenAmount", 0) or 0)
-            usd_val   = float(tt.get("tokenAmountUsd", 0) or 0)
+            mint = tt.get("mint", "")
 
-            if usd_val < WHALE_THRESHOLD_USD:
+            # Only alert on tokens we actively track
+            if mint not in TOKEN_REGISTRY:
                 continue
+
+            symbol    = TOKEN_REGISTRY[mint]
+            token_cfg = _cfg.get("solana_tokens", {}).get(symbol, {})
+            emoji     = token_cfg.get("emoji", "🪙")
+            amount    = float(tt.get("tokenAmount", 0) or 0)
+
+            # USD value via DexScreener; fall back to token-count threshold
+            price   = get_token_price_usd(mint)
+            usd_val = round(amount * price, 2) if price else 0.0
+
+            if price:
+                if usd_val < WHALE_THRESHOLD_USD:
+                    continue
+            else:
+                min_tokens = float(_cfg.get("min_holder_change_tokens", 1000))
+                if amount < min_tokens:
+                    continue
 
             from_addr = tt.get("fromUserAccount", "")
             to_addr   = tt.get("toUserAccount", "")
-            direction = "📤 SELL" if not to_addr else "📥 BUY"
+            direction = _transfer_direction(tx, mint)
+
+            usd_str   = f"\n💵 {fmt_usd(usd_val)}" if usd_val else ""
+            price_str = f"  @${price:.6f}" if price else ""
 
             alerts.append(
-                f"🐳 <b>WHALE {direction} — {symbol}</b>\n"
-                f"💰 {fmt_usd(usd_val)}\n"
-                f"📊 {amount:,.0f} tokens\n"
-                f"🔀 {shorten_addr(from_addr)} → {shorten_addr(to_addr)}\n"
+                f"🐳 <b>WHALE {direction} — {symbol} {emoji}</b>\n"
+                f"📊 {amount:,.0f} tokens{price_str}{usd_str}\n"
+                f"🔀 <code>{shorten_addr(from_addr)}</code> → <code>{shorten_addr(to_addr)}</code>\n"
                 f"🕐 {time_str}  |  {tx_type}\n"
-                f"🔗 <code>{sig}...</code>"
+                f"🔗 <code>{sig[:20]}...</code>"
             )
         except (ValueError, TypeError, KeyError) as exc:
-            log.warning("Skipping malformed transfer in tx %s: %s", sig, exc)
+            log.warning("Skipping malformed transfer in tx %s: %s", sig[:12], exc)
             continue
 
     return alerts
@@ -393,7 +480,7 @@ async def helius_webhook(request: Request) -> JSONResponse:
     body = await request.body()
 
     signature = request.headers.get("authorization", "")
-    if HELIUS_WEBHOOK_SECRET and not verify_helius_signature(body, signature, HELIUS_WEBHOOK_SECRET):
+    if HELIUS_WEBHOOK_SECRET and not verify_helius_signature(signature, HELIUS_WEBHOOK_SECRET):
         log.warning("Rejected webhook — invalid HMAC signature")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
