@@ -143,79 +143,125 @@ _supabase: Client | None = init_supabase()
 
 def write_snapshot_to_supabase(
     symbol: str,
+    token_address: str,
     holders: list[dict[str, Any]],
 ) -> None:
     """
-    Insert the current holder snapshot into the ``wallet_snapshots`` table.
+    Insert one row per holder into ``wallet_snapshots``.
+
+    Schema requires token_address, token_symbol, and wallet_address (all NOT NULL),
+    so we insert N rows — one per holder — rather than a single aggregate row.
 
     Args:
-        symbol:  Token symbol (e.g. "ALON").
-        holders: Holder list from ``fetch_holders()``.
+        symbol:        Token symbol (e.g. "ALON").
+        token_address: Solana mint address.
+        holders:       Holder list from ``fetch_holders()``.
     """
     if _supabase is None:
         return
 
-    total = sum(get_amount(h) for h in holders) or 1.0
-    top10_pct = sum(
-        get_amount(h) / total * 100
-        for h in holders[:10]
-    )
+    total        = sum(get_amount(h) for h in holders) or 1.0
+    top10_pct    = sum(get_amount(h) / total * 100 for h in holders[:10])
+    holder_count = len(holders)
+    captured_at  = datetime.now(timezone.utc).isoformat()
 
-    row = {
-        "symbol":       symbol,
-        "captured_at":  datetime.now(timezone.utc).isoformat(),
-        "holders":      holders,
-        "holder_count": len(holders),
-        "top10_pct":    round(top10_pct, 4),
-    }
+    rows = [
+        {
+            "token_address":  token_address,
+            "token_symbol":   symbol,
+            "symbol":         symbol,
+            "wallet_address": h["address"],
+            "rank":           rank,
+            "balance":        get_amount(h),
+            "pct_supply":     round(get_amount(h) / total * 100, 6),
+            "captured_at":    captured_at,
+            "holder_count":   holder_count,
+            "top10_pct":      round(top10_pct, 4),
+        }
+        for rank, h in enumerate(holders, 1)
+    ]
 
     try:
-        _supabase.table("wallet_snapshots").insert(row).execute()
-        log.info("  ✅ Snapshot written to Supabase wallet_snapshots (%s)", symbol)
+        _supabase.table("wallet_snapshots").insert(rows).execute()
+        log.info("  ✅ %d holder rows written to wallet_snapshots (%s)", len(rows), symbol)
     except Exception as exc:
         log.error("  ❌ Failed to write snapshot to Supabase for %s: %s", symbol, exc)
 
 
 def write_alert_to_supabase(
     symbol: str,
+    token_address: str,
     change: dict[str, Any],
     telegram_sent: bool,
 ) -> None:
     """
-    Insert a single holder change event into the ``whale_alerts`` table.
+    Insert a holder change event into ``whale_alerts`` and ``wallet_flow_changes``.
 
     Args:
         symbol:        Token symbol.
+        token_address: Solana mint address.
         change:        Single change dict from ``compare_holders()``.
         telegram_sent: Whether the Telegram alert was delivered successfully.
     """
     if _supabase is None:
         return
 
-    row = {
+    now = datetime.now(timezone.utc).isoformat()
+
+    # ── whale_alerts ──────────────────────────────────────────────────────────
+    alert_row = {
+        "token_address":  token_address,
+        "token_symbol":   symbol,
         "symbol":         symbol,
-        "change_type":    change["type"],
         "wallet_address": change["address"],
+        "change_type":    change["type"],
         "old_pct":        change.get("old_pct"),
         "new_pct":        change.get("new_pct"),
         "delta_pct":      round(change["delta"], 6),
         "token_delta":    change.get("token_delta"),
         "trigger":        change.get("trigger", "pct"),
-        "alerted_at":     datetime.now(timezone.utc).isoformat(),
+        "alerted_at":     now,
         "telegram_sent":  telegram_sent,
     }
-
     try:
-        _supabase.table("whale_alerts").insert(row).execute()
+        _supabase.table("whale_alerts").insert(alert_row).execute()
         log.info(
-            "  ✅ Alert written to Supabase whale_alerts (%s %s %s)",
+            "  ✅ Alert written to whale_alerts (%s %s %s)",
             symbol, change["type"], change["address"][:8],
         )
     except Exception as exc:
         log.error(
-            "  ❌ Failed to write alert to Supabase for %s %s: %s",
+            "  ❌ Failed to write to whale_alerts for %s %s: %s",
             symbol, change["address"][:8], exc,
         )
+
+    # ── wallet_flow_changes (MOVE events only) ────────────────────────────────
+    if change["type"] == "MOVE":
+        token_delta = change.get("token_delta", 0) or 0
+        delta       = change.get("delta", 0)
+        flow_row = {
+            "token_address":  token_address,
+            "token_symbol":   symbol,
+            "symbol":         symbol,
+            "wallet_address": change["address"],
+            "prev_balance":   None,
+            "new_balance":    None,
+            "change_amount":  token_delta,
+            "change_pct":     round(delta, 6),
+            "flow_type":      "buy" if delta > 0 else "sell",
+            "detected_at":    now,
+        }
+        try:
+            _supabase.table("wallet_flow_changes").insert(flow_row).execute()
+            log.info(
+                "  ✅ Flow written to wallet_flow_changes (%s %s %s)",
+                symbol, flow_row["flow_type"], change["address"][:8],
+            )
+        except Exception as exc:
+            log.error(
+                "  ❌ Failed to write to wallet_flow_changes for %s %s: %s",
+                symbol, change["address"][:8], exc,
+            )
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -476,7 +522,7 @@ def run_holder_monitor() -> None:
         log.info("  Fetched %d holders", len(current))
 
         # Write snapshot to Supabase regardless of whether changes are detected.
-        write_snapshot_to_supabase(symbol, current)
+        write_snapshot_to_supabase(symbol, address, current)
 
         snapshot = load_snapshot(symbol)
 
@@ -502,9 +548,9 @@ def run_holder_monitor() -> None:
                 except Exception as exc:
                     log.error("Unexpected Telegram error for %s: %s", symbol, exc)
 
-                # Write each individual change to Supabase whale_alerts.
+                # Write each individual change to Supabase.
                 for change in changes:
-                    write_alert_to_supabase(symbol, change, telegram_sent)
+                    write_alert_to_supabase(symbol, address, change, telegram_sent)
             else:
                 log.info("  No significant changes")
         else:
