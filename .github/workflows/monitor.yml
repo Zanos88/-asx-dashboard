@@ -2,11 +2,11 @@ name: Holder Monitor + Sentiment Digest
 
 on:
   schedule:
-    - cron: '0 * * * *'   # every hour on the hour
-  workflow_dispatch:        # allow manual trigger from GitHub UI
+    - cron: '*/15 * * * *'  # every 15 minutes
+  workflow_dispatch:          # allow manual trigger from GitHub UI
 
 permissions:
-  contents: write           # required to commit updated snapshots back to repo
+  contents: write             # required to commit updated snapshots back to repo
 
 jobs:
   monitor:
@@ -22,17 +22,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests tenacity
+        run: pip install -r requirements.txt
 
       - name: Run holder monitor and sentiment digest
         env:
           HELIUS_API_KEY:     ${{ secrets.HELIUS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          XAI_API_KEY:        ${{ secrets.XAI_API_KEY }}
-          MOVE_THRESHOLD_PCT: "1.0"
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
           # Set SKIP_SENTIMENT=1 on frequent runs to avoid excess Grok API calls
-          SKIP_SENTIMENT:     "0"
+          SKIP_SENTIMENT:     "1"
         run: python monitor.py
 
       - name: Commit updated snapshots
