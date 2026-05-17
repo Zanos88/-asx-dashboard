@@ -590,11 +590,9 @@ async def telegram_command_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(telegram_command_loop())
+    # Telegram command polling is handled by bot_commands.py (via main.py daemon thread).
+    # webhook.py handles only Helius webhooks and HTTP endpoints.
     yield
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
 
 
 # ── App ───────────────────────────────────────────────────────────────────────

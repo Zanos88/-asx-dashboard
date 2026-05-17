@@ -301,36 +301,6 @@ def init_supabase() -> Client | None:
 _supabase: Client | None = init_supabase()
 
 
-def _load_bot_config_from_supabase() -> None:
-    """Override config.json values with live settings written by the Telegram bot."""
-    global MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS, TOKENS
-    if _supabase is None:
-        return
-    try:
-        result = _supabase.table("bot_config").select("key,value").execute()
-        cfg = {row["key"]: row["value"] for row in (result.data or [])}
-
-        if "move_threshold_pct" in cfg:
-            MOVE_THRESHOLD_PCT = float(cfg["move_threshold_pct"])
-            log.info("bot_config override: move_threshold_pct=%.4f%%", MOVE_THRESHOLD_PCT)
-
-        if "min_holder_change_tokens" in cfg:
-            MIN_HOLDER_CHANGE_TOKENS = float(cfg["min_holder_change_tokens"])
-            log.info("bot_config override: min_holder_change_tokens=%.0f", MIN_HOLDER_CHANGE_TOKENS)
-
-        if "tracked_tokens" in cfg:
-            try:
-                tracked = json.loads(cfg["tracked_tokens"])
-                if isinstance(tracked, dict) and tracked:
-                    TOKENS.clear()
-                    TOKENS.update(tracked)
-                    log.info("bot_config override: tracked_tokens=%s", list(TOKENS.keys()))
-            except json.JSONDecodeError:
-                pass
-    except Exception as exc:
-        log.warning("Failed to load bot_config from Supabase: %s", exc)
-
-
 # ── Supabase writers ──────────────────────────────────────────────────────────
 
 def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[dict]) -> None:
@@ -420,30 +390,6 @@ def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any
     except Exception as exc:
         log.warning("wallet_metadata lookup failed for %s: %s", address[:8], exc)
         return default
-
-
-def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) -> None:
-    if _supabase is None:
-        return
-    multi = {addr: h for addr, h in cross_holdings.items() if len(h) >= 2}
-    if not multi:
-        return
-    rows = []
-    for addr, holdings in multi.items():
-        sym_list = sorted(holdings.keys())
-        for i in range(len(sym_list)):
-            for j in range(i + 1, len(sym_list)):
-                rows.append({
-                    "wallet_address": addr,
-                    "coin_a": sym_list[i], "coin_a_pct": round(holdings[sym_list[i]], 4),
-                    "coin_b": sym_list[j], "coin_b_pct": round(holdings[sym_list[j]], 4),
-                })
-    if rows:
-        try:
-            _supabase.table("wallet_relationships").insert(rows).execute()
-            log.info("✅ %d wallet relationship row(s) written", len(rows))
-        except Exception as exc:
-            log.error("❌ wallet_relationships insert failed: %s", exc)
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────

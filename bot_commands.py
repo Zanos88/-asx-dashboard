@@ -5,6 +5,7 @@ Railway worker: see Procfile
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -20,9 +21,11 @@ from monitor import (
     TELEGRAM_CHAT_ID,
     MOVE_THRESHOLD_PCT,
     MIN_HOLDER_CHANGE_TOKENS,
+    MAJOR_TOKEN_MINTS,
     _CONFIG_PATH,
     _load_config,
     fetch_holders,
+    fetch_wallet_intel,
     load_snapshot,
     get_amount,
 )
@@ -93,6 +96,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — Config &amp; connection status\n"
         "/snapshot — Latest saved snapshot for all tokens\n"
         "/holders &lt;SYMBOL&gt; — Fetch live top-10 holders\n"
+        "/related — External token holdings for top wallets\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
         "/removetoken &lt;SYMBOL&gt; — Stop tracking a token\n"
         "/threshold &lt;PCT&gt; — Set move alert threshold (e.g. 0.01)\n"
@@ -252,6 +256,80 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def cmd_related(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+
+    await update.message.reply_text(
+        "⏳ Fetching live external holdings for top wallets… (may take 20–30s)",
+    )
+
+    cfg    = _load_config()
+    tokens = {sym: info["address"] for sym, info in cfg.get("solana_tokens", {}).items()}
+    if not tokens:
+        await update.message.reply_text("No tokens tracked. Use /addtoken.")
+        return
+
+    loop   = asyncio.get_event_loop()
+    lines  = ["🕸 <b>Cross-Token Whale Intelligence</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+    ext_names = ", ".join(MAJOR_TOKEN_MINTS.keys())
+
+    for sym, token_addr in tokens.items():
+        snap = load_snapshot(sym)
+        emoji = cfg.get("solana_tokens", {}).get(sym, {}).get("emoji", "🔹")
+        if not snap:
+            lines.append(f"\n{emoji} <b>{sym}</b>: no snapshot yet")
+            continue
+
+        all_holders = snap.get("holders", [])
+        total       = sum(get_amount(h) for h in all_holders) or 1.0
+        top10       = all_holders[:10]
+
+        wallet_lines: list[str] = []
+        for rank, h in enumerate(top10, 1):
+            addr = h.get("address", "")
+            pct  = get_amount(h) / total * 100
+
+            # Run synchronous RPC call in a thread so we don't block the event loop
+            intel = await loop.run_in_executor(None, fetch_wallet_intel, addr, sym)
+
+            majors  = intel.get("major_tokens", {})
+            sol_usd = intel.get("sol_usd")
+
+            # Only show external positions >= $500
+            significant = {
+                s: d for s, d in majors.items() if d.get("usd", 0) >= 500
+            }
+            if sol_usd and sol_usd >= 500:
+                significant["SOL"] = {"usd": sol_usd}
+
+            if not significant:
+                continue
+
+            parts = [
+                f"{ext} ~${d['usd']:,.0f}"
+                for ext, d in sorted(significant.items(), key=lambda kv: -kv[1].get("usd", 0))
+            ]
+            short = f"{addr[:8]}…{addr[-6:]}"
+            wallet_lines.append(
+                f"  #{rank} <code>{short}</code> ({pct:.2f}%)\n"
+                f"    • {' | '.join(parts)}"
+            )
+
+        lines.append(f"\n{emoji} <b>{sym}</b>:")
+        if wallet_lines:
+            lines.extend(wallet_lines)
+        else:
+            lines.append("  No top-10 holder holds ≥$500 in any external token")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<i>Checks: {ext_names}</i>")
+    lines.append(f"<i>Threshold ≥$500 | {datetime.now(timezone.utc).strftime('%H:%M UTC')}</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -268,6 +346,7 @@ def main() -> None:
     app.add_handler(CommandHandler("removetoken",   cmd_removetoken))
     app.add_handler(CommandHandler("threshold",     cmd_threshold))
     app.add_handler(CommandHandler("movethreshold", cmd_threshold))
+    app.add_handler(CommandHandler("related",       cmd_related))
     log.info("🤖 Bot polling started — authorized chat: %s", _AUTHORIZED_CHAT)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
