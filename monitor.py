@@ -908,7 +908,7 @@ def format_quant_alert(
         major_parts = []
         for sym, data in sorted(majors.items(), key=lambda kv: -kv[1].get("usd", 0)):
             usd = data.get("usd", 0)
-            if usd >= 5000:
+            if usd >= 500:
                 major_parts.append(f"{sym}: ~${usd:,.0f}")
         if major_parts:
             intel_lines.append(f"  • {', '.join(major_parts[:4])}")
