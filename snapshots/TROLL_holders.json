@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-05-17T09:19:26.916717+00:00",
+  "timestamp": "2026-05-17T10:28:52.636119+00:00",
   "holders": [
     {
       "address": "7ecuyhdmuiCksyZZ3PMaPaafuW3c5TUvFud6PVp7tVwb",
@@ -17,10 +17,10 @@
     },
     {
       "address": "53vDorCSUPb1vNkY5cvJVFGGzymByXftvtv25k5hCSZ9",
-      "uiAmount": 22559650.960649,
+      "uiAmount": 23003223.537257,
       "decimals": 6,
-      "amount": "22559650960649",
-      "uiAmountString": "22559650.960649"
+      "amount": "23003223537257",
+      "uiAmountString": "23003223.537257"
     },
     {
       "address": "5Lkyx7wymZpaQKVFqTXkQShevyWoKsUGhJVKKStPLfk8",
@@ -31,10 +31,10 @@
     },
     {
       "address": "8SmW82qNZ7BpdBp5PZk7znqt3VswFzX3nkRgHBBE1x4e",
-      "uiAmount": 17490950.25726,
+      "uiAmount": 17010245.770368,
       "decimals": 6,
-      "amount": "17490950257260",
-      "uiAmountString": "17490950.25726"
+      "amount": "17010245770368",
+      "uiAmountString": "17010245.770368"
     },
     {
       "address": "FWebf3p1t7Gv4FEvPgRRqGfUjLm7q8Qa2N65eZwxp6VR",
@@ -45,10 +45,10 @@
     },
     {
       "address": "CDJq3hANVq1jn68hvJinBbWu9mkhZwWUoA3jUVqFeEjn",
-      "uiAmount": 16060705.664063,
+      "uiAmount": 16068796.181063,
       "decimals": 6,
-      "amount": "16060705664063",
-      "uiAmountString": "16060705.664063"
+      "amount": "16068796181063",
+      "uiAmountString": "16068796.181063"
     },
     {
       "address": "97db5ui4fJwna9mcZyuviGmELpVs8nn9xAoWoZXGZe53",
@@ -101,10 +101,10 @@
     },
     {
       "address": "AVnk2eh9UuPTAprMboDWEkQAd3W35kFPFidkhFJ2sTxM",
-      "uiAmount": 9083905.745036,
+      "uiAmount": 9028122.775036,
       "decimals": 6,
-      "amount": "9083905745036",
-      "uiAmountString": "9083905.745036"
+      "amount": "9028122775036",
+      "uiAmountString": "9028122.775036"
     },
     {
       "address": "7pMcxFP5MB5W4oSKxieXx7FPMzkpVGATW8ZJg58oFsq5",
