@@ -8,7 +8,7 @@ Environment variables:
     TELEGRAM_BOT_TOKEN        Telegram bot token from @BotFather
     TELEGRAM_CHAT_ID          Target chat or channel ID
     SUPABASE_URL              Supabase project URL (https://xxx.supabase.co)
-    SUPABASE_SERVICE_KEY      Supabase service-role key (bypasses RLS)
+    SUPABASE_SERVICE_ROLE_KEY Supabase service-role key (bypasses RLS)
     ANTHROPIC_API_KEY         Anthropic API key for AI interpretation
     MOVE_THRESHOLD_PCT        % supply change to trigger an alert (overridden by bot_config)
     MIN_HOLDER_CHANGE_TOKENS  raw token amount threshold (overridden by bot_config)
@@ -16,6 +16,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ HELIUS_API_KEY     = os.environ.get("HELIUS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
 
@@ -83,7 +84,7 @@ MAX_ALERTS_PER_RUN = 20
 
 # Wallet intelligence (FIX 3)
 WALLET_INTEL_CACHE_SECS    = 600   # 10 min
-WALLET_INTEL_MIN_DELTA_PCT = 0.5   # only fetch for moves >= 0.5%
+WALLET_INTEL_MIN_DELTA_PCT = 0.1   # only fetch for moves >= 0.1%
 PRICE_CACHE_SECS           = 60    # 60 sec price cache
 
 MAJOR_TOKEN_MINTS: dict[str, str] = {
@@ -91,7 +92,184 @@ MAJOR_TOKEN_MINTS: dict[str, str] = {
     "WIF":    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
     "JUP":    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
     "POPCAT": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+    "HANTA":  "2tXpgu2DLTsPUf9zFmuZmA4xrYxXKBTpVq9wAM7hzs9y",
+    "PUMP":   "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
 }
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# ── Module-level run state ────────────────────────────────────────────────────
+DRY_RUN: bool                                    = False  # set via --dry-run
+_ai_cache: dict[str, tuple[str, float]]          = {}
+_coord_ai_cache: dict[str, tuple[str, float]]    = {}
+_alert_timestamps: dict[str, float]              = {}
+_wallet_intel_cache: dict[str, tuple[dict, float]] = {}
+_price_cache: dict[str, tuple[dict, float]]      = {}
+_hourly_alert_count: int                         = 0
+_hourly_flows: list[dict[str, Any]]              = []
+
+
+# ── Supabase client ───────────────────────────────────────────────────────────
+
+def init_supabase() -> Client | None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.error("Supabase not configured — set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
+        return None
+    try:
+        client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        client.table("wallet_snapshots").select("id").limit(1).execute()
+        log.info("✅ Supabase connection OK — %s", SUPABASE_URL)
+        return client
+    except Exception as exc:
+        log.error("❌ Supabase connection FAILED: %s", exc)
+        return None
+
+
+_supabase: Client | None = init_supabase()
+
+
+def _load_bot_config_from_supabase() -> None:
+    """Override config.json values with live settings written by the Telegram bot."""
+    global MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS, TOKENS
+    if _supabase is None:
+        return
+    try:
+        result = _supabase.table("bot_config").select("key,value").execute()
+        cfg = {row["key"]: row["value"] for row in (result.data or [])}
+
+        if "move_threshold_pct" in cfg:
+            MOVE_THRESHOLD_PCT = float(cfg["move_threshold_pct"])
+            log.info("bot_config override: move_threshold_pct=%.4f%%", MOVE_THRESHOLD_PCT)
+
+        if "min_holder_change_tokens" in cfg:
+            MIN_HOLDER_CHANGE_TOKENS = float(cfg["min_holder_change_tokens"])
+            log.info("bot_config override: min_holder_change_tokens=%.0f", MIN_HOLDER_CHANGE_TOKENS)
+
+        if "tracked_tokens" in cfg:
+            try:
+                tracked = json.loads(cfg["tracked_tokens"])
+                if isinstance(tracked, dict) and tracked:
+                    TOKENS.clear()
+                    TOKENS.update(tracked)
+                    log.info("bot_config override: tracked_tokens=%s", list(TOKENS.keys()))
+            except json.JSONDecodeError:
+                pass
+    except Exception as exc:
+        log.warning("Failed to load bot_config from Supabase: %s", exc)
+
+
+# ── Supabase writers ──────────────────────────────────────────────────────────
+
+def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[dict]) -> None:
+    if DRY_RUN:
+        log.info("[DRY RUN] Supabase wallet_snapshots write skipped (%s)", symbol)
+        return
+    if _supabase is None:
+        return
+    total        = sum(get_amount(h) for h in holders) or 1.0
+    top10_pct    = sum(get_amount(h) / total * 100 for h in holders[:10])
+    holder_count = len(holders)
+    captured_at  = datetime.now(timezone.utc).isoformat()
+    rows = [
+        {
+            "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
+            "wallet_address": h["address"], "rank": rank,
+            "balance": get_amount(h),
+            "pct_supply": round(get_amount(h) / total * 100, 6),
+            "captured_at": captured_at, "holder_count": holder_count,
+            "top10_pct": round(top10_pct, 4),
+        }
+        for rank, h in enumerate(holders, 1)
+    ]
+    try:
+        _supabase.table("wallet_snapshots").insert(rows).execute()
+        log.info("  ✅ %d rows → wallet_snapshots (%s)", len(rows), symbol)
+    except Exception as exc:
+        log.error("  ❌ wallet_snapshots insert failed for %s: %s", symbol, exc)
+
+
+def write_alert_to_supabase(symbol: str, token_address: str, change: dict, telegram_sent: bool) -> None:
+    if DRY_RUN:
+        log.info("[DRY RUN] Supabase whale_alerts write skipped (%s)", symbol)
+        return
+    if _supabase is None:
+        return
+    now         = datetime.now(timezone.utc).isoformat()
+    token_delta = change.get("tokens_delta") or change.get("token_delta") or 0
+    delta       = change.get("delta", 0)
+    flow_type   = (
+        "entry" if change["type"] == "NEW"
+        else "exit" if change["type"] == "EXIT"
+        else "buy"  if delta > 0
+        else "sell"
+    )
+    try:
+        _supabase.table("whale_alerts").insert({
+            "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
+            "wallet_address": change["address"], "change_type": change["type"],
+            "old_pct": change.get("old_pct"), "new_pct": change.get("new_pct"),
+            "delta_pct": round(delta, 6), "token_delta": token_delta,
+            "trigger": change.get("trigger", "pct"),
+            "alerted_at": now, "telegram_sent": telegram_sent,
+        }).execute()
+    except Exception as exc:
+        log.error("  ❌ whale_alerts insert failed: %s", exc)
+
+    try:
+        _supabase.table("wallet_flow_changes").insert({
+            "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
+            "wallet_address": change["address"],
+            "prev_balance": change.get("old_tokens"), "new_balance": change.get("new_tokens"),
+            "change_amount": token_delta if delta >= 0 else -token_delta,
+            "change_pct": round(delta, 6), "flow_type": flow_type, "detected_at": now,
+        }).execute()
+    except Exception as exc:
+        log.error("  ❌ wallet_flow_changes insert failed: %s", exc)
+
+
+def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any]:
+    default = {"age_days": None, "is_new_wallet": False}
+    if _supabase is None:
+        return default
+    try:
+        result = _supabase.table("wallet_metadata").select("first_seen").eq("address", address).execute()
+        now = datetime.now(timezone.utc)
+        if result.data:
+            first_seen = datetime.fromisoformat(result.data[0]["first_seen"].replace("Z", "+00:00"))
+            age_days   = (now - first_seen).days
+            return {"age_days": age_days, "is_new_wallet": age_days < 1}
+        else:
+            _supabase.table("wallet_metadata").insert({
+                "address": address, "symbol": symbol,
+                "first_seen": now.isoformat(), "first_seen_rank": rank,
+            }).execute()
+            return {"age_days": 0, "is_new_wallet": True}
+    except Exception as exc:
+        log.warning("wallet_metadata lookup failed for %s: %s", address[:8], exc)
+        return default
+
+
+def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) -> None:
+    if _supabase is None:
+        return
+    multi = {addr: h for addr, h in cross_holdings.items() if len(h) >= 2}
+    if not multi:
+        return
+    rows = []
+    for addr, holdings in multi.items():
+        sym_list = sorted(holdings.keys())
+        for i in range(len(sym_list)):
+            for j in range(i + 1, len(sym_list)):
+                rows.append({
+                    "wallet_address": addr,
+                    "coin_a": sym_list[i], "coin_a_pct": round(holdings[sym_list[i]], 4),
+                    "coin_b": sym_list[j], "coin_b_pct": round(holdings[sym_list[j]], 4),
+                })
+    if rows:
+        try:
+            _supabase.table("wallet_relationships").insert(rows).execute()
+            log.info("✅ %d wallet relationship row(s) written", len(rows))
+        except Exception as exc:
+            log.error("❌ wallet_relationships insert failed: %s", exc)
 
 # ── Module-level run state ────────────────────────────────────────────────────
 DRY_RUN: bool                                    = False  # set via --dry-run
@@ -380,9 +558,10 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
         return cached[0]
 
     result: dict[str, Any] = {
-        "other_monitored": {},  # sym -> {"amount": float, "usd": float}
+        "other_monitored": {},  # sym -> {"amount": float, "usd": float, "rank": int|None}
         "major_tokens":    {},  # sym -> {"amount": float, "usd": float}
         "sol_balance":     None,
+        "sol_usd":         None,
         "total_usd_est":   None,
     }
 
@@ -439,6 +618,15 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
             else:
                 result["major_tokens"][sym] = entry
 
+        # Rank lookup for other monitored tokens (uses local disk snapshot — fast, no RPC)
+        for sym, entry in result["other_monitored"].items():
+            snap = load_snapshot(sym)
+            if snap:
+                for i, h in enumerate(snap.get("holders", []), 1):
+                    if h.get("address") == wallet_address:
+                        entry["rank"] = i
+                        break
+
         # SOL balance (native)
         sol_resp = requests.post(rpc_url, json={
             "jsonrpc": "2.0", "id": 2,
@@ -448,6 +636,11 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
         if sol_resp.ok:
             lamports = (sol_resp.json().get("result") or {}).get("value") or 0
             result["sol_balance"] = lamports / 1e9
+            if result["sol_balance"] and result["sol_balance"] >= 0.1:
+                sol_price = fetch_price_context(WSOL_MINT).get("price") or 0.0
+                sol_usd = round(result["sol_balance"] * sol_price, 2)
+                result["sol_usd"] = sol_usd
+                total_usd += sol_usd
 
         if total_usd > 0:
             result["total_usd_est"] = round(total_usd, 2)
@@ -477,7 +670,7 @@ def get_ai_interpretation(symbol: str, severity: str, change_type: str, delta: f
             f"(severity: {severity}). Focus on market implications for traders."
         )
         msg = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=80,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -514,7 +707,7 @@ def get_coordinated_move_ai(
             f"{token} {direction} simultaneously, moving {total_pct:.2f}% of supply in total{price_ctx}?"
         )
         msg = client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -844,7 +1037,7 @@ def format_quant_alert(
     age_days      = wallet_info.get("age_days")
     is_new_wallet = wallet_info.get("is_new_wallet", False)
     age_str       = (
-        "🚨 NEW WALLET (< 24h)" if is_new_wallet
+        "🚨 NEW WALLET (&lt; 24h)" if is_new_wallet
         else f"{age_days} day{'s' if age_days != 1 else ''}" if age_days is not None
         else "Unknown"
     )
@@ -882,24 +1075,27 @@ def format_quant_alert(
         total   = wallet_intel.get("total_usd_est")
 
         for sym, data in other.items():
-            usd = data.get("usd", 0)
-            amt = data.get("amount", 0)
-            usd_part = f" (~${usd:,.0f})" if usd >= 1 else ""
-            intel_lines.append(f"  • Also holds {sym}: {amt:,.0f} tokens{usd_part}")
+            usd    = data.get("usd", 0)
+            rank   = data.get("rank")
+            rank_s = f" (#{rank} holder)" if rank else ""
+            usd_s  = f" ~${usd:,.0f}" if usd >= 1 else ""
+            intel_lines.append(f"  • Also holds {sym}{rank_s}{usd_s}")
 
         major_parts = []
         for sym, data in sorted(majors.items(), key=lambda kv: -kv[1].get("usd", 0)):
             usd = data.get("usd", 0)
-            if usd >= 100:
+            if usd >= 500:
                 major_parts.append(f"{sym}: ~${usd:,.0f}")
         if major_parts:
             intel_lines.append(f"  • {', '.join(major_parts[:4])}")
 
         if sol_bal and sol_bal >= 0.1:
-            intel_lines.append(f"  • SOL: {sol_bal:.2f} SOL")
+            sol_usd = wallet_intel.get("sol_usd")
+            usd_s   = f" (~${sol_usd:,.0f})" if sol_usd and sol_usd >= 1 else ""
+            intel_lines.append(f"  • SOL: {sol_bal:.1f} SOL{usd_s}")
 
-        if total and total >= 500:
-            intel_lines.append(f"  • Est. portfolio (excl. SOL): ~${total:,.0f}")
+        if total and total >= 100:
+            intel_lines.append(f"  • Est. total portfolio: ~${total:,.0f}")
 
         if intel_lines:
             lines.append("🔍 Wallet Intel:")
@@ -908,7 +1104,7 @@ def format_quant_alert(
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
     if ai_interp:
-        lines.append(f"🤖 <i>Analysis: {ai_interp}</i>")
+        lines.append(f"🤖 <i>Analysis: {html.escape(ai_interp)}</i>")
 
     lines.append(
         f'🔗 <a href="{solscan_url}">Solscan</a> | '
