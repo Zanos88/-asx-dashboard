@@ -1,11 +1,24 @@
 """
-Helius Webhook Receiver
-=======================
+Helius Webhook Receiver + Telegram Command Bot
+===============================================
 Deploy as a **separate** Railway service from the same repo.
 
 Receives real-time transaction notifications from Helius and forwards:
   - Whale transfer alerts to Telegram
   - Scheduled X / Grok sentiment digests to Telegram
+
+Also runs an async Telegram bot polling loop (via FastAPI lifespan) that
+lets you control the monitor from Telegram:
+  /status            — current thresholds and tracked tokens
+  /threshold <pct>   — set move_threshold_pct (e.g. /threshold 0.005)
+  /mintokens <n>     — set min_holder_change_tokens (0 to disable)
+  /coins             — list tracked coins with addresses
+  /addcoin SYM ADDR  — add a coin to tracking
+  /removecoin SYM    — remove a coin from tracking
+  /related           — recent cross-coin wallet overlaps from Supabase
+
+Config changes written via commands are stored in Supabase bot_config and
+take effect on the next monitor.py cron run (within 15 minutes).
 
 Environment variables (set in Railway service):
     TELEGRAM_BOT_TOKEN      Telegram bot token from @BotFather
@@ -14,6 +27,8 @@ Environment variables (set in Railway service):
     WHALE_THRESHOLD_USD     Minimum USD value to trigger whale alert (default 10000)
     XAI_API_KEY             xAI / Grok API key for X sentiment analysis
     SENTIMENT_TOKENS        Comma-separated list of token symbols to analyse (default ALON)
+    SUPABASE_URL            Supabase project URL
+    SUPABASE_SERVICE_KEY    Supabase service-role key (bypasses RLS)
 
 Railway start command:
     uvicorn webhook:app --host 0.0.0.0 --port $PORT
@@ -21,14 +36,17 @@ Railway start command:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
 import os
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from typing import Any
 
+import httpx
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -47,24 +65,83 @@ HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
 WHALE_THRESHOLD_USD   = float(os.environ.get("WHALE_THRESHOLD_USD", "10000"))
 XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
 SENTIMENT_TOKENS      = [t.strip() for t in os.environ.get("SENTIMENT_TOKENS", "ALON").split(",")]
+SUPABASE_URL          = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY          = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-# Mint address → symbol mapping — extend as you add tokens
+# Mint address → symbol mapping
 TOKEN_REGISTRY: dict[str, str] = {
     "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS": "ALON",
+    "5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2": "TROLL",
 }
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Portfolio Webhook Receiver",
-    description="Receives Helius webhooks and forwards whale + sentiment alerts to Telegram.",
-    version="1.0.0",
-)
+# Telegram bot polling offset (module-level to survive between loop iterations)
+_tg_offset: int = 0
+
+
+# ── Supabase helpers ──────────────────────────────────────────────────────────
+
+def _get_supabase():
+    """Return a supabase Client or None if not configured."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        log.error("Supabase client init failed: %s", exc)
+        return None
+
+
+def _bot_config_get(key: str) -> str | None:
+    sb = _get_supabase()
+    if not sb:
+        return None
+    try:
+        res = sb.table("bot_config").select("value").eq("key", key).execute()
+        return res.data[0]["value"] if res.data else None
+    except Exception as exc:
+        log.warning("bot_config get '%s' failed: %s", key, exc)
+        return None
+
+
+def _bot_config_set(key: str, value: str) -> bool:
+    sb = _get_supabase()
+    if not sb:
+        return False
+    try:
+        existing = sb.table("bot_config").select("key").eq("key", key).execute()
+        now = datetime.utcnow().isoformat()
+        if existing.data:
+            sb.table("bot_config").update({"value": value, "updated_at": now}).eq("key", key).execute()
+        else:
+            sb.table("bot_config").insert({"key": key, "value": value, "updated_at": now}).execute()
+        return True
+    except Exception as exc:
+        log.error("bot_config set '%s' failed: %s", key, exc)
+        return False
+
+
+def _get_tracked_tokens() -> dict[str, str]:
+    """Return tracked tokens from bot_config, falling back to TOKEN_REGISTRY values."""
+    raw = _bot_config_get("tracked_tokens")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    # Derive from TOKEN_REGISTRY as fallback
+    return {sym: addr for addr, sym in TOKEN_REGISTRY.items()}
+
+
+def _set_tracked_tokens(tokens: dict[str, str]) -> bool:
+    return _bot_config_set("tracked_tokens", json.dumps(tokens))
 
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
 def fmt_usd(v: float) -> str:
-    """Format a float as a compact USD string (e.g. $1.23M)."""
     if abs(v) >= 1_000_000_000:
         return f"${v / 1_000_000_000:.2f}B"
     if abs(v) >= 1_000_000:
@@ -75,31 +152,20 @@ def fmt_usd(v: float) -> str:
 
 
 def shorten_addr(addr: str) -> str:
-    """Shorten a Solana wallet address for display."""
     return f"{addr[:6]}...{addr[-4:]}" if addr else "—"
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Telegram sync (for webhook alerts) ───────────────────────────────────────
 
 def send_telegram(msg: str, retries: int = 3) -> tuple[bool, str]:
-    """
-    Send an HTML-formatted message to Telegram via the Bot API.
-
-    Retries up to ``retries`` times with exponential backoff on transient errors.
-
-    Args:
-        msg:     HTML-formatted message body.
-        retries: Maximum number of attempts before giving up.
-
-    Returns:
-        Tuple of (success: bool, error_description: str).
-    """
+    """Send HTML-formatted message to Telegram with exponential backoff."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram credentials not configured — skipping alert")
         return False, "not_configured"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML",
+               "disable_web_page_preview": True}
 
     for attempt in range(retries):
         try:
@@ -121,22 +187,296 @@ def send_telegram(msg: str, retries: int = 3) -> tuple[bool, str]:
     return False, f"Failed after {retries} attempts"
 
 
+# ── Telegram async (for bot command polling) ──────────────────────────────────
+
+async def _tg_send_async(client: httpx.AsyncClient, chat_id: str | int, text: str) -> None:
+    """Send a plain-text reply from the bot (async)."""
+    try:
+        await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=10,
+        )
+    except Exception as exc:
+        log.error("Async Telegram send failed: %s", exc)
+
+
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+async def cmd_status(client: httpx.AsyncClient, chat_id: int) -> None:
+    threshold = _bot_config_get("move_threshold_pct") or "0.01"
+    mintokens = _bot_config_get("min_holder_change_tokens") or "0"
+    tokens    = _get_tracked_tokens()
+    coin_list = ", ".join(tokens.keys()) or "(none)"
+    text = (
+        f"📊 <b>Monitor Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Threshold: {float(threshold):.4f}%\n"
+        f"🪙 Min tokens: {mintokens}\n"
+        f"🔍 Tracked: {coin_list}\n"
+        f"⏱ Cron: every 15 min\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Changes take effect within 15 min."
+    )
+    await _tg_send_async(client, chat_id, text)
+
+
+async def cmd_threshold(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    if not args:
+        await _tg_send_async(client, chat_id, "Usage: /threshold <pct>  e.g. /threshold 0.005")
+        return
+    try:
+        val = float(args.strip())
+    except ValueError:
+        await _tg_send_async(client, chat_id, f"❌ Invalid value: {args!r} — must be a number like 0.01")
+        return
+    old = _bot_config_get("move_threshold_pct") or "?"
+    if _bot_config_set("move_threshold_pct", str(val)):
+        await _tg_send_async(
+            client, chat_id,
+            f"✅ Threshold updated: {old}% → {val}%\nTakes effect on next run (within 15 min)."
+        )
+    else:
+        await _tg_send_async(client, chat_id, "❌ Failed to update threshold (Supabase error — check Railway logs).")
+
+
+async def cmd_mintokens(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    if not args:
+        await _tg_send_async(client, chat_id, "Usage: /mintokens <n>  e.g. /mintokens 0  (0 disables this gate)")
+        return
+    try:
+        val = int(float(args.strip()))
+    except ValueError:
+        await _tg_send_async(client, chat_id, f"❌ Invalid value: {args!r} — must be an integer")
+        return
+    old = _bot_config_get("min_holder_change_tokens") or "?"
+    if _bot_config_set("min_holder_change_tokens", str(val)):
+        await _tg_send_async(
+            client, chat_id,
+            f"✅ Min tokens updated: {old} → {val}\nTakes effect on next run (within 15 min)."
+        )
+    else:
+        await _tg_send_async(client, chat_id, "❌ Failed to update (Supabase error — check Railway logs).")
+
+
+async def cmd_coins(client: httpx.AsyncClient, chat_id: int) -> None:
+    tokens = _get_tracked_tokens()
+    if not tokens:
+        await _tg_send_async(client, chat_id, "No coins currently tracked.")
+        return
+    lines = ["🔍 <b>Tracked Coins</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+    for sym, addr in tokens.items():
+        short = f"{addr[:8]}...{addr[-4:]}"
+        lines.append(f"<b>{sym}</b>  <code>{short}</code>")
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "Use /addcoin SYM ADDR or /removecoin SYM to modify."
+    ]
+    await _tg_send_async(client, chat_id, "\n".join(lines))
+
+
+async def cmd_addcoin(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    parts = args.strip().split()
+    if len(parts) != 2:
+        await _tg_send_async(client, chat_id,
+            "Usage: /addcoin SYMBOL MINT_ADDRESS\ne.g. /addcoin BONK DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263")
+        return
+    sym, addr = parts[0].upper(), parts[1]
+    if len(addr) < 32:
+        await _tg_send_async(client, chat_id, "❌ Address looks too short — check the mint address.")
+        return
+    tokens = _get_tracked_tokens()
+    tokens[sym] = addr
+    if _set_tracked_tokens(tokens):
+        await _tg_send_async(client, chat_id,
+            f"✅ Added <b>{sym}</b> (<code>{addr[:8]}...{addr[-4:]}</code>)\n"
+            f"Now tracking: {', '.join(tokens.keys())}\nTakes effect within 15 min.")
+    else:
+        await _tg_send_async(client, chat_id, "❌ Failed to update tracked_tokens in Supabase.")
+
+
+async def cmd_removecoin(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    sym = args.strip().upper()
+    if not sym:
+        await _tg_send_async(client, chat_id, "Usage: /removecoin SYMBOL  e.g. /removecoin TROLL")
+        return
+    tokens = _get_tracked_tokens()
+    if sym not in tokens:
+        await _tg_send_async(client, chat_id, f"❌ {sym} is not in the tracked list. Use /coins to see current list.")
+        return
+    del tokens[sym]
+    if _set_tracked_tokens(tokens):
+        remaining = ", ".join(tokens.keys()) or "(none)"
+        await _tg_send_async(client, chat_id,
+            f"✅ Removed <b>{sym}</b>.\nNow tracking: {remaining}\nTakes effect within 15 min.")
+    else:
+        await _tg_send_async(client, chat_id, "❌ Failed to update tracked_tokens in Supabase.")
+
+
+async def cmd_related(client: httpx.AsyncClient, chat_id: int) -> None:
+    sb = _get_supabase()
+    if not sb:
+        await _tg_send_async(client, chat_id, "❌ Supabase not configured — cannot fetch relationships.")
+        return
+    try:
+        res = (
+            sb.table("wallet_relationships")
+            .select("wallet_address,coin_a,coin_a_pct,coin_b,coin_b_pct,detected_at")
+            .order("detected_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as exc:
+        await _tg_send_async(client, chat_id, f"❌ Supabase query failed: {exc}")
+        return
+
+    if not rows:
+        await _tg_send_async(client, chat_id, "No cross-coin wallet relationships recorded yet.")
+        return
+
+    # Deduplicate by wallet_address, show most recent per wallet
+    seen: set[str] = set()
+    lines = ["🕸 <b>Cross-coin Wallet Overlaps</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+    count = 0
+    for row in rows:
+        addr = row["wallet_address"]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        short = f"{addr[:8]}...{addr[-6:]}"
+        lines.append(
+            f"<code>{short}</code>\n"
+            f"  {row['coin_a']}: {row['coin_a_pct']:.2f}%  |  {row['coin_b']}: {row['coin_b_pct']:.2f}%"
+        )
+        count += 1
+        if count >= 8:
+            break
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    await _tg_send_async(client, chat_id, "\n".join(lines))
+
+
+# ── Telegram command dispatcher ───────────────────────────────────────────────
+
+async def handle_command(client: httpx.AsyncClient, update: dict[str, Any]) -> None:
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return
+    text    = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id")
+    if not text or not chat_id:
+        return
+    if not text.startswith("/"):
+        return
+
+    # Only respond to the configured chat
+    if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
+        log.info("Ignored command from unauthorized chat %s", chat_id)
+        return
+
+    parts   = text.split(None, 1)
+    command = parts[0].split("@")[0].lower()  # strip @botname suffix
+    args    = parts[1] if len(parts) > 1 else ""
+
+    log.info("Bot command: %s %r from chat %s", command, args, chat_id)
+
+    if command == "/status":
+        await cmd_status(client, chat_id)
+    elif command == "/threshold":
+        await cmd_threshold(client, chat_id, args)
+    elif command == "/mintokens":
+        await cmd_mintokens(client, chat_id, args)
+    elif command == "/coins":
+        await cmd_coins(client, chat_id)
+    elif command == "/addcoin":
+        await cmd_addcoin(client, chat_id, args)
+    elif command == "/removecoin":
+        await cmd_removecoin(client, chat_id, args)
+    elif command == "/related":
+        await cmd_related(client, chat_id)
+    elif command in ("/start", "/help"):
+        await _tg_send_async(client, chat_id, (
+            "🤖 <b>Monitor Bot Commands</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "/status — current config\n"
+            "/threshold &lt;pct&gt; — e.g. /threshold 0.005\n"
+            "/mintokens &lt;n&gt; — e.g. /mintokens 0\n"
+            "/coins — list tracked coins\n"
+            "/addcoin SYM ADDR — add a coin\n"
+            "/removecoin SYM — remove a coin\n"
+            "/related — cross-coin whale overlaps\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Changes take effect within 15 min."
+        ))
+    else:
+        await _tg_send_async(client, chat_id,
+            f"Unknown command: {command}\nSend /help for the list of available commands.")
+
+
+# ── Telegram long-poll loop ───────────────────────────────────────────────────
+
+async def telegram_command_loop() -> None:
+    """Poll Telegram for bot updates and dispatch commands. Runs forever."""
+    global _tg_offset
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN not set — bot command loop not started")
+        return
+
+    log.info("Telegram command bot polling started")
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    async with httpx.AsyncClient(timeout=40) as client:
+        while True:
+            try:
+                resp = await client.get(
+                    f"{base_url}/getUpdates",
+                    params={
+                        "offset":          _tg_offset,
+                        "timeout":         30,
+                        "allowed_updates": ["message"],
+                    },
+                )
+                resp.raise_for_status()
+                updates = resp.json().get("result", [])
+                for upd in updates:
+                    _tg_offset = upd["update_id"] + 1
+                    try:
+                        await handle_command(client, upd)
+                    except Exception as exc:
+                        log.error("Command handler error for update %s: %s", upd.get("update_id"), exc)
+            except asyncio.CancelledError:
+                raise
+            except httpx.TimeoutException:
+                pass  # long-poll timeout is normal — loop immediately
+            except Exception as exc:
+                log.error("Bot polling error: %s — retrying in 5s", exc)
+                await asyncio.sleep(5)
+
+
+# ── FastAPI lifespan ──────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(telegram_command_loop())
+    yield
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Portfolio Webhook Receiver",
+    description="Receives Helius webhooks, forwards whale alerts, and runs a Telegram command bot.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+
 # ── Grok / X Sentiment ────────────────────────────────────────────────────────
 
 def fetch_grok_sentiment(symbol: str, retries: int = 3) -> str | None:
-    """
-    Query the xAI / Grok API for real-time X sentiment on a given token.
-
-    Uses Grok's live X search to retrieve the latest community sentiment.
-    Retries with exponential backoff on transient network errors.
-
-    Args:
-        symbol:  Token symbol to analyse (e.g. "ALON").
-        retries: Maximum number of retry attempts.
-
-    Returns:
-        Formatted sentiment string, or None on failure.
-    """
     if not XAI_API_KEY:
         log.warning("XAI_API_KEY not set — skipping sentiment for %s", symbol)
         return None
@@ -201,12 +541,6 @@ def fetch_grok_sentiment(symbol: str, retries: int = 3) -> str | None:
 
 
 def send_sentiment_digest() -> None:
-    """
-    Fetch X sentiment for all configured tokens and send a digest to Telegram.
-
-    Processes tokens sequentially; a failure on one token does not prevent
-    the others from being analysed.
-    """
     log.info("Sending X sentiment digest for tokens: %s", SENTIMENT_TOKENS)
     for symbol in SENTIMENT_TOKENS:
         try:
@@ -226,23 +560,12 @@ def send_sentiment_digest() -> None:
                 log.info("Sentiment digest sent for %s", symbol)
         except Exception as exc:
             log.error("Unexpected error in sentiment digest for %s: %s", symbol, exc)
-            continue  # never crash on a single token
+            continue
 
 
 # ── Helius webhook processing ─────────────────────────────────────────────────
 
 def verify_helius_signature(body: bytes, signature: str, secret: str) -> bool:
-    """
-    Verify the HMAC-SHA256 signature on an incoming Helius webhook request.
-
-    Args:
-        body:      Raw request body bytes.
-        signature: Value of the ``authorization`` header from Helius.
-        secret:    Shared secret configured in the Helius dashboard.
-
-    Returns:
-        True if the signature is valid or no secret is configured.
-    """
     if not secret:
         return True
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
@@ -250,19 +573,6 @@ def verify_helius_signature(body: bytes, signature: str, secret: str) -> bool:
 
 
 def process_transaction(tx: dict[str, Any]) -> list[str]:
-    """
-    Parse a single Helius transaction and return Telegram alert strings for
-    any token transfers that exceed the whale threshold.
-
-    A failure to parse any individual transfer is logged and skipped so the
-    rest of the transaction continues to be processed.
-
-    Args:
-        tx: Raw transaction dict from a Helius webhook payload.
-
-    Returns:
-        List of HTML-formatted alert strings (empty if no whale activity).
-    """
     alerts: list[str] = []
     sig      = tx.get("signature", "unknown")[:12]
     tx_type  = tx.get("type", "UNKNOWN")
@@ -302,28 +612,13 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    """Railway health check endpoint. Returns 200 when the service is running."""
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.post("/webhook/helius")
 async def helius_webhook(request: Request) -> JSONResponse:
-    """
-    Accept POST requests from the Helius webhook service.
-
-    Validates the optional HMAC signature, parses each transaction for whale
-    transfers, and dispatches Telegram alerts. Returns 200 even if Telegram
-    delivery fails so Helius does not retry unnecessarily.
-
-    Args:
-        request: FastAPI Request object containing the raw Helius payload.
-
-    Returns:
-        JSON with counts of received transactions and alerts sent.
-    """
     body = await request.body()
 
-    # Optional signature verification
     signature = request.headers.get("authorization", "")
     if HELIUS_WEBHOOK_SECRET and not verify_helius_signature(body, signature, HELIUS_WEBHOOK_SECRET):
         log.warning("Rejected webhook — invalid signature")
@@ -349,22 +644,13 @@ async def helius_webhook(request: Request) -> JSONResponse:
                     log.error("Telegram delivery failed: %s", err)
         except Exception as exc:
             log.error("Unexpected error processing tx %s: %s", tx.get("signature", "?")[:12], exc)
-            continue  # never crash on a single transaction
+            continue
 
     return JSONResponse({"received": len(transactions), "alerts_sent": alerts_sent})
 
 
 @app.post("/trigger/sentiment")
 async def trigger_sentiment(request: Request) -> JSONResponse:
-    """
-    Manually trigger an X sentiment digest for all configured tokens.
-
-    This endpoint can be called from GitHub Actions or any scheduler.
-    Requires a ``x-api-key`` header matching ``HELIUS_WEBHOOK_SECRET`` when set.
-
-    Returns:
-        JSON confirming the digest was dispatched.
-    """
     if HELIUS_WEBHOOK_SECRET:
         key = request.headers.get("x-api-key", "")
         if not hmac.compare_digest(key, HELIUS_WEBHOOK_SECRET):
