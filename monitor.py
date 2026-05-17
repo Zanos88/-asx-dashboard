@@ -84,7 +84,7 @@ MAX_ALERTS_PER_RUN = 20
 
 # Wallet intelligence (FIX 3)
 WALLET_INTEL_CACHE_SECS    = 600   # 10 min
-WALLET_INTEL_MIN_DELTA_PCT = 0.5   # only fetch for moves >= 0.5%
+WALLET_INTEL_MIN_DELTA_PCT = 0.1   # only fetch for moves >= 0.1%
 PRICE_CACHE_SECS           = 60    # 60 sec price cache
 
 MAJOR_TOKEN_MINTS: dict[str, str] = {
@@ -93,6 +93,7 @@ MAJOR_TOKEN_MINTS: dict[str, str] = {
     "JUP":    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
     "POPCAT": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
 }
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # ── Module-level run state ────────────────────────────────────────────────────
 DRY_RUN: bool                                    = False  # set via --dry-run
@@ -381,9 +382,10 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
         return cached[0]
 
     result: dict[str, Any] = {
-        "other_monitored": {},  # sym -> {"amount": float, "usd": float}
+        "other_monitored": {},  # sym -> {"amount": float, "usd": float, "rank": int|None}
         "major_tokens":    {},  # sym -> {"amount": float, "usd": float}
         "sol_balance":     None,
+        "sol_usd":         None,
         "total_usd_est":   None,
     }
 
@@ -440,6 +442,15 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
             else:
                 result["major_tokens"][sym] = entry
 
+        # Rank lookup for other monitored tokens (uses local disk snapshot — fast, no RPC)
+        for sym, entry in result["other_monitored"].items():
+            snap = load_snapshot(sym)
+            if snap:
+                for i, h in enumerate(snap.get("holders", []), 1):
+                    if h.get("address") == wallet_address:
+                        entry["rank"] = i
+                        break
+
         # SOL balance (native)
         sol_resp = requests.post(rpc_url, json={
             "jsonrpc": "2.0", "id": 2,
@@ -449,6 +460,11 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
         if sol_resp.ok:
             lamports = (sol_resp.json().get("result") or {}).get("value") or 0
             result["sol_balance"] = lamports / 1e9
+            if result["sol_balance"] and result["sol_balance"] >= 0.1:
+                sol_price = fetch_price_context(WSOL_MINT).get("price") or 0.0
+                sol_usd = round(result["sol_balance"] * sol_price, 2)
+                result["sol_usd"] = sol_usd
+                total_usd += sol_usd
 
         if total_usd > 0:
             result["total_usd_est"] = round(total_usd, 2)
@@ -883,10 +899,11 @@ def format_quant_alert(
         total   = wallet_intel.get("total_usd_est")
 
         for sym, data in other.items():
-            usd = data.get("usd", 0)
-            amt = data.get("amount", 0)
-            usd_part = f" (~${usd:,.0f})" if usd >= 1 else ""
-            intel_lines.append(f"  • Also holds {sym}: {amt:,.0f} tokens{usd_part}")
+            usd    = data.get("usd", 0)
+            rank   = data.get("rank")
+            rank_s = f" (#{rank} holder)" if rank else ""
+            usd_s  = f" ~${usd:,.0f}" if usd >= 1 else ""
+            intel_lines.append(f"  • Also holds {sym}{rank_s}{usd_s}")
 
         major_parts = []
         for sym, data in sorted(majors.items(), key=lambda kv: -kv[1].get("usd", 0)):
@@ -897,10 +914,12 @@ def format_quant_alert(
             intel_lines.append(f"  • {', '.join(major_parts[:4])}")
 
         if sol_bal and sol_bal >= 0.1:
-            intel_lines.append(f"  • SOL: {sol_bal:.2f} SOL")
+            sol_usd = wallet_intel.get("sol_usd")
+            usd_s   = f" (~${sol_usd:,.0f})" if sol_usd and sol_usd >= 1 else ""
+            intel_lines.append(f"  • SOL: {sol_bal:.1f} SOL{usd_s}")
 
-        if total and total >= 500:
-            intel_lines.append(f"  • Est. portfolio (excl. SOL): ~${total:,.0f}")
+        if total and total >= 100:
+            intel_lines.append(f"  • Est. total portfolio: ~${total:,.0f}")
 
         if intel_lines:
             lines.append("🔍 Wallet Intel:")
