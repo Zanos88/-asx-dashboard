@@ -9,13 +9,16 @@ Receives real-time transaction notifications from Helius and forwards:
 
 Also runs an async Telegram bot polling loop (via FastAPI lifespan) that
 lets you control the monitor from Telegram:
-  /status            — current thresholds and tracked tokens
-  /threshold <pct>   — set move_threshold_pct (e.g. /threshold 0.005)
-  /mintokens <n>     — set min_holder_change_tokens (0 to disable)
-  /coins             — list tracked coins with addresses
-  /addcoin SYM ADDR  — add a coin to tracking
-  /removecoin SYM    — remove a coin from tracking
-  /related           — recent cross-coin wallet overlaps from Supabase
+  /status                — current thresholds and tracked tokens
+  /snapshot              — live top-10 holders for all tracked tokens
+  /holders SYM           — live top-20 holders for one token
+  /coins                 — list tracked coins with addresses
+  /addtoken SYM ADDR     — add a coin to tracking (alias: /addcoin)
+  /removetoken SYM       — remove a coin from tracking (alias: /removecoin)
+  /threshold <usd>       — set whale_threshold_usd (e.g. /threshold 2000)
+  /movethreshold <pct>   — set move_threshold_pct (e.g. /movethreshold 0.005)
+  /mintokens <n>         — set min_holder_change_tokens (0 to disable)
+  /related               — recent cross-coin wallet overlaps from Supabase
 
 Config changes written via commands are stored in Supabase bot_config and
 take effect on the next monitor.py cron run (within 15 minutes).
@@ -67,6 +70,8 @@ XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
 SENTIMENT_TOKENS      = [t.strip() for t in os.environ.get("SENTIMENT_TOKENS", "ALON").split(",")]
 SUPABASE_URL          = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY          = os.environ.get("SUPABASE_SERVICE_KEY", "")
+HELIUS_API_KEY        = os.environ.get("HELIUS_API_KEY", "")
+HELIUS_RPC_URL        = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if os.environ.get("HELIUS_API_KEY") else "https://api.mainnet-beta.solana.com"
 
 # Mint address → symbol mapping
 TOKEN_REGISTRY: dict[str, str] = {
@@ -139,6 +144,40 @@ def _set_tracked_tokens(tokens: dict[str, str]) -> bool:
     return _bot_config_set("tracked_tokens", json.dumps(tokens))
 
 
+# ── Solana RPC helpers (for bot commands) ────────────────────────────────────
+
+def fetch_holders_sync(mint: str, top_n: int = 20) -> list[dict]:
+    """Fetch top-N token holders via Helius (or fallback) RPC. Never raises."""
+    urls = [HELIUS_RPC_URL, "https://api.mainnet-beta.solana.com"]
+    for rpc_url in urls:
+        try:
+            resp = requests.post(
+                rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts",
+                      "params": [mint]},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            accounts = data.get("result", {}).get("value", [])
+            total = sum(float(a.get("uiAmount", 0) or 0) for a in accounts)
+            holders = []
+            for i, acc in enumerate(accounts[:top_n]):
+                amt = float(acc.get("uiAmount", 0) or 0)
+                pct = (amt / total * 100) if total else 0
+                holders.append({
+                    "rank":    i + 1,
+                    "address": acc.get("address", ""),
+                    "amount":  amt,
+                    "pct":     pct,
+                })
+            return holders
+        except Exception as exc:
+            log.warning("fetch_holders_sync failed on %s for %s: %s",
+                        rpc_url[:40], mint[:8], exc)
+    return []
+
+
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
 def fmt_usd(v: float) -> str:
@@ -205,14 +244,16 @@ async def _tg_send_async(client: httpx.AsyncClient, chat_id: str | int, text: st
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_status(client: httpx.AsyncClient, chat_id: int) -> None:
-    threshold = _bot_config_get("move_threshold_pct") or "0.01"
+    move_pct  = _bot_config_get("move_threshold_pct") or "0.01"
     mintokens = _bot_config_get("min_holder_change_tokens") or "0"
+    whale_usd = _bot_config_get("whale_threshold_usd") or str(int(WHALE_THRESHOLD_USD))
     tokens    = _get_tracked_tokens()
     coin_list = ", ".join(tokens.keys()) or "(none)"
     text = (
         f"📊 <b>Monitor Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Threshold: {float(threshold):.4f}%\n"
+        f"🎯 Move threshold: {float(move_pct):.4f}%\n"
+        f"🐳 Whale threshold: ${float(whale_usd):,.0f} USD\n"
         f"🪙 Min tokens: {mintokens}\n"
         f"🔍 Tracked: {coin_list}\n"
         f"⏱ Cron: every 15 min\n"
@@ -223,22 +264,49 @@ async def cmd_status(client: httpx.AsyncClient, chat_id: int) -> None:
 
 
 async def cmd_threshold(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    """Set whale_threshold_usd (minimum USD for real-time whale alerts)."""
     if not args:
-        await _tg_send_async(client, chat_id, "Usage: /threshold <pct>  e.g. /threshold 0.005")
+        await _tg_send_async(client, chat_id, "Usage: /threshold <usd>  e.g. /threshold 2000")
         return
     try:
         val = float(args.strip())
+        if val < 0:
+            raise ValueError("negative")
     except ValueError:
-        await _tg_send_async(client, chat_id, f"❌ Invalid value: {args!r} — must be a number like 0.01")
+        await _tg_send_async(client, chat_id, f"❌ Invalid value: {args!r} — must be a positive number like 2000")
         return
-    old = _bot_config_get("move_threshold_pct") or "?"
+    old = _bot_config_get("whale_threshold_usd") or str(int(WHALE_THRESHOLD_USD))
+    if _bot_config_set("whale_threshold_usd", str(val)):
+        await _tg_send_async(
+            client, chat_id,
+            f"✅ Whale threshold updated: ${float(old):,.0f} → ${val:,.0f} USD\n"
+            f"Takes effect on next run (within 15 min)."
+        )
+    else:
+        await _tg_send_async(client, chat_id, "❌ Failed to update whale threshold (Supabase error — check Railway logs).")
+
+
+async def cmd_movethreshold(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    """Set move_threshold_pct (minimum % supply move for holder change alerts)."""
+    if not args:
+        await _tg_send_async(client, chat_id, "Usage: /movethreshold <pct>  e.g. /movethreshold 0.005")
+        return
+    try:
+        val = float(args.strip())
+        if val < 0:
+            raise ValueError("negative")
+    except ValueError:
+        await _tg_send_async(client, chat_id, f"❌ Invalid value: {args!r} — must be a positive number like 0.01")
+        return
+    old = _bot_config_get("move_threshold_pct") or "0.01"
     if _bot_config_set("move_threshold_pct", str(val)):
         await _tg_send_async(
             client, chat_id,
-            f"✅ Threshold updated: {old}% → {val}%\nTakes effect on next run (within 15 min)."
+            f"✅ Move threshold updated: {float(old):.4f}% → {val:.4f}%\n"
+            f"Takes effect on next run (within 15 min)."
         )
     else:
-        await _tg_send_async(client, chat_id, "❌ Failed to update threshold (Supabase error — check Railway logs).")
+        await _tg_send_async(client, chat_id, "❌ Failed to update move threshold (Supabase error — check Railway logs).")
 
 
 async def cmd_mintokens(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
@@ -258,6 +326,61 @@ async def cmd_mintokens(client: httpx.AsyncClient, chat_id: int, args: str) -> N
         )
     else:
         await _tg_send_async(client, chat_id, "❌ Failed to update (Supabase error — check Railway logs).")
+
+
+async def cmd_snapshot(client: httpx.AsyncClient, chat_id: int) -> None:
+    """Show current top-10 holders for all tracked tokens."""
+    tokens = _get_tracked_tokens()
+    if not tokens:
+        await _tg_send_async(client, chat_id, "No coins currently tracked.")
+        return
+    await _tg_send_async(client, chat_id, f"⏳ Fetching holders for {', '.join(tokens.keys())}…")
+    for sym, mint in tokens.items():
+        holders = fetch_holders_sync(mint, top_n=10)
+        if not holders:
+            await _tg_send_async(client, chat_id, f"❌ Could not fetch holders for {sym}.")
+            continue
+        lines = [f"📊 <b>{sym} — Top 10 Holders</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for h in holders:
+            addr = h["address"]
+            short = f"{addr[:6]}…{addr[-4:]}"
+            lines.append(
+                f"#{h['rank']:>2}  {h['pct']:.2f}%  "
+                f"<code>{short}</code>  "
+                f"({h['amount']:,.0f})"
+            )
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        await _tg_send_async(client, chat_id, "\n".join(lines))
+
+
+async def cmd_holders(client: httpx.AsyncClient, chat_id: int, args: str) -> None:
+    """Show top-20 holders for a specific token symbol."""
+    sym = args.strip().upper()
+    if not sym:
+        await _tg_send_async(client, chat_id, "Usage: /holders SYMBOL  e.g. /holders ALON")
+        return
+    tokens = _get_tracked_tokens()
+    mint = tokens.get(sym)
+    if not mint:
+        known = ", ".join(tokens.keys()) or "(none)"
+        await _tg_send_async(client, chat_id, f"❌ {sym} not tracked. Known: {known}")
+        return
+    await _tg_send_async(client, chat_id, f"⏳ Fetching top-20 holders for {sym}…")
+    holders = fetch_holders_sync(mint, top_n=20)
+    if not holders:
+        await _tg_send_async(client, chat_id, f"❌ Could not fetch holders for {sym}.")
+        return
+    lines = [f"📊 <b>{sym} — Top 20 Holders</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+    for h in holders:
+        addr = h["address"]
+        short = f"{addr[:6]}…{addr[-4:]}"
+        lines.append(
+            f"#{h['rank']:>2}  {h['pct']:.2f}%  "
+            f"<code>{short}</code>  "
+            f"({h['amount']:,.0f})"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    await _tg_send_async(client, chat_id, "\n".join(lines))
 
 
 async def cmd_coins(client: httpx.AsyncClient, chat_id: int) -> None:
@@ -385,13 +508,19 @@ async def handle_command(client: httpx.AsyncClient, update: dict[str, Any]) -> N
         await cmd_status(client, chat_id)
     elif command == "/threshold":
         await cmd_threshold(client, chat_id, args)
+    elif command == "/movethreshold":
+        await cmd_movethreshold(client, chat_id, args)
     elif command == "/mintokens":
         await cmd_mintokens(client, chat_id, args)
+    elif command == "/snapshot":
+        await cmd_snapshot(client, chat_id)
+    elif command == "/holders":
+        await cmd_holders(client, chat_id, args)
     elif command == "/coins":
         await cmd_coins(client, chat_id)
-    elif command == "/addcoin":
+    elif command in ("/addcoin", "/addtoken"):
         await cmd_addcoin(client, chat_id, args)
-    elif command == "/removecoin":
+    elif command in ("/removecoin", "/removetoken"):
         await cmd_removecoin(client, chat_id, args)
     elif command == "/related":
         await cmd_related(client, chat_id)
@@ -399,15 +528,18 @@ async def handle_command(client: httpx.AsyncClient, update: dict[str, Any]) -> N
         await _tg_send_async(client, chat_id, (
             "🤖 <b>Monitor Bot Commands</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "/status — current config\n"
-            "/threshold &lt;pct&gt; — e.g. /threshold 0.005\n"
-            "/mintokens &lt;n&gt; — e.g. /mintokens 0\n"
+            "/status — config + thresholds\n"
+            "/snapshot — top-10 holders for all coins\n"
+            "/holders SYM — top-20 holders for one coin\n"
             "/coins — list tracked coins\n"
-            "/addcoin SYM ADDR — add a coin\n"
-            "/removecoin SYM — remove a coin\n"
+            "/addtoken SYM ADDR — add a coin to tracking\n"
+            "/removetoken SYM — remove a coin from tracking\n"
+            "/threshold &lt;usd&gt; — whale alert min USD (e.g. 2000)\n"
+            "/movethreshold &lt;pct&gt; — holder move alert % (e.g. 0.005)\n"
+            "/mintokens &lt;n&gt; — min token gate (0 to disable)\n"
             "/related — cross-coin whale overlaps\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Changes take effect within 15 min."
+            "Config changes take effect within 15 min."
         ))
     else:
         await _tg_send_async(client, chat_id,
