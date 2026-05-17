@@ -41,5 +41,11 @@
 
   "move_threshold_pct": 0.01,
   "whale_threshold_usd": 500,
-  "min_holder_change_tokens": 0
+  "min_holder_change_tokens": 0,
+
+  "webhook_url": "https://asx-dashboard-production.up.railway.app/webhook/helius",
+  "railway_url": "https://asx-dashboard-production.up.railway.app",
+  "helius_fallback_rpc": "https://api.mainnet-beta.solana.com",
+  "alert_rate_limit_minutes": 5,
+  "hourly_digest_enabled": true
 }

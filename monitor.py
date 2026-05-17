@@ -87,6 +87,8 @@ MIN_HOLDER_CHANGE_TOKENS = float(
     os.environ.get("MIN_HOLDER_CHANGE_TOKENS", str(_cfg.get("min_holder_change_tokens", 0)))
 )
 
+PUBLIC_SOLANA_RPC = _cfg.get("helius_fallback_rpc", "https://api.mainnet-beta.solana.com")
+
 # Token registry sourced from config.json (overridable via Telegram /addcoin)
 TOKENS: dict[str, str] = {
     sym: info["address"]
@@ -425,28 +427,52 @@ def get_ai_interpretation(
 
 # ── Helius RPC ────────────────────────────────────────────────────────────────
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((requests.Timeout, requests.ConnectionError)),
-    before_sleep=before_sleep_log(log, logging.WARNING),
-    reraise=True,
-)
 def fetch_holders(token_address: str) -> list[dict[str, Any]]:
-    """Fetch the top-20 token holders via Helius getTokenLargestAccounts."""
-    if not HELIUS_API_KEY:
-        raise ValueError("HELIUS_API_KEY is not set")
-    resp = requests.post(
-        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-        json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        log.error("Helius RPC error for %s: %s", token_address[:8], data["error"])
-        return []
-    return data.get("result", {}).get("value", [])
+    """Fetch top-20 token holders, falling back to public Solana RPC if Helius is blocked.
+
+    Tries Helius first (fastest, richest data). On 403 / connection error / timeout
+    it immediately retries once on the public Solana mainnet RPC so GitHub Actions
+    runners — which are not in the Helius IP allowlist — still get data.
+    Logs which endpoint succeeded so the Actions log makes it obvious which path ran.
+    """
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method":  "getTokenLargestAccounts",
+        "params":  [token_address],
+    }
+    endpoints: list[tuple[str, str]] = []
+    if HELIUS_API_KEY:
+        endpoints.append(("Helius", f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"))
+    endpoints.append(("Solana-public", PUBLIC_SOLANA_RPC))
+
+    last_exc: Exception = RuntimeError("no endpoints configured")
+    for name, url in endpoints:
+        for attempt in range(2):
+            try:
+                resp = requests.post(url, json=payload, timeout=15)
+                if resp.status_code == 403:
+                    log.warning("  RPC %s → 403 Forbidden for %s (IP allowlist?) — trying fallback",
+                                name, token_address[:8])
+                    break  # don't retry this endpoint; move to next
+                resp.raise_for_status()
+                data = resp.json()
+                if "error" in data:
+                    log.error("  RPC %s JSON-RPC error for %s: %s", name, token_address[:8], data["error"])
+                    break
+                holders = data.get("result", {}).get("value", [])
+                log.info("  RPC endpoint used: %s  (%d holders)", name, len(holders))
+                return holders
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_exc = exc
+                log.warning("  RPC %s attempt %d failed for %s: %s", name, attempt + 1, token_address[:8], exc)
+                if attempt == 0:
+                    time.sleep(2)
+            except requests.HTTPError as exc:
+                last_exc = exc
+                log.warning("  RPC %s HTTP error for %s: %s — trying fallback", name, token_address[:8], exc)
+                break
+
+    raise RuntimeError(f"All RPC endpoints failed for {token_address[:8]}: {last_exc}")
 
 
 # ── Snapshot helpers ──────────────────────────────────────────────────────────
