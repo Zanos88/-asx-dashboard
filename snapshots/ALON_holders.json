@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-05-17T05:22:01.911865+00:00",
+  "timestamp": "2026-05-17T07:21:57.257903+00:00",
   "holders": [
     {
       "address": "Gi1VCbPL6Sdcytjp6f1uG1PvCHq25FuNgnVqySHBnKNk",
-      "uiAmount": 139085543.81566,
+      "uiAmount": 138941119.342204,
       "decimals": 6,
-      "amount": "139085543815660",
-      "uiAmountString": "139085543.81566"
+      "amount": "138941119342204",
+      "uiAmountString": "138941119.342204"
     },
     {
       "address": "D5aivThejtD9Fc7sGC3VfovfCe3VvVtpogTpvbrnEW4j",
