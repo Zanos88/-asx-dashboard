@@ -1,0 +1,43 @@
+name: Bot Smoke Tests
+
+on:
+  pull_request:
+    paths:
+      - 'bot_commands.py'
+      - 'monitor.py'
+      - 'main.py'
+      - 'webhook.py'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # Skip entirely if the bot token secret is not configured (e.g. forks)
+    if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check — monitor.py
+        run: python -c "import ast; ast.parse(open('monitor.py').read()); print('monitor.py OK')"
+
+      - name: Syntax check — bot_commands.py
+        run: python -c "import ast; ast.parse(open('bot_commands.py').read()); print('bot_commands.py OK')"
+
+      - name: Syntax check — webhook.py
+        run: python -c "import ast; ast.parse(open('webhook.py').read()); print('webhook.py OK')"
+
+      - name: Bot smoke tests
+        run: python test_bot.py --timeout 15
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          HELIUS_API_KEY:     ${{ secrets.HELIUS_API_KEY }}
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

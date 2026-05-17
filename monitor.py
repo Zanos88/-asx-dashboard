@@ -271,36 +271,6 @@ def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) ->
         except Exception as exc:
             log.error("❌ wallet_relationships insert failed: %s", exc)
 
-# ── Module-level run state ────────────────────────────────────────────────────
-DRY_RUN: bool                                    = False  # set via --dry-run
-_ai_cache: dict[str, tuple[str, float]]          = {}
-_coord_ai_cache: dict[str, tuple[str, float]]    = {}
-_alert_timestamps: dict[str, float]              = {}
-_wallet_intel_cache: dict[str, tuple[dict, float]] = {}
-_price_cache: dict[str, tuple[dict, float]]      = {}
-_hourly_alert_count: int                         = 0
-_hourly_flows: list[dict[str, Any]]              = []
-
-
-# ── Supabase client ───────────────────────────────────────────────────────────
-
-def init_supabase() -> Client | None:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        log.error("Supabase not configured — set SUPABASE_URL and SUPABASE_SERVICE_KEY")
-        return None
-    try:
-        client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        client.table("wallet_snapshots").select("id").limit(1).execute()
-        log.info("✅ Supabase connection OK — %s", SUPABASE_URL)
-        return client
-    except Exception as exc:
-        log.error("❌ Supabase connection FAILED: %s", exc)
-        return None
-
-
-_supabase: Client | None = init_supabase()
-
-
 # ── Supabase writers ──────────────────────────────────────────────────────────
 
 def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[dict]) -> None:

@@ -39,17 +39,15 @@ Railway start command:
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
 import logging
 import os
-from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -741,8 +739,13 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+async def health() -> dict:
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
+        "supabase_configured": bool(SUPABASE_URL),
+    }
 
 
 @app.post("/webhook/helius")

@@ -271,7 +271,7 @@ async def cmd_related(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("No tokens tracked. Use /addtoken.")
         return
 
-    loop   = asyncio.get_event_loop()
+    loop   = asyncio.get_running_loop()
     lines  = ["🕸 <b>Cross-Token Whale Intelligence</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
     ext_names = ", ".join(MAJOR_TOKEN_MINTS.keys())
 
