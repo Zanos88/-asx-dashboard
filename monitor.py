@@ -8,7 +8,7 @@ Environment variables:
     TELEGRAM_BOT_TOKEN        Telegram bot token from @BotFather
     TELEGRAM_CHAT_ID          Target chat or channel ID
     SUPABASE_URL              Supabase project URL (https://xxx.supabase.co)
-    SUPABASE_SERVICE_KEY      Supabase service-role key (bypasses RLS)
+    SUPABASE_SERVICE_ROLE_KEY Supabase service-role key (bypasses RLS)
     ANTHROPIC_API_KEY         Anthropic API key for AI interpretation
     MOVE_THRESHOLD_PCT        % supply change to trigger an alert (overridden by bot_config)
     MIN_HOLDER_CHANGE_TOKENS  raw token amount threshold (overridden by bot_config)
@@ -46,7 +46,7 @@ HELIUS_API_KEY     = os.environ.get("HELIUS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
 
@@ -112,7 +112,7 @@ _hourly_flows: list[dict[str, Any]]              = []
 
 def init_supabase() -> Client | None:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        log.error("Supabase not configured — set SUPABASE_URL and SUPABASE_SERVICE_KEY")
+        log.error("Supabase not configured — set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
         return None
     try:
         client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
