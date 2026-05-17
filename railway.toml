@@ -1,11 +1,18 @@
 # Railway deployment configuration
-# Dashboard service — Streamlit app
-# Deploy the webhook service separately (see README.md)
+# Two services from the same repo — select the service in the Railway dashboard
+# to pick up its start command.
 
 [build]
 builder = "nixpacks"
 
-[deploy]
+[services.dashboard]
+startCommand = "streamlit run asx_dashboard.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 300
+
+[services.bot]
 startCommand = "python main.py"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
