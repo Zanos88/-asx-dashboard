@@ -1,1 +1,1 @@
-worker: python bot_commands.py
+web: python main.py
