@@ -1,0 +1,61 @@
+{
+  "_comment": "Edit this file from the GitHub mobile app to update tokens, holdings, and thresholds. Changes take effect on the next run.",
+
+  "solana_tokens": {
+    "ALON": {
+      "address": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS",
+      "name": "Alon",
+      "emoji": "🤖"
+    },
+    "TROLL": {
+      "address": "5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2",
+      "name": "Troll",
+      "emoji": "🧌"
+    },
+    "HANTA": {
+      "address": "2tXpgu2DLTsPUf9zFmuZmA4xrYxXKBTpVq9wAM7hzs9y",
+      "name": "Hanta",
+      "emoji": "🦠"
+    },
+    "PUMP": {
+      "address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+      "name": "Pump",
+      "emoji": "🚀"
+    }
+  },
+
+  "asx_holdings": {
+    "AKN.AX": {
+      "name": "AuKing Mining",
+      "avg_entry": 0.043,
+      "shares": 212782
+    },
+    "XST.AX": {
+      "name": "Xstate Resources",
+      "avg_entry": 0.120,
+      "shares": 0
+    }
+  },
+
+  "asx_watchlist": {
+    "G11.AX": { "name": "Group 11 Technologies" },
+    "VRC.AX": { "name": "Volt Resources" },
+    "RNX.AX": { "name": "Renegade Exploration" }
+  },
+
+  "akn_milestones": [
+    { "stage": "Discovery",  "target_cap_m": 55  },
+    { "stage": "Resource",   "target_cap_m": 100 },
+    { "stage": "Developer",  "target_cap_m": 250 }
+  ],
+
+  "move_threshold_pct": 0.01,
+  "whale_threshold_usd": 500,
+  "min_holder_change_tokens": 0,
+
+  "webhook_url": "https://asx-dashboard-production.up.railway.app/webhook/helius",
+  "railway_url": "https://asx-dashboard-production.up.railway.app",
+  "helius_fallback_rpc": "https://api.mainnet-beta.solana.com",
+  "alert_rate_limit_minutes": 5,
+  "hourly_digest_enabled": true
+}
