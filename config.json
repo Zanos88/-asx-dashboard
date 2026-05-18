@@ -39,7 +39,8 @@
     { "stage": "Developer",  "target_cap_m": 250 }
   ],
 
-  "telegram_channel_id": "-100100397146138",
+  "telegram_channel_id": "-1003971651708",
+  "telegram_group_id":   "-1003971651708",
   "telegram_owner_id": "set_via_TELEGRAM_CHAT_ID_env_var",
 
   "move_threshold_pct": 0.01,
