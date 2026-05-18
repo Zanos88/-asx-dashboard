@@ -42,10 +42,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-HELIUS_API_KEY     = os.environ.get("HELIUS_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-SUPABASE_URL       = os.environ.get("SUPABASE_URL", "")
+HELIUS_API_KEY      = os.environ.get("HELIUS_API_KEY", "")
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY       = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SNAPSHOT_DIR       = os.path.join(os.path.dirname(__file__), "snapshots")
@@ -371,15 +372,16 @@ def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any
     before_sleep=before_sleep_log(log, logging.WARNING),
     reraise=False,
 )
-def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
+def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None, *, chat_id: str = "") -> tuple[bool, str]:
     if DRY_RUN:
         log.info("[DRY RUN] Telegram skipped: %s", msg[:80])
         return True, "dry-run"
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         log.warning("Telegram not configured — missing token or chat ID")
         return False, "not_configured"
     payload: dict[str, Any] = {
-        "chat_id": TELEGRAM_CHAT_ID, "text": msg,
+        "chat_id": target, "text": msg,
         "parse_mode": "HTML", "disable_web_page_preview": True,
     }
     if reply_markup:
@@ -394,6 +396,25 @@ def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple
         log.error("Telegram HTTP error %s: %s", resp.status_code, resp.text[:200])
         return False, str(exc)
     return True, ""
+
+
+def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Broadcast a whale/holder alert to channel (if set) and to the owner's chat."""
+    targets = [t for t in [TELEGRAM_CHANNEL_ID, TELEGRAM_CHAT_ID] if t]
+    sent = False
+    last_err = "no_targets"
+    for target in targets:
+        try:
+            result = send_telegram(msg, reply_markup, chat_id=target)
+            ok, err = result if result else (False, "retry_exhausted")
+        except Exception as exc:
+            ok, err = False, str(exc)
+        if ok:
+            sent = True
+        else:
+            last_err = err
+            log.warning("Alert delivery failed for chat %s: %s", target, err)
+    return sent, ("" if sent else last_err)
 
 
 def make_inline_keyboard(wallet_address: str, token_address: str) -> dict[str, Any]:
@@ -803,7 +824,7 @@ def send_cross_coin_digest(
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-    ok, err = send_telegram("\n".join(lines).strip())
+    ok, err = send_alert("\n".join(lines).strip())
     if ok:
         log.info("Cross-coin digest sent (%d wallets)", len(multi))
     else:
@@ -862,7 +883,7 @@ def detect_coordinated_moves(
                     f'🔗 <a href="https://dexscreener.com/solana/{token_address}">DexScreener</a>'
                 )
 
-            ok, err = send_telegram("\n".join(lines))
+            ok, err = send_alert("\n".join(lines))
             if ok:
                 log.info("Coordinated move alert sent for %s (%d wallets)", symbol, len(group))
             else:
@@ -1063,7 +1084,7 @@ def send_hourly_digest(symbol: str, token_address: str, flows: list[dict], price
         f"💵 {symbol} Price: {price_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
-    ok, err = send_telegram(msg)
+    ok, err = send_alert(msg)
     if not ok:
         log.error("Flow digest failed: %s", err)
     else:
@@ -1148,7 +1169,7 @@ def send_daily_digest() -> None:
         f"🔔 Total alerts sent: {len(rows)}",
     ]
 
-    ok, err = send_telegram("\n".join(lines))
+    ok, err = send_alert("\n".join(lines))
     if ok:
         log.info("Daily digest sent (%d alerts)", len(rows))
     else:
@@ -1328,7 +1349,7 @@ def run_holder_monitor() -> None:
 
                 telegram_sent = False
                 try:
-                    ok, err = send_telegram(msg, reply_markup=kb)
+                    ok, err = send_alert(msg, reply_markup=kb)
                     telegram_sent = ok
                     if not ok:
                         log.error("  Telegram failed: %s", err)

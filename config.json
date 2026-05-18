@@ -39,6 +39,9 @@
     { "stage": "Developer",  "target_cap_m": 250 }
   ],
 
+  "telegram_channel_id": "-100100397146138",
+  "telegram_owner_id": "set_via_TELEGRAM_CHAT_ID_env_var",
+
   "move_threshold_pct": 0.01,
   "whale_threshold_usd": 500,
   "min_holder_change_tokens": 0,

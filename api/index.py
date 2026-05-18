@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHANNEL_ID   = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 HELIUS_API_KEY        = os.environ.get("HELIUS_API_KEY", "")
 XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
 HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
@@ -132,15 +133,18 @@ def send_telegram(
     msg: str,
     reply_markup: dict[str, Any] | None = None,
     retries: int = 3,
+    *,
+    chat_id: str = "",
 ) -> tuple[bool, str]:
-    """Send an HTML-formatted message to Telegram, optionally with inline keyboard."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    """Send an HTML-formatted message to a single Telegram chat, optionally with inline keyboard."""
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         log.warning("Telegram credentials not configured")
         return False, "not_configured"
 
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload: dict[str, Any] = {
-        "chat_id":                  TELEGRAM_CHAT_ID,
+        "chat_id":                  target,
         "text":                     msg,
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
@@ -164,6 +168,24 @@ def send_telegram(
             time.sleep(2 ** attempt)
 
     return False, f"Failed after {retries} attempts"
+
+
+def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Broadcast a whale/holder alert to channel (if set) and to the owner's chat."""
+    targets = [t for t in [TELEGRAM_CHANNEL_ID, TELEGRAM_CHAT_ID] if t]
+    sent = False
+    last_err = "no_targets"
+    for target in targets:
+        try:
+            ok, err = send_telegram(msg, reply_markup, chat_id=target)
+        except Exception as exc:
+            ok, err = False, str(exc)
+        if ok:
+            sent = True
+        else:
+            last_err = err
+            log.warning("Alert delivery failed for chat %s: %s", target, err)
+    return sent, ("" if sent else last_err)
 
 
 # ── DexScreener price ─────────────────────────────────────────────────────────
@@ -426,7 +448,7 @@ def send_holder_status(symbol: str, mint: str) -> None:
         pct = amt / total * 100
         lines.append(f"{i:2d}. <code>{shorten_addr(h.get('address', ''))}</code>  {pct:.2f}%")
 
-    ok, err = send_telegram("\n".join(lines))
+    ok, err = send_alert("\n".join(lines))
     if not ok:
         log.error("Failed to send holder status for %s: %s", symbol, err)
 
@@ -476,7 +498,7 @@ async def helius_webhook(request: Request) -> JSONResponse:
     for tx in transactions:
         try:
             for alert_text, kb in process_transaction(tx):
-                ok, err = send_telegram(alert_text, reply_markup=kb)
+                ok, err = send_alert(alert_text, reply_markup=kb)
                 if ok:
                     alerts_sent += 1
                 else:
@@ -554,7 +576,7 @@ async def trigger_sentiment(request: Request) -> JSONResponse:
                     f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
                     f"{sentiment}"
                 )
-                ok, err = send_telegram(msg)
+                ok, err = send_alert(msg)
                 results[symbol] = "sent" if ok else f"telegram_error: {err}"
             else:
                 results[symbol] = "no_sentiment_returned"
@@ -594,7 +616,7 @@ async def cron(request: Request) -> JSONResponse:
                     f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
                     f"{sentiment}"
                 )
-                ok, err = send_telegram(msg)
+                ok, err = send_alert(msg)
                 if ok:
                     dispatched.append(f"{symbol}:sentiment")
                 else:

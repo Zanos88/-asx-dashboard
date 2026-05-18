@@ -62,6 +62,7 @@ log = logging.getLogger(__name__)
 # ── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHANNEL_ID   = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
 WHALE_THRESHOLD_USD   = float(os.environ.get("WHALE_THRESHOLD_USD", "10000"))
 XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
@@ -194,14 +195,15 @@ def shorten_addr(addr: str) -> str:
 
 # ── Telegram sync (for webhook alerts) ───────────────────────────────────────
 
-def send_telegram(msg: str, retries: int = 3) -> tuple[bool, str]:
-    """Send HTML-formatted message to Telegram with exponential backoff."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram(msg: str, retries: int = 3, *, chat_id: str = "") -> tuple[bool, str]:
+    """Send HTML-formatted message to a single Telegram chat with exponential backoff."""
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         log.warning("Telegram credentials not configured — skipping alert")
         return False, "not_configured"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML",
+    payload = {"chat_id": target, "text": msg, "parse_mode": "HTML",
                "disable_web_page_preview": True}
 
     for attempt in range(retries):
@@ -222,6 +224,24 @@ def send_telegram(msg: str, retries: int = 3) -> tuple[bool, str]:
             time.sleep(2 ** attempt)
 
     return False, f"Failed after {retries} attempts"
+
+
+def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Broadcast a whale/holder alert to channel (if set) and to the owner's chat."""
+    targets = [t for t in [TELEGRAM_CHANNEL_ID, TELEGRAM_CHAT_ID] if t]
+    sent = False
+    last_err = "no_targets"
+    for target in targets:
+        try:
+            ok, err = send_telegram(msg, chat_id=target)
+        except Exception as exc:
+            ok, err = False, str(exc)
+        if ok:
+            sent = True
+        else:
+            last_err = err
+            log.warning("Alert delivery failed for chat %s: %s", target, err)
+    return sent, ("" if sent else last_err)
 
 
 # ── Telegram async (for bot command polling) ──────────────────────────────────
@@ -681,7 +701,7 @@ def send_sentiment_digest() -> None:
                 f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
                 f"{sentiment}"
             )
-            ok, err = send_telegram(msg)
+            ok, err = send_alert(msg)
             if not ok:
                 log.error("Failed to send sentiment digest for %s: %s", symbol, err)
             else:
@@ -770,7 +790,7 @@ async def helius_webhook(request: Request) -> JSONResponse:
     for tx in transactions:
         try:
             for alert in process_transaction(tx):
-                ok, err = send_telegram(alert)
+                ok, err = send_alert(alert)
                 if ok:
                     alerts_sent += 1
                 else:
