@@ -36,14 +36,20 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-_AUTHORIZED_CHAT = int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else 0
+def _parse_chat_ids(raw: str) -> set[int]:
+    return {int(cid.strip()) for cid in raw.split(",") if cid.strip().lstrip("-").isdigit()}
+
+_AUTHORIZED_CHATS: frozenset[int] = frozenset(
+    (_parse_chat_ids(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else set())
+    | _parse_chat_ids(os.environ.get("TELEGRAM_EXTRA_CHAT_IDS", ""))
+)
 _REPO_DIR = os.path.dirname(os.path.abspath(_CONFIG_PATH))
 
 
 # ── Auth + config helpers ─────────────────────────────────────────────────────
 
 def _authorized(update: Update) -> bool:
-    return update.effective_chat.id == _AUTHORIZED_CHAT
+    return update.effective_chat.id in _AUTHORIZED_CHATS
 
 
 async def _deny(update: Update) -> None:
