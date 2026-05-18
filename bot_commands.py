@@ -354,7 +354,7 @@ def main() -> None:
     app.add_handler(CommandHandler("movethreshold", cmd_threshold))
     app.add_handler(CommandHandler("related",       cmd_related))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
 
 if __name__ == "__main__":
