@@ -171,21 +171,14 @@ def send_telegram(
 
 
 def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
-    """Broadcast a whale/holder alert to channel (if set) and to the owner's chat."""
-    targets = [t for t in [TELEGRAM_CHANNEL_ID, TELEGRAM_CHAT_ID] if t]
-    sent = False
-    last_err = "no_targets"
-    for target in targets:
-        try:
-            ok, err = send_telegram(msg, reply_markup, chat_id=target)
-        except Exception as exc:
-            ok, err = False, str(exc)
-        if ok:
-            sent = True
-        else:
-            last_err = err
-            log.warning("Alert delivery failed for chat %s: %s", target, err)
-    return sent, ("" if sent else last_err)
+    """Send alert to channel when configured, else fall back to owner chat."""
+    target = TELEGRAM_CHANNEL_ID or TELEGRAM_CHAT_ID
+    if not target:
+        return False, "no_targets"
+    try:
+        return send_telegram(msg, reply_markup, chat_id=target)
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ── DexScreener price ─────────────────────────────────────────────────────────

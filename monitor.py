@@ -399,22 +399,15 @@ def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None, *, chat_
 
 
 def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
-    """Broadcast a whale/holder alert to channel (if set) and to the owner's chat."""
-    targets = [t for t in [TELEGRAM_CHANNEL_ID, TELEGRAM_CHAT_ID] if t]
-    sent = False
-    last_err = "no_targets"
-    for target in targets:
-        try:
-            result = send_telegram(msg, reply_markup, chat_id=target)
-            ok, err = result if result else (False, "retry_exhausted")
-        except Exception as exc:
-            ok, err = False, str(exc)
-        if ok:
-            sent = True
-        else:
-            last_err = err
-            log.warning("Alert delivery failed for chat %s: %s", target, err)
-    return sent, ("" if sent else last_err)
+    """Send alert to channel when configured, else fall back to owner chat."""
+    target = TELEGRAM_CHANNEL_ID or TELEGRAM_CHAT_ID
+    if not target:
+        return False, "no_targets"
+    try:
+        result = send_telegram(msg, reply_markup, chat_id=target)
+        return result if result else (False, "retry_exhausted")
+    except Exception as exc:
+        return False, str(exc)
 
 
 def make_inline_keyboard(wallet_address: str, token_address: str) -> dict[str, Any]:
