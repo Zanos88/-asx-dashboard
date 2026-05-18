@@ -25,6 +25,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
+from address_filters import (  # noqa: E402
+    classify_and_filter,
+    classify_address,
+    KNOWN_EXCLUDED_ADDRESSES,
+)
 from supabase import Client, create_client
 from tenacity import (
     before_sleep_log,
@@ -1244,14 +1249,31 @@ def run_holder_monitor() -> None:
     for symbol, token_address in TOKENS.items():
         log.info("Fetching %s (%s...)", symbol, token_address[:8])
         try:
-            current = fetch_holders(token_address)
+            raw = fetch_holders(token_address)
         except Exception as exc:
             log.error("fetch_holders failed for %s: %s — skipping", symbol, exc)
             continue
-        if not current:
+        if not raw:
             log.warning("Empty holder list for %s — skipping", symbol)
             continue
-        log.info("  %d holders fetched", len(current))
+        log.info("  %d holders fetched", len(raw))
+
+        # Filter LP pools and program accounts before any analysis
+        _rpc = (
+            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+            if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+        )
+        filter_result = classify_and_filter(raw, _rpc, resolve_owners_batch, _supabase)
+        current = filter_result["real_holders"]
+        if not current:
+            log.warning("  %s: all holders filtered as LP/programs — skipping", symbol)
+            continue
+        if filter_result["excluded"]:
+            log.info(
+                "  %s: %d LP/program addresses excluded (%.2f%% supply)",
+                symbol, len(filter_result["excluded"]), filter_result["lp_pct"],
+            )
+
         all_current[symbol]   = current
         all_addresses[symbol] = token_address
         try:

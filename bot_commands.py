@@ -23,8 +23,11 @@ from monitor import (
     MIN_HOLDER_CHANGE_TOKENS,
     MAJOR_TOKEN_MINTS,
     TOKENS,
+    HELIUS_API_KEY,
+    PUBLIC_SOLANA_RPC,
     _CONFIG_PATH,
     _load_config,
+    _supabase,
     update_bot_config,
     fetch_holders,
     fetch_wallet_intel,
@@ -32,10 +35,12 @@ from monitor import (
     fetch_price_context,
     format_quant_alert,
     resolve_owners_batch,
+    classify_address,
     load_snapshot,
     get_amount,
     send_alert,
 )
+from address_filters import classify_and_filter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,6 +119,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/run — Trigger a full monitor run immediately\n"
         "/testalert [SYMBOL] — Fire a synthetic alert to verify the pipeline\n"
         "/topwallets [TOKEN] — Rank top wallets by meme win rate\n"
+        "/classify &lt;ADDRESS&gt; — Check if an address is a wallet, LP pool, or program\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
         "/removetoken &lt;SYMBOL&gt; — Stop tracking a token\n"
         "/threshold &lt;PCT&gt; — Set move alert threshold (e.g. 0.01)\n"
@@ -188,20 +194,60 @@ async def cmd_holders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     await update.message.reply_text(f"⏳ Fetching live holders for {sym}…")
     try:
-        holders = fetch_holders(tokens[sym])
+        raw = fetch_holders(tokens[sym])
     except Exception as exc:
         await update.message.reply_text(f"❌ RPC error: {html.escape(str(exc))}")
         return
-    if not holders:
+    if not raw:
         await update.message.reply_text(f"No holders returned for {sym}.")
         return
-    total = sum(get_amount(h) for h in holders) or 1.0
-    lines = [f"🐋 <b>{sym} Top-10 Holders</b> (live)\n"]
-    for i, h in enumerate(holders[:10], 1):
-        pct  = get_amount(h) / total * 100
+
+    # Filter LP pools / programs
+    rpc_url = (
+        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+    )
+    loop = asyncio.get_running_loop()
+    fr   = await loop.run_in_executor(
+        None, classify_and_filter, raw, rpc_url, resolve_owners_batch, _supabase
+    )
+    real    = fr["real_holders"]
+    excl    = fr["excluded"]
+    lp_pct  = fr["lp_pct"]
+
+    all_holders = real  # already owner-wallet addresses, reranked
+    total_real  = sum(get_amount(h) for h in all_holders) or 1.0
+
+    lines = [f"🐋 <b>{sym} Top-10 Holders</b> (live — LP filtered)\n"]
+
+    # Show excluded LP entries first (greyed out)
+    raw_total = sum(get_amount(h) for h in raw) or 1.0
+    for (ta, owner, reason) in excl[:3]:
+        exc_amt = next(
+            (get_amount(h) for h in raw if h.get("address") == ta), 0.0
+        )
+        exc_pct = exc_amt / raw_total * 100
+        short   = f"{owner[:8]}…{owner[-6:]}"
+        lines.append(f"<i>[{reason}] <code>{short}</code> {exc_pct:.2f}% — excluded</i>")
+
+    if excl:
+        lines.append("")
+
+    for i, h in enumerate(all_holders[:10], 1):
+        pct  = get_amount(h) / total_real * 100
         addr = h.get("address", "?")
-        lines.append(f"#{i} <code>{addr[:8]}…{addr[-6:]}</code> {pct:.2f}%")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        link = f'<a href="https://solscan.io/account/{addr}">{addr[:8]}…{addr[-6:]}</a>'
+        flag = " 🔶" if pct >= 20.0 else ""
+        lines.append(f"#{i} {link}  {pct:.2f}%{flag}")
+
+    conc_top5 = sum(get_amount(h) / total_real * 100 for h in all_holders[:5])
+    lines.append(
+        f"\n<b>Top-5 concentration (excl. LP):</b> {conc_top5:.1f}%"
+    )
+    if lp_pct > 0:
+        lines.append(f"<b>LP / programs hold:</b> ~{lp_pct:.1f}% of supply")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -397,6 +443,49 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def cmd_classify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Classify a Solana address — is it a real wallet, LP pool, or program?"""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /classify &lt;SOLANA_ADDRESS&gt;\n"
+            "Example: /classify 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+            parse_mode="HTML",
+        )
+        return
+
+    address = context.args[0].strip()
+    if len(address) < 32 or len(address) > 44:
+        await update.message.reply_text("❌ That doesn't look like a valid Solana address (32–44 chars).")
+        return
+
+    rpc_url = (
+        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+    )
+
+    loop   = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, classify_address, address, rpc_url, _supabase
+    )
+
+    label      = result["label"]
+    detail     = result["detail"]
+    solscan    = f'<a href="https://solscan.io/account/{address}">{address[:8]}…{address[-6:]}</a>'
+    icon       = {"WALLET": "✅", "KNOWN_PROGRAM": "⛔", "LP_POOL": "🏊", "PROGRAM": "🤖"}.get(label, "❓")
+
+    await update.message.reply_text(
+        f"{icon} <b>Address Classification</b>\n\n"
+        f"<b>Address:</b> {solscan}\n"
+        f"<b>Label:</b> {label}\n"
+        f"<b>Detail:</b> {html.escape(detail)}",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         await _deny(update)
@@ -530,6 +619,7 @@ def main() -> None:
     app.add_handler(CommandHandler("run",           cmd_run))
     app.add_handler(CommandHandler("testalert",     cmd_testalert))
     app.add_handler(CommandHandler("topwallets",    cmd_topwallets))
+    app.add_handler(CommandHandler("classify",      cmd_classify))
     app.add_handler(CommandHandler("related",       cmd_related))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
