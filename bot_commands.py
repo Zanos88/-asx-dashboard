@@ -22,14 +22,19 @@ from monitor import (
     MOVE_THRESHOLD_PCT,
     MIN_HOLDER_CHANGE_TOKENS,
     MAJOR_TOKEN_MINTS,
+    TOKENS,
     _CONFIG_PATH,
     _load_config,
+    update_bot_config,
     fetch_holders,
     fetch_wallet_intel,
     fetch_wallet_winrate,
+    fetch_price_context,
+    format_quant_alert,
     resolve_owners_batch,
     load_snapshot,
     get_amount,
+    send_alert,
 )
 
 logging.basicConfig(
@@ -64,19 +69,19 @@ def _save_config(cfg: dict) -> None:
         json.dump(cfg, fh, indent=2)
 
 
-def _git_push_config() -> str:
-    """Commit and push config.json; returns a status line for the reply."""
-    try:
-        subprocess.run(["git", "add", "config.json"], check=True, capture_output=True, cwd=_REPO_DIR)
-        subprocess.run(
-            ["git", "commit", "-m", "Bot: updated config"],
-            check=True, capture_output=True, cwd=_REPO_DIR,
-        )
-        subprocess.run(["git", "push"], check=True, capture_output=True, cwd=_REPO_DIR)
-        return "✅ Config saved and pushed to git."
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode()
-        return f"⚠️ Config saved locally but git push failed:\n<code>{html.escape(stderr[:200])}</code>"
+def _persist_config(cfg: dict) -> str:
+    """Save config.json locally and upsert all changed keys to Supabase bot_config."""
+    _save_config(cfg)
+    results = []
+    tokens = cfg.get("solana_tokens", {})
+    if update_bot_config("tracked_tokens", json.dumps({s: v["address"] for s, v in tokens.items()})):
+        results.append("tokens")
+    if "move_threshold_pct" in cfg:
+        if update_bot_config("move_threshold_pct", str(cfg["move_threshold_pct"])):
+            results.append("threshold")
+    if results:
+        return f"✅ Saved to Supabase ({', '.join(results)}) — takes effect on next cron run."
+    return "⚠️ Saved locally only (Supabase write failed — check logs)."
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -107,6 +112,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/holders &lt;SYMBOL&gt; — Fetch live top-10 holders\n"
         "/related — External token holdings for top wallets\n"
         "/run — Trigger a full monitor run immediately\n"
+        "/testalert [SYMBOL] — Fire a synthetic alert to verify the pipeline\n"
         "/topwallets [TOKEN] — Rank top wallets by meme win rate\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
         "/removetoken &lt;SYMBOL&gt; — Stop tracking a token\n"
@@ -214,8 +220,7 @@ async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     cfg = _load_config()
     cfg.setdefault("solana_tokens", {})[sym] = {"address": mint, "name": sym.title(), "emoji": "🔹"}
-    _save_config(cfg)
-    status = _git_push_config()
+    status = _persist_config(cfg)
     await update.message.reply_text(
         f"✅ Now tracking <b>{sym}</b> (<code>{mint[:8]}…</code>)\n{status}",
         parse_mode="HTML",
@@ -235,8 +240,7 @@ async def cmd_removetoken(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"'{sym}' is not currently tracked.")
         return
     del cfg["solana_tokens"][sym]
-    _save_config(cfg)
-    status = _git_push_config()
+    status = _persist_config(cfg)
     await update.message.reply_text(f"✅ Removed <b>{sym}</b>.\n{status}", parse_mode="HTML")
 
 
@@ -259,8 +263,7 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     cfg = _load_config()
     cfg["move_threshold_pct"] = pct
-    _save_config(cfg)
-    status = _git_push_config()
+    status = _persist_config(cfg)
     await update.message.reply_text(
         f"✅ Move threshold set to <b>{pct:.4f}%</b>\n{status}",
         parse_mode="HTML",
@@ -339,6 +342,59 @@ async def cmd_related(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines.append(f"<i>Threshold ≥$500 | {datetime.now(timezone.utc).strftime('%H:%M UTC')}</i>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+
+    sym = (context.args[0].upper() if context.args else None) or next(iter(TOKENS), None)
+    cfg = _load_config()
+    tok = cfg.get("solana_tokens", {}).get(sym)
+    if not tok:
+        await update.message.reply_text(
+            f"Unknown token '{sym}'. Tracked: {', '.join(TOKENS) or 'none'}"
+        )
+        return
+
+    snap = load_snapshot(sym)
+    if not snap or not snap.get("holders"):
+        await update.message.reply_text("No snapshot found — run /run first.")
+        return
+
+    holders = snap["holders"]
+    h1      = holders[0]
+    addr    = h1.get("address", "11111111111111111111111111111111")
+    total   = sum(get_amount(h) for h in holders) or 1.0
+    old_pct = get_amount(h1) / total * 100
+
+    fake_change = {
+        "type": "MOVE", "address": addr,
+        "old_pct": old_pct, "new_pct": old_pct + 0.05, "delta": 0.05,
+        "old_rank": 1, "new_rank": 1,
+        "tokens_delta": 50_000,
+        "old_tokens": get_amount(h1), "new_tokens": get_amount(h1) + 50_000,
+        "trigger": "pct",
+    }
+
+    loop      = asyncio.get_running_loop()
+    price_ctx = await loop.run_in_executor(None, fetch_price_context, tok["address"])
+    msg = format_quant_alert(
+        sym, tok["address"], fake_change, price_ctx,
+        wallet_info={"age_days": 45, "is_new_wallet": False},
+        ai_interp="[TEST] Synthetic move — verifying alert pipeline end-to-end.",
+    )
+    msg = f"⚠️ <b>TEST ALERT — pipeline check</b>\n\n{msg}"
+
+    ok, err = send_alert(msg)
+    if ok:
+        await update.message.reply_text("✅ Test alert sent to channel.")
+    else:
+        await update.message.reply_text(
+            f"❌ Send failed: {html.escape(str(err))}\n"
+            "Check TELEGRAM_CHANNEL_ID env var and bot membership."
+        )
 
 
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -472,6 +528,7 @@ def main() -> None:
     app.add_handler(CommandHandler("threshold",     cmd_threshold))
     app.add_handler(CommandHandler("movethreshold", cmd_threshold))
     app.add_handler(CommandHandler("run",           cmd_run))
+    app.add_handler(CommandHandler("testalert",     cmd_testalert))
     app.add_handler(CommandHandler("topwallets",    cmd_topwallets))
     app.add_handler(CommandHandler("related",       cmd_related))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))

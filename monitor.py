@@ -158,6 +158,19 @@ def _load_bot_config_from_supabase() -> None:
         log.warning("Failed to load bot_config from Supabase: %s", exc)
 
 
+def update_bot_config(key: str, value: str) -> bool:
+    """Upsert a key/value pair in the bot_config Supabase table. Returns True on success."""
+    if _supabase is None:
+        return False
+    try:
+        _supabase.table("bot_config").upsert({"key": key, "value": value}).execute()
+        log.info("bot_config updated: %s = %s", key, value[:80])
+        return True
+    except Exception as exc:
+        log.warning("bot_config update failed (%s): %s", key, exc)
+        return False
+
+
 # ── Supabase writers ──────────────────────────────────────────────────────────
 
 def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[dict]) -> None:
@@ -1175,6 +1188,7 @@ def log_startup_diagnostics() -> None:
     log.info("HELIUS_API_KEY       : %s", "✅ set" if HELIUS_API_KEY     else "❌ MISSING")
     log.info("TELEGRAM_BOT_TOKEN   : %s", "✅ set" if TELEGRAM_BOT_TOKEN else "❌ MISSING")
     log.info("TELEGRAM_CHAT_ID     : %s", "✅ set" if TELEGRAM_CHAT_ID   else "❌ MISSING")
+    log.info("TELEGRAM_CHANNEL_ID  : %s", TELEGRAM_CHANNEL_ID if TELEGRAM_CHANNEL_ID else "not set — falling back to CHAT_ID")
     log.info("SUPABASE_URL         : %s", "✅ set" if SUPABASE_URL       else "❌ MISSING")
     log.info("SUPABASE_SERVICE_KEY : %s", "✅ set" if SUPABASE_KEY       else "❌ MISSING")
     log.info("ANTHROPIC_API_KEY    : %s", "✅ set" if ANTHROPIC_API_KEY  else "❌ MISSING")
