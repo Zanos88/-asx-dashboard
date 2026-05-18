@@ -272,95 +272,36 @@ def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) ->
         except Exception as exc:
             log.error("❌ wallet_relationships insert failed: %s", exc)
 
-# ── Supabase writers ──────────────────────────────────────────────────────────
 
-def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[dict]) -> None:
-    if DRY_RUN:
-        log.info("[DRY RUN] Supabase wallet_snapshots write skipped (%s)", symbol)
-        return
-    if _supabase is None:
-        return
-    total        = sum(get_amount(h) for h in holders) or 1.0
-    top10_pct    = sum(get_amount(h) / total * 100 for h in holders[:10])
-    holder_count = len(holders)
-    captured_at  = datetime.now(timezone.utc).isoformat()
-    rows = [
-        {
-            "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
-            "wallet_address": h["address"], "rank": rank,
-            "balance": get_amount(h),
-            "pct_supply": round(get_amount(h) / total * 100, 6),
-            "captured_at": captured_at, "holder_count": holder_count,
-            "top10_pct": round(top10_pct, 4),
-        }
-        for rank, h in enumerate(holders, 1)
+def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
+    """Batch-resolve SPL token account addresses → owner wallet addresses (one RPC call)."""
+    if not token_account_addrs:
+        return {}
+    rpc_url = (
+        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+    )
+    batch = [
+        {"jsonrpc": "2.0", "id": i, "method": "getAccountInfo",
+         "params": [addr, {"encoding": "jsonParsed"}]}
+        for i, addr in enumerate(token_account_addrs)
     ]
     try:
-        _supabase.table("wallet_snapshots").insert(rows).execute()
-        log.info("  ✅ %d rows → wallet_snapshots (%s)", len(rows), symbol)
+        resp = requests.post(rpc_url, json=batch, timeout=30)
+        resp.raise_for_status()
+        owners: dict[str, str] = {}
+        for item in resp.json():
+            idx   = item.get("id")
+            value = (item.get("result") or {}).get("value") or {}
+            data  = value.get("data") or {}
+            if isinstance(data, dict):
+                owner = (data.get("parsed") or {}).get("info", {}).get("owner")
+                if owner and idx is not None and idx < len(token_account_addrs):
+                    owners[token_account_addrs[idx]] = owner
+        return owners
     except Exception as exc:
-        log.error("  ❌ wallet_snapshots insert failed for %s: %s", symbol, exc)
-
-
-def write_alert_to_supabase(symbol: str, token_address: str, change: dict, telegram_sent: bool) -> None:
-    if DRY_RUN:
-        log.info("[DRY RUN] Supabase whale_alerts write skipped (%s)", symbol)
-        return
-    if _supabase is None:
-        return
-    now         = datetime.now(timezone.utc).isoformat()
-    token_delta = change.get("tokens_delta") or change.get("token_delta") or 0
-    delta       = change.get("delta", 0)
-    flow_type   = (
-        "entry" if change["type"] == "NEW"
-        else "exit" if change["type"] == "EXIT"
-        else "buy"  if delta > 0
-        else "sell"
-    )
-    try:
-        _supabase.table("whale_alerts").insert({
-            "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
-            "wallet_address": change["address"], "change_type": change["type"],
-            "old_pct": change.get("old_pct"), "new_pct": change.get("new_pct"),
-            "delta_pct": round(delta, 6), "token_delta": token_delta,
-            "trigger": change.get("trigger", "pct"),
-            "alerted_at": now, "telegram_sent": telegram_sent,
-        }).execute()
-    except Exception as exc:
-        log.error("  ❌ whale_alerts insert failed: %s", exc)
-
-    try:
-        _supabase.table("wallet_flow_changes").insert({
-            "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
-            "wallet_address": change["address"],
-            "prev_balance": change.get("old_tokens"), "new_balance": change.get("new_tokens"),
-            "change_amount": token_delta if delta >= 0 else -token_delta,
-            "change_pct": round(delta, 6), "flow_type": flow_type, "detected_at": now,
-        }).execute()
-    except Exception as exc:
-        log.error("  ❌ wallet_flow_changes insert failed: %s", exc)
-
-
-def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any]:
-    default = {"age_days": None, "is_new_wallet": False}
-    if _supabase is None:
-        return default
-    try:
-        result = _supabase.table("wallet_metadata").select("first_seen").eq("address", address).execute()
-        now = datetime.now(timezone.utc)
-        if result.data:
-            first_seen = datetime.fromisoformat(result.data[0]["first_seen"].replace("Z", "+00:00"))
-            age_days   = (now - first_seen).days
-            return {"age_days": age_days, "is_new_wallet": age_days < 1}
-        else:
-            _supabase.table("wallet_metadata").insert({
-                "address": address, "symbol": symbol,
-                "first_seen": now.isoformat(), "first_seen_rank": rank,
-            }).execute()
-            return {"age_days": 0, "is_new_wallet": True}
-    except Exception as exc:
-        log.warning("wallet_metadata lookup failed for %s: %s", address[:8], exc)
-        return default
+        log.warning("resolve_owners_batch failed: %s", exc)
+        return {}
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────

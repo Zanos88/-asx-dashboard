@@ -27,6 +27,7 @@ from monitor import (
     fetch_holders,
     fetch_wallet_intel,
     fetch_wallet_winrate,
+    resolve_owners_batch,
     load_snapshot,
     get_amount,
 )
@@ -388,12 +389,19 @@ async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as exc:
             log.warning("fetch_holders failed for %s: %s", sym, exc)
 
-    all_wallets: list[str] = list({a for addrs in token_holder_map.values() for a in addrs})
-    if not all_wallets:
+    all_token_accounts: list[str] = list({a for addrs in token_holder_map.values() for a in addrs})
+    if not all_token_accounts:
         await update.message.reply_text("❌ No holders found.")
         return
 
-    # Win rate per wallet
+    # Resolve token account addresses → owner wallet addresses (one batch RPC call)
+    owners_map = await loop.run_in_executor(None, resolve_owners_batch, all_token_accounts)
+    all_wallets = list(set(owners_map.values()))
+    if not all_wallets:
+        await update.message.reply_text("❌ Could not resolve wallet owners.")
+        return
+
+    # Win rate per owner wallet
     results: list[tuple[str, dict]] = []
     for addr in all_wallets:
         wr = await loop.run_in_executor(None, fetch_wallet_winrate, addr)
@@ -411,7 +419,7 @@ async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
     lines = [
         "🏆 <b>Top Wallets by Win Rate</b>",
-        f"Tokens: {' '.join(mints)} | Wallets: {len(all_wallets)} scanned | {ts}",
+        f"Tokens: {' '.join(mints)} | {len(all_wallets)} owners scanned | {ts}",
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
     for i, (addr, wr) in enumerate(results[:10], 1):
