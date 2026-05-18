@@ -415,7 +415,7 @@ async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
     for i, (addr, wr) in enumerate(results[:10], 1):
-        short   = f"{addr[:8]}…{addr[-6:]}"
+        link    = f'<a href="https://solscan.io/account/{addr}">{addr}</a>'
         pct     = f"{wr['win_rate']*100:.0f}%"
         wl      = f"({wr['wins']}W/{wr['losses']}L)"
         usd     = f"  ~${wr['usd_total']:,.0f}" if wr.get("usd_total") else ""
@@ -429,7 +429,7 @@ async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for s, c in sorted(wr["changes"].items(), key=lambda kv: kv[1])
             if c < 0
         )
-        lines.append(f"\n#{i}  <code>{short}</code>  {pct} {wl}{usd}")
+        lines.append(f"\n#{i}  {link}  {pct} {wl}{usd}")
         if winners:
             lines.append(f"    📈 {winners}")
         if losers:
