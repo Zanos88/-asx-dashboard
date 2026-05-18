@@ -40,6 +40,13 @@ from monitor import (
     get_amount,
     send_alert,
 )
+from wallet_relationship_engine import (
+    get_wallet_clusters_for_token,
+    get_cluster_for_wallet,
+    get_relationships_for_token,
+    run_relationship_detection,
+    backfill_from_supabase,
+)
 from address_filters import classify_and_filter
 
 logging.basicConfig(
@@ -119,6 +126,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/run — Trigger a full monitor run immediately\n"
         "/testalert [SYMBOL] — Fire a synthetic alert to verify the pipeline\n"
         "/topwallets [TOKEN] — Rank top wallets by meme win rate\n"
+        "/clusters [SYMBOL] — Show detected wallet clusters &amp; bundles\n"
+        "/bundle &lt;WALLET&gt; — Check if wallet is in a bundle/cluster\n"
+        "/relationships [SYMBOL] — Full wallet relationship graph\n"
         "/classify &lt;ADDRESS&gt; — Check if an address is a wallet, LP pool, or program\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
         "/removetoken &lt;SYMBOL&gt; — Stop tracking a token\n"
@@ -486,6 +496,219 @@ async def cmd_classify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_clusters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all detected wallet clusters for a token."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    sym = (context.args[0].upper() if context.args else None) or next(iter(TOKENS), None)
+    cfg = _load_config()
+    tok = cfg.get("solana_tokens", {}).get(sym)
+    if not tok:
+        await update.message.reply_text(
+            f"Unknown token '{sym}'. Tracked: {', '.join(TOKENS) or 'none'}"
+        )
+        return
+
+    loop     = asyncio.get_running_loop()
+    clusters = await loop.run_in_executor(
+        None, get_wallet_clusters_for_token, tok["address"], _supabase
+    )
+
+    if not clusters:
+        await update.message.reply_text(
+            f"No clusters detected for {sym} yet.\n"
+            "Run /run to trigger detection, or wait for next cron cycle."
+        )
+        return
+
+    lines = [
+        f"🔍 <b>{sym} — Wallet Clusters</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    risk_icons = {"HIGH_RISK": "🔴", "MEDIUM": "🟡", "SMART_MONEY": "🟢"}
+
+    for i, cl in enumerate(clusters[:8], 1):
+        risk    = cl.get("risk_level", "UNKNOWN")
+        ctype   = cl.get("cluster_type", "?")
+        method  = cl.get("detection_method", "?")
+        pct     = cl.get("total_supply_pct") or 0
+        n       = cl.get("wallet_count") or len(cl.get("wallets", []))
+        icon    = risk_icons.get(risk, "⚪")
+        cid     = cl.get("cluster_id", "")[-8:]
+
+        lines.append(f"\n{icon} <b>Cluster #{i}</b> — {ctype} ({method})")
+        lines.append(f"   Wallets: {n} | Supply: {pct:.2f}% | Risk: {risk}")
+
+        if cl.get("funder_address"):
+            f = cl["funder_address"]
+            lines.append(f'   Funder: <a href="https://solscan.io/account/{f}">{f[:8]}…{f[-6:]}</a>')
+
+        for w in (cl.get("wallets") or [])[:3]:
+            short = f"{w[:8]}…{w[-6:]}"
+            lines.append(f'   📋 <a href="https://solscan.io/account/{w}">{short}</a>')
+        more = n - 3
+        if more > 0:
+            lines.append(f"   … +{more} more")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<i>{datetime.now(timezone.utc).strftime('%H:%M UTC')}</i>")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+async def cmd_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check if a specific wallet is in any bundle/cluster."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /bundle &lt;WALLET_ADDRESS&gt;", parse_mode="HTML"
+        )
+        return
+
+    wallet = context.args[0].strip()
+    if len(wallet) < 32 or len(wallet) > 44:
+        await update.message.reply_text("❌ Invalid Solana address.")
+        return
+
+    loop = asyncio.get_running_loop()
+    cl   = await loop.run_in_executor(None, get_cluster_for_wallet, wallet, _supabase)
+
+    short = f"{wallet[:8]}…{wallet[-6:]}"
+    link  = f'<a href="https://solscan.io/account/{wallet}">{short}</a>'
+
+    if not cl:
+        await update.message.reply_text(
+            f"🔍 Wallet: {link}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ No cluster membership detected.\n"
+            "This wallet has not been linked to any bundle or coordinated group.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    risk    = cl.get("risk_level", "?")
+    ctype   = cl.get("cluster_type", "?")
+    method  = cl.get("detection_method", "?")
+    pct     = cl.get("total_supply_pct") or 0
+    n       = cl.get("wallet_count") or 0
+    funder  = cl.get("funder_address")
+    cid     = cl.get("cluster_id", "")
+    members = cl.get("wallets", [])
+    risk_icon = {"HIGH_RISK": "🔴", "MEDIUM": "🟡", "SMART_MONEY": "🟢"}.get(risk, "⚪")
+
+    lines = [
+        f"🔍 Wallet: {link}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📦 {risk_icon} Cluster: {ctype} ({cid[-8:]})",
+        f"Method: {method} | Supply: {pct:.2f}% | {n} wallets",
+    ]
+    if funder:
+        lines.append(
+            f'🏦 Funder: <a href="https://solscan.io/account/{funder}">{funder[:8]}…{funder[-6:]}</a>'
+        )
+
+    peers = [w for w in members if w != wallet][:4]
+    if peers:
+        lines.append("🤝 Related wallets:")
+        for p in peers:
+            ps = f"{p[:8]}…{p[-6:]}"
+            lines.append(f'  <a href="https://solscan.io/account/{p}">{ps}</a>')
+
+    # Relationship count
+    if _supabase:
+        try:
+            r = _supabase.table("wallet_relationships").select("relationship_type").or_(
+                f"wallet_a.eq.{wallet},wallet_b.eq.{wallet}"
+            ).execute()
+            by_type: dict[str, int] = {}
+            for row in (r.data or []):
+                t = row["relationship_type"]
+                by_type[t] = by_type.get(t, 0) + 1
+            if by_type:
+                rel_str = " | ".join(f"{t}: {n}" for t, n in sorted(by_type.items()))
+                lines.append(f"📊 Relationships: {rel_str}")
+        except Exception:
+            pass
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    if risk == "HIGH_RISK":
+        lines.append("⚠️ HIGH RISK — likely insider/team wallet")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+async def cmd_relationships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the full relationship graph for a token."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    sym = (context.args[0].upper() if context.args else None) or next(iter(TOKENS), None)
+    cfg = _load_config()
+    tok = cfg.get("solana_tokens", {}).get(sym)
+    if not tok:
+        await update.message.reply_text(
+            f"Unknown token '{sym}'. Tracked: {', '.join(TOKENS) or 'none'}"
+        )
+        return
+
+    loop  = asyncio.get_running_loop()
+    rels  = await loop.run_in_executor(
+        None, get_relationships_for_token, tok["address"], _supabase
+    )
+
+    if not rels:
+        await update.message.reply_text(
+            f"No relationships detected for {sym} yet.\nRun /run to trigger detection."
+        )
+        return
+
+    # Group by pair
+    pair_map: dict[tuple[str, str], list[str]] = {}
+    for r in rels:
+        a, b = r["wallet_a"], r["wallet_b"]
+        if a == b:
+            continue
+        key = (min(a, b), max(a, b))
+        pair_map.setdefault(key, []).append(r["relationship_type"])
+
+    lines = [
+        f"🕸 <b>{sym} — Relationship Map</b>",
+        f"<i>{len(pair_map)} wallet pairs | {datetime.now(timezone.utc).strftime('%H:%M UTC')}</i>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    sorted_pairs = sorted(
+        pair_map.items(),
+        key=lambda kv: -sum(
+            {"JITO_BUNDLE": 4, "INTER_TRANSFER": 3, "COMMON_FUNDER": 2,
+             "TEMPORAL_CLUSTER": 1, "CROSS_TOKEN_HOLDER": 0}.get(t, 0)
+            for t in kv[1]
+        )
+    )
+
+    for (a, b), types in sorted_pairs[:20]:
+        as_ = f"{a[:6]}…{a[-4:]}"
+        bs_ = f"{b[:6]}…{b[-4:]}"
+        type_str = " | ".join(sorted(set(types), key=lambda t: -{"JITO_BUNDLE": 4, "INTER_TRANSFER": 3,
+            "COMMON_FUNDER": 2, "TEMPORAL_CLUSTER": 1, "CROSS_TOKEN_HOLDER": 0}.get(t, 0)))
+        lines.append(f"<code>{as_}</code> ↔ <code>{bs_}</code>  [{type_str}]")
+
+    if len(sorted_pairs) > 20:
+        lines.append(f"… +{len(sorted_pairs) - 20} more pairs")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         await _deny(update)
@@ -619,6 +842,9 @@ def main() -> None:
     app.add_handler(CommandHandler("run",           cmd_run))
     app.add_handler(CommandHandler("testalert",     cmd_testalert))
     app.add_handler(CommandHandler("topwallets",    cmd_topwallets))
+    app.add_handler(CommandHandler("clusters",      cmd_clusters))
+    app.add_handler(CommandHandler("bundle",        cmd_bundle))
+    app.add_handler(CommandHandler("relationships", cmd_relationships))
     app.add_handler(CommandHandler("classify",      cmd_classify))
     app.add_handler(CommandHandler("related",       cmd_related))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))

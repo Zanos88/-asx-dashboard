@@ -30,6 +30,11 @@ from address_filters import (  # noqa: E402
     classify_address,
     KNOWN_EXCLUDED_ADDRESSES,
 )
+from wallet_relationship_engine import (  # noqa: E402
+    run_relationship_detection,
+    get_cluster_for_wallet,
+    get_wallet_clusters_for_token,
+)
 from supabase import Client, create_client
 from tenacity import (
     before_sleep_log,
@@ -268,27 +273,36 @@ def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any
 
 
 def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) -> None:
+    """Persist CROSS_TOKEN_HOLDER relationships to the new wallet_relationships schema."""
     if _supabase is None:
         return
     multi = {addr: h for addr, h in cross_holdings.items() if len(h) >= 2}
     if not multi:
         return
+    import json as _json
     rows = []
     for addr, holdings in multi.items():
         sym_list = sorted(holdings.keys())
-        for i in range(len(sym_list)):
-            for j in range(i + 1, len(sym_list)):
-                rows.append({
-                    "wallet_address": addr,
-                    "coin_a": sym_list[i], "coin_a_pct": round(holdings[sym_list[i]], 4),
-                    "coin_b": sym_list[j], "coin_b_pct": round(holdings[sym_list[j]], 4),
-                })
+        rows.append({
+            "wallet_a":          addr,
+            "wallet_b":          addr,
+            "relationship_type": "CROSS_TOKEN_HOLDER",
+            "token_address":     None,
+            "evidence":          _json.dumps({
+                "tokens":   sym_list,
+                "holdings": {s: round(holdings[s], 4) for s in sym_list},
+            }),
+            "confidence_score": 70,
+        })
     if rows:
         try:
-            _supabase.table("wallet_relationships").insert(rows).execute()
-            log.info("✅ %d wallet relationship row(s) written", len(rows))
+            _supabase.table("wallet_relationships").upsert(
+                rows,
+                on_conflict="wallet_a,wallet_b,relationship_type,token_address",
+            ).execute()
+            log.info("✅ %d cross-token relationship(s) written", len(rows))
         except Exception as exc:
-            log.error("❌ wallet_relationships insert failed: %s", exc)
+            log.error("❌ wallet_relationships upsert failed: %s", exc)
 
 
 def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
@@ -807,12 +821,41 @@ def send_cross_coin_digest(
         log.error("Cross-coin digest failed: %s", err)
 
 
+def _notify_new_cluster(symbol: str, token_address: str, cluster: dict[str, Any]) -> None:
+    """Send a Telegram alert when a new HIGH_RISK cluster is first detected."""
+    try:
+        wallets = cluster.get("wallets", [])
+        method  = cluster.get("detection_method", "UNKNOWN")
+        pct     = cluster.get("total_supply_pct", 0)
+        n       = cluster.get("wallet_count", len(wallets))
+        risk    = cluster.get("risk_level", "UNKNOWN")
+        ctype   = cluster.get("cluster_type", "UNKNOWN")
+        icon    = "🔴" if risk == "HIGH_RISK" else "🟡"
+        msg = (
+            f"{icon} <b>NEW WALLET CLUSTER — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Type: {ctype} | Method: {method} | Risk: {risk}\n"
+            f"{n} wallets controlling {pct:.2f}% supply\n"
+        )
+        if cluster.get("funder_address"):
+            f = cluster["funder_address"]
+            msg += f'Funder: <a href="https://solscan.io/account/{f}">{f[:8]}…{f[-6:]}</a>\n'
+        for w in wallets[:3]:
+            msg += f'  📋 <code>{w}</code>\n'
+        if len(wallets) > 3:
+            msg += f"  … and {len(wallets) - 3} more\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━"
+        send_alert(msg)
+    except Exception as exc:
+        log.warning("_notify_new_cluster failed: %s", exc)
+
+
 def detect_coordinated_moves(
     all_run_changes: dict[str, list[dict[str, Any]]],
     all_addresses: dict[str, str],
     all_price_ctx: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    """Detect 2+ wallets moving same direction; AI interpretation for 3+ (FIX 5)."""
+    """Detect 2+ wallets moving same direction; enrich with cluster info if available."""
     for symbol, changes in all_run_changes.items():
         buyers  = [c for c in changes if c["type"] == "MOVE" and c["delta"] > 0]
         sellers = [c for c in changes if c["type"] == "MOVE" and c["delta"] < 0]
@@ -829,34 +872,93 @@ def detect_coordinated_moves(
             price_ctx     = (all_price_ctx or {}).get(symbol, {})
             price_1h      = price_ctx.get("change_1h")
 
+            # Cluster enrichment: check if moving wallets share a cluster
+            cluster_map: dict[str, dict] = {}
+            if _supabase:
+                for c in group:
+                    try:
+                        cl = get_cluster_for_wallet(c["address"], _supabase)
+                        if cl:
+                            cluster_map[c["address"]] = cl
+                    except Exception:
+                        pass
+
+            # Find dominant cluster (most wallets in group)
+            cluster_counts: dict[str, int] = {}
+            for cl in cluster_map.values():
+                cid = cl.get("cluster_id", "")
+                if cid:
+                    cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
+            dominant_cid = max(cluster_counts, key=lambda k: cluster_counts[k]) if cluster_counts else None
+            dominant_cl  = next(
+                (cl for cl in cluster_map.values() if cl.get("cluster_id") == dominant_cid),
+                None,
+            ) if dominant_cid else None
+
             icon  = "🟢" if "BUYING" in direction_label else "🔴"
             lines = [
                 f"⚡ <b>COORDINATED MOVE — {symbol}</b>",
                 "━━━━━━━━━━━━━━━━━━━━━━",
-                f"{icon} {len(group)} wallets {direction_label} simultaneously",
             ]
+
+            # Cluster banner if detected
+            if dominant_cl:
+                risk    = dominant_cl.get("risk_level", "")
+                method  = dominant_cl.get("detection_method", "")
+                ctype   = dominant_cl.get("cluster_type", "")
+                pct     = dominant_cl.get("total_supply_pct", 0)
+                n_in_cl = dominant_cl.get("wallet_count", 0)
+                risk_icon = "🔴" if risk == "HIGH_RISK" else "🟡" if risk == "MEDIUM" else "🟢"
+                lines += [
+                    f"{risk_icon} <b>BUNDLED WALLETS DETECTED</b>",
+                    f"Cluster {dominant_cid} | Method: {method} | Risk: {risk}",
+                    f"Combined supply: {pct:.2f}% | Wallets: {n_in_cl}",
+                    "",
+                ]
+
+            lines.append(f"{icon} {len(group)} wallets {direction_label} simultaneously")
             for c in sorted(group, key=lambda x: -abs(x["delta"]))[:5]:
-                rank  = c.get("new_rank") or c.get("old_rank") or "?"
-                addr  = c["address"]
-                short = f"{addr[:8]}...{addr[-6:]}"
-                lines.append(f"  #{rank} <code>{short}</code>  {c['delta']:+.3f}%")
-                lines.append(f"       📋 <code>{addr}</code>")  # FIX 1 — full address
+                rank   = c.get("new_rank") or c.get("old_rank") or "?"
+                addr   = c["address"]
+                short  = f"{addr[:8]}...{addr[-6:]}"
+                cl_tag = ""
+                if addr in cluster_map:
+                    cid_short = cluster_map[addr].get("cluster_id", "")[-4:]
+                    cl_tag = f"  [CLUSTER #{cid_short}]"
+                lines.append(f"  #{rank} <code>{short}</code>  {c['delta']:+.3f}%{cl_tag}")
+                lines.append(f"       📋 <code>{addr}</code>")
+
+            if dominant_cl and dominant_cl.get("wallets"):
+                inter_count = 0
+                if _supabase:
+                    try:
+                        r = _supabase.table("wallet_relationships").select("id", count="exact").eq(
+                            "token_address", token_address
+                        ).eq("relationship_type", "INTER_TRANSFER").execute()
+                        inter_count = r.count or 0
+                    except Exception:
+                        pass
+                if inter_count:
+                    lines.append(f"🔗 {symbol} inter-transfers: {inter_count} detected")
 
             lines += [
                 f"🏆 Net: {total_delta:.3f}% supply moved",
                 f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
             ]
 
-            # FIX 5 — AI for 3+ wallets
             if len(group) >= 3:
                 ai = get_coordinated_move_ai(symbol, dir_key, len(group), total_delta, price_1h)
                 if ai:
                     lines.append(f"🤖 <i>{ai}</i>")
 
+            if dominant_cl and dominant_cl.get("risk_level") == "HIGH_RISK":
+                lines.append("⚠️ <b>HIGH RISK: Insider/team wallet cluster</b>")
+
             lines.append("━━━━━━━━━━━━━━━━━━━━━━")
             if token_address:
                 lines.append(
                     f'🔗 <a href="https://dexscreener.com/solana/{token_address}">DexScreener</a>'
+                    f' | <a href="https://app.bubblemaps.io/sol/token/{token_address}">Bubblemaps</a>'
                 )
 
             ok, err = send_alert("\n".join(lines))
@@ -877,6 +979,7 @@ def format_quant_alert(
     ai_interp: str,
     cross_coin: dict[str, float] | None = None,
     wallet_intel: dict[str, Any] | None = None,
+    cluster_info: dict[str, Any] | None = None,
 ) -> str:
     addr         = change["address"]
     short_addr   = f"{addr[:8]}...{addr[-6:]}"
@@ -978,6 +1081,18 @@ def format_quant_alert(
     if cross_coin:
         cross_parts = [f"{sym}: {pct:.2f}%" for sym, pct in sorted(cross_coin.items(), key=lambda kv: -kv[1])]
         lines.append(f"🔗 Cross-coin: also holds {', '.join(cross_parts)}")
+
+    # Cluster intel
+    if cluster_info:
+        risk    = cluster_info.get("risk_level", "")
+        method  = cluster_info.get("detection_method", "")
+        ctype   = cluster_info.get("cluster_type", "")
+        cpct    = cluster_info.get("total_supply_pct", 0)
+        cn      = cluster_info.get("wallet_count", 0)
+        risk_icon = "🔴" if risk == "HIGH_RISK" else "🟡" if risk == "MEDIUM" else "🟢"
+        lines.append(f"{risk_icon} Cluster: {ctype} | {method} | {cn} wallets | {cpct:.2f}% supply")
+        if risk == "HIGH_RISK":
+            lines.append("⚠️ HIGH RISK: Insider/team wallet cluster")
 
     # FIX 3 — wallet intel
     if wallet_intel:
@@ -1285,6 +1400,29 @@ def run_holder_monitor() -> None:
     cross_holdings = build_cross_holdings(all_current)
     persist_wallet_relationships(cross_holdings)
 
+    # Run relationship detection + cluster building for each tracked token
+    _all_clusters: dict[str, list[dict[str, Any]]] = {}
+    for symbol, current in all_current.items():
+        token_address = all_addresses[symbol]
+        wallets = [h["address"] for h in current if h.get("address")]
+        try:
+            clusters = run_relationship_detection(
+                token_address=token_address,
+                token_symbol=symbol,
+                wallets=wallets,
+                current_holders=current,
+                cross_holdings=cross_holdings,
+                supabase=_supabase,
+                helius_key=HELIUS_API_KEY,
+            )
+            _all_clusters[symbol] = clusters
+            # Notify on new HIGH_RISK cluster discoveries
+            for cl in clusters:
+                if cl.get("risk_level") == "HIGH_RISK":
+                    _notify_new_cluster(symbol, token_address, cl)
+        except Exception as exc:
+            log.warning("Relationship detection failed for %s: %s", symbol, exc)
+
     # Pass 2: diff and alert per token
     all_run_changes: dict[str, list[dict[str, Any]]] = {}
 
@@ -1333,11 +1471,19 @@ def run_holder_monitor() -> None:
                     except Exception as exc:
                         log.warning("  Wallet intel skipped for %s: %s", addr[:8], exc)
 
+                # Cluster info for this wallet
+                cluster_info: dict[str, Any] | None = None
+                try:
+                    cluster_info = get_cluster_for_wallet(addr, _supabase)
+                except Exception:
+                    pass
+
                 msg = format_quant_alert(
                     symbol, token_address, change, price_ctx,
                     wallet_info, ai_interp,
                     cross_coin=wallet_cross or None,
                     wallet_intel=wallet_intel,
+                    cluster_info=cluster_info,
                 )
                 kb = make_inline_keyboard(addr, token_address)
 
