@@ -582,6 +582,30 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
     return result
 
 
+def fetch_wallet_winrate(wallet_addr: str) -> dict[str, Any]:
+    """Win rate across MAJOR_TOKEN_MINTS holdings based on 24h price change."""
+    intel = fetch_wallet_intel(wallet_addr, "__none__")
+    wins, losses, changes = 0, 0, {}
+    for sym, data in intel.get("major_tokens", {}).items():
+        mint = MAJOR_TOKEN_MINTS.get(sym)
+        if not mint:
+            continue
+        change = fetch_price_context(mint).get("change_24h", 0.0)
+        changes[sym] = change
+        if change > 0:
+            wins += 1
+        elif change < 0:
+            losses += 1
+    total = wins + losses
+    return {
+        "wins":      wins,
+        "losses":    losses,
+        "win_rate":  wins / total if total > 0 else 0.0,
+        "changes":   changes,
+        "usd_total": intel.get("total_usd_est"),
+    }
+
+
 # ── AI interpretation ─────────────────────────────────────────────────────────
 
 def get_ai_interpretation(symbol: str, severity: str, change_type: str, delta: float, rank: int) -> str:

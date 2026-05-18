@@ -26,6 +26,7 @@ from monitor import (
     _load_config,
     fetch_holders,
     fetch_wallet_intel,
+    fetch_wallet_winrate,
     load_snapshot,
     get_amount,
 )
@@ -44,6 +45,7 @@ _AUTHORIZED_CHATS: frozenset[int] = frozenset(
     | _parse_chat_ids(os.environ.get("TELEGRAM_EXTRA_CHAT_IDS", ""))
 )
 _REPO_DIR = os.path.dirname(os.path.abspath(_CONFIG_PATH))
+_monitor_proc: subprocess.Popen | None = None
 
 
 # ── Auth + config helpers ─────────────────────────────────────────────────────
@@ -103,6 +105,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/snapshot — Latest saved snapshot for all tokens\n"
         "/holders &lt;SYMBOL&gt; — Fetch live top-10 holders\n"
         "/related — External token holdings for top wallets\n"
+        "/run — Trigger a full monitor run immediately\n"
+        "/topwallets [TOKEN] — Rank top wallets by meme win rate\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
         "/removetoken &lt;SYMBOL&gt; — Stop tracking a token\n"
         "/threshold &lt;PCT&gt; — Set move alert threshold (e.g. 0.01)\n"
@@ -336,6 +340,113 @@ async def cmd_related(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+    global _monitor_proc
+    if _monitor_proc and _monitor_proc.poll() is None:
+        await update.message.reply_text("⏳ A run is already in progress — please wait.")
+        return
+    monitor_path = os.path.join(_REPO_DIR, "monitor.py")
+    _monitor_proc = subprocess.Popen(
+        ["python", monitor_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    await update.message.reply_text(
+        "⏳ Manual monitor run started.\n"
+        "Alerts will appear in the group within ~60s."
+    )
+
+
+async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
+
+    arg = context.args[0].upper() if context.args else None
+    if arg and arg not in MAJOR_TOKEN_MINTS:
+        await update.message.reply_text(
+            f"Unknown token '{arg}'. Options: {', '.join(MAJOR_TOKEN_MINTS)}",
+        )
+        return
+    mints = {arg: MAJOR_TOKEN_MINTS[arg]} if arg else dict(MAJOR_TOKEN_MINTS)
+
+    await update.message.reply_text("⏳ Scanning top wallets… (may take 20–40s)")
+
+    loop = asyncio.get_running_loop()
+
+    # Collect unique wallet addresses across selected tokens
+    token_holder_map: dict[str, list[str]] = {}
+    for sym, mint in mints.items():
+        try:
+            holders = await loop.run_in_executor(None, fetch_holders, mint)
+            token_holder_map[sym] = [
+                h.get("address", "") for h in holders[:20] if h.get("address")
+            ]
+        except Exception as exc:
+            log.warning("fetch_holders failed for %s: %s", sym, exc)
+
+    all_wallets: list[str] = list({a for addrs in token_holder_map.values() for a in addrs})
+    if not all_wallets:
+        await update.message.reply_text("❌ No holders found.")
+        return
+
+    # Win rate per wallet
+    results: list[tuple[str, dict]] = []
+    for addr in all_wallets:
+        wr = await loop.run_in_executor(None, fetch_wallet_winrate, addr)
+        if wr["wins"] + wr["losses"] > 0:
+            results.append((addr, wr))
+    results.sort(key=lambda x: -x[1]["win_rate"])
+
+    # Most held tokens across wallets
+    token_pop: dict[str, int] = {}
+    for _, wr in results:
+        for sym in wr["changes"]:
+            token_pop[sym] = token_pop.get(sym, 0) + 1
+    top_tokens = sorted(token_pop, key=lambda s: -token_pop[s])
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [
+        "🏆 <b>Top Wallets by Win Rate</b>",
+        f"Tokens: {' '.join(mints)} | Wallets: {len(all_wallets)} scanned | {ts}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for i, (addr, wr) in enumerate(results[:10], 1):
+        short   = f"{addr[:8]}…{addr[-6:]}"
+        pct     = f"{wr['win_rate']*100:.0f}%"
+        wl      = f"({wr['wins']}W/{wr['losses']}L)"
+        usd     = f"  ~${wr['usd_total']:,.0f}" if wr.get("usd_total") else ""
+        winners = " | ".join(
+            f"{s} <b>+{c:.1f}%</b>"
+            for s, c in sorted(wr["changes"].items(), key=lambda kv: -kv[1])
+            if c > 0
+        )
+        losers  = " | ".join(
+            f"{s} {c:.1f}%"
+            for s, c in sorted(wr["changes"].items(), key=lambda kv: kv[1])
+            if c < 0
+        )
+        lines.append(f"\n#{i}  <code>{short}</code>  {pct} {wl}{usd}")
+        if winners:
+            lines.append(f"    📈 {winners}")
+        if losers:
+            lines.append(f"    📉 {losers}")
+
+    if top_tokens:
+        pop_str = " | ".join(f"{s} ({token_pop[s]})" for s in top_tokens[:5])
+        lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🔥 Most held: {pop_str}")
+
+    msg = "\n".join(lines)
+    # Telegram message limit is 4096 chars
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -352,6 +463,8 @@ def main() -> None:
     app.add_handler(CommandHandler("removetoken",   cmd_removetoken))
     app.add_handler(CommandHandler("threshold",     cmd_threshold))
     app.add_handler(CommandHandler("movethreshold", cmd_threshold))
+    app.add_handler(CommandHandler("run",           cmd_run))
+    app.add_handler(CommandHandler("topwallets",    cmd_topwallets))
     app.add_handler(CommandHandler("related",       cmd_related))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
