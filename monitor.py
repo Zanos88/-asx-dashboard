@@ -244,8 +244,8 @@ def write_alert_to_supabase(
         return
     now          = datetime.now(timezone.utc).isoformat()
     # Signed token delta: positive = accumulate, negative = distribute
-    new_tokens   = change.get("new_tokens", 0) or 0
-    old_tokens   = change.get("old_tokens", 0) or 0
+    new_tokens   = change.get("new_tokens") or 0.0
+    old_tokens   = change.get("old_tokens") or 0.0
     token_delta  = new_tokens - old_tokens
     delta        = change.get("delta", 0)
     flow_type    = (
@@ -254,10 +254,27 @@ def write_alert_to_supabase(
         else "buy"  if delta > 0
         else "sell"
     )
-    price_usd     = (price_ctx or {}).get("price") or None
+    # price_usd: use None only when price_ctx absent/empty, not when price is 0.0
+    price_usd     = (price_ctx or {}).get("price") if price_ctx else None
     wallet_age_d  = (wallet_info or {}).get("age_days") if wallet_info else None
-    cluster_id_v  = (cluster_info or {}).get("cluster_id") if cluster_info else None
     tok_delta_usd = round(token_delta * price_usd, 4) if (price_usd and token_delta) else None
+
+    # cluster_id: validate provided cluster belongs to this token, else query by token
+    cluster_id_v = None
+    if cluster_info:
+        cid = cluster_info.get("cluster_id")
+        # cluster_id is prefixed with token_symbol (e.g. "ALON_abc12345")
+        if cid and cid.startswith(symbol + "_"):
+            cluster_id_v = cid
+    if cluster_id_v is None and _supabase:
+        try:
+            r = _supabase.table("wallet_clusters").select("cluster_id").eq(
+                "wallet_address", change["address"]
+            ).eq("token_symbol", symbol).order("updated_at", desc=True).limit(1).execute()
+            if r.data:
+                cluster_id_v = r.data[0].get("cluster_id")
+        except Exception:
+            pass
     try:
         _supabase.table("whale_alerts").insert({
             "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
@@ -712,9 +729,10 @@ def get_cluster_ai_insight(
     risk: str,
     direction: str = "holding",
     price_change_1h: float | None = None,
+    net_delta: float = 0.0,
 ) -> str:
-    """Neutral Claude one-liner for a newly detected bundle cluster. Cached 30 min."""
-    cache_key = f"cluster:{token}:{n_wallets}:{pct:.1f}:{method}:{direction}"
+    """Directional Claude one-liner for a newly detected bundle cluster. Cached 30 min."""
+    cache_key = f"cluster:{token}:{n_wallets}:{pct:.1f}:{method}:{direction}:{net_delta:+.3f}"
     cached = _cluster_ai_cache.get(cache_key)
     if cached and (time.time() - cached[1]) < 1800:
         return cached[0]
@@ -723,18 +741,23 @@ def get_cluster_ai_insight(
     try:
         import anthropic as _anthropic
         client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        price_line = (
-            f"Price is {price_change_1h:+.1f}% in the last hour. "
-            if price_change_1h is not None else ""
-        )
+        price_1h_line = f"- Price 1h: {price_change_1h:+.1f}%\n" if price_change_1h is not None else "- Price 1h: unknown\n"
         prompt = (
-            f"You are a neutral on-chain data analyst. "
-            f"Observe ONLY — do not make recommendations or trading advice.\n\n"
-            f"Data: {n_wallets} of the top-20 holders of ${token} are {direction} simultaneously. "
-            f"They control {pct:.1f}% of real wallet supply (LP pools excluded). "
-            f"{price_line}Detection method: {method}\n\n"
-            f"In ONE sentence, state what this pattern objectively indicates about holder behaviour. "
-            f"No recommendations. Facts only."
+            f"You are a crypto trading analyst specialising in Solana meme coins "
+            f"and on-chain flow analysis.\n\n"
+            f"Data:\n"
+            f"- Token: ${token}\n"
+            f"- {n_wallets} bundled/coordinated wallets (control {pct:.1f}% supply)\n"
+            f"- Direction: {direction} ({net_delta:+.3f}% net supply change)\n"
+            f"{price_1h_line}"
+            f"- Detection: {method}\n"
+            f"- Risk: {risk}\n\n"
+            f"In ONE sentence give a directional assessment. "
+            f"If accumulating + price stable/up = bullish signal. "
+            f"If distributing + price dropping = bearish/exit signal. "
+            f"If accumulating + price dropping = potential buy zone or dump incoming. "
+            f"If HIGH_RISK bundled wallets accumulating = caution, possible manipulation. "
+            f"State the likely implication for other holders. Be direct and specific."
         )
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1022,6 +1045,7 @@ def _notify_new_cluster(
     current_holders: list[dict[str, Any]] | None = None,
     total_supply_tokens: float = 0.0,
     price_ctx: dict[str, Any] | None = None,
+    wallet_deltas: dict[str, float] | None = None,
 ) -> None:
     """Send a Telegram alert when a new HIGH_RISK or MEDIUM cluster is first detected."""
     try:
@@ -1048,9 +1072,9 @@ def _notify_new_cluster(
             if millions >= 1 and abs(millions - round(millions)) < 0.001:
                 round_set.add(addr)
 
-        # Recent deltas for net direction line
-        recent_deltas  = _fetch_recent_wallet_deltas(wallets[:8], symbol)
-        net_delta      = sum(recent_deltas.values()) if recent_deltas else 0.0
+        # In-memory deltas from current run's snapshot comparison (no DB query)
+        deltas    = wallet_deltas or {}
+        net_delta = sum(deltas.get(w, 0.0) for w in wallets[:8])
         if net_delta > 0.0005:
             net_str   = f"📈 Net: +{net_delta:.3f}% ACCUMULATING"
             direction = "accumulating"
@@ -1107,7 +1131,7 @@ def _notify_new_cluster(
             msg += f'\nFunder: <a href="https://solscan.io/account/{f_}">{f_[:8]}…{f_[-6:]}</a>\n'
 
         price_change_1h = (price_ctx or {}).get("change_1h")
-        ai_insight = get_cluster_ai_insight(symbol, n, pct, method, risk, direction, price_change_1h)
+        ai_insight = get_cluster_ai_insight(symbol, n, pct, method, risk, direction, price_change_1h, net_delta)
         if ai_insight:
             msg += f"\n🤖 <i>{ai_insight}</i>\n"
 
@@ -1730,6 +1754,21 @@ def run_holder_monitor() -> None:
     cross_holdings = build_cross_holdings(all_current)
     persist_wallet_relationships(cross_holdings)
 
+    # Build in-memory wallet deltas for cluster alert enrichment (before Pass 2)
+    # compare_holders is run here so _notify_new_cluster() can use current-run deltas
+    # without a DB query (all_run_changes is populated in Pass 2, after cluster alerts)
+    all_preview_deltas: dict[str, dict[str, float]] = {}
+    for _sym, _current in all_current.items():
+        _snapshot = load_snapshot(_sym) or _supabase_fallbacks.get(_sym)
+        if _snapshot:
+            try:
+                _preview = compare_holders(_snapshot["holders"], _current)
+                all_preview_deltas[_sym] = {c["address"]: c.get("delta", 0.0) for c in _preview}
+            except Exception:
+                all_preview_deltas[_sym] = {}
+        else:
+            all_preview_deltas[_sym] = {}
+
     # Run relationship detection + cluster building for each tracked token
     _all_clusters: dict[str, list[dict[str, Any]]] = {}
     for symbol, current in all_current.items():
@@ -1756,6 +1795,7 @@ def run_holder_monitor() -> None:
                         symbol, token_address, cl, current,
                         total_supply_tokens=all_supplies.get(symbol, 0.0),
                         price_ctx=all_price_ctx.get(symbol),
+                        wallet_deltas=all_preview_deltas.get(symbol, {}),
                     )
                     _mark_cluster_alerted(cid)
         except Exception as exc:
