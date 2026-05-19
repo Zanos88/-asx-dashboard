@@ -856,6 +856,34 @@ def _notify_new_cluster(symbol: str, token_address: str, cluster: dict[str, Any]
         log.warning("_notify_new_cluster failed: %s", exc)
 
 
+def _is_cluster_already_alerted(cluster_id: str) -> bool:
+    """Return True if we already sent a Telegram alert for this cluster in the last 24 h."""
+    if not _supabase or not cluster_id:
+        return False
+    key = f"cluster_alert:{cluster_id}"
+    try:
+        r = _supabase.table("bot_config").select("value,updated_at").eq("key", key).execute()
+        if not r.data:
+            return False
+        updated = (r.data[0].get("updated_at") or "").replace("Z", "+00:00")
+        last = datetime.fromisoformat(updated)
+        return (datetime.now(timezone.utc) - last).total_seconds() < 86400
+    except Exception:
+        return False
+
+
+def _mark_cluster_alerted(cluster_id: str) -> None:
+    """Record that a cluster alert was sent so we don't repeat it for 24 h."""
+    if not _supabase or not cluster_id:
+        return
+    key = f"cluster_alert:{cluster_id}"
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        _supabase.table("bot_config").upsert({"key": key, "value": now}, on_conflict="key").execute()
+    except Exception as exc:
+        log.debug("_mark_cluster_alerted failed: %s", exc)
+
+
 def detect_coordinated_moves(
     all_run_changes: dict[str, list[dict[str, Any]]],
     all_addresses: dict[str, str],
@@ -1077,7 +1105,8 @@ def format_quant_alert(
         # FIX 1 — shortened link + full copyable address below
         f'🏦 Wallet: <a href="{solscan_url}"><code>{short_addr}</code></a>  |  Age: {age_str}',
         f"📋 <code>{addr}</code>",
-        f'📜 Contract: <a href="{contract_url}">{token_address[:8]}...{token_address[-4:]}</a>',
+        f'📜 Contract: <a href="{contract_url}">{token_address[:8]}…{token_address[-4:]}</a>',
+        f"📋 <code>{token_address}</code>",
         f"📈 Supply: {supply_str}",
         f"💰 Tokens: {tokens_str}",
         f"💵 Price: {price_line}",
@@ -1422,10 +1451,13 @@ def run_holder_monitor() -> None:
                 helius_key=HELIUS_API_KEY,
             )
             _all_clusters[symbol] = clusters
-            # Notify on new HIGH_RISK cluster discoveries
+            # Notify once per cluster (HIGH_RISK or MEDIUM), deduped by 24h window
             for cl in clusters:
-                if cl.get("risk_level") == "HIGH_RISK":
+                risk = cl.get("risk_level", "")
+                cid  = cl.get("cluster_id", "")
+                if risk in ("HIGH_RISK", "MEDIUM") and not _is_cluster_already_alerted(cid):
                     _notify_new_cluster(symbol, token_address, cl)
+                    _mark_cluster_alerted(cid)
         except Exception as exc:
             log.warning("Relationship detection failed for %s: %s", symbol, exc)
 

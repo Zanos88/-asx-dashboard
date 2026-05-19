@@ -738,7 +738,10 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
                 f"🐳 <b>WHALE {direction} — {symbol}</b>\n"
                 f"💰 {fmt_usd(usd_val)}\n"
                 f"📊 {amount:,.0f} tokens\n"
-                f"🔀 {shorten_addr(from_addr)} → {shorten_addr(to_addr)}\n"
+                f"📤 From: {shorten_addr(from_addr)}\n"
+                f"📋 <code>{from_addr or '—'}</code>\n"
+                f"📥 To:   {shorten_addr(to_addr)}\n"
+                f"📋 <code>{to_addr or '—'}</code>\n"
                 f"🕐 {time_str}  |  {tx_type}\n"
                 f"🔗 <code>{sig}...</code>"
             )

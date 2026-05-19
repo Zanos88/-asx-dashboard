@@ -151,8 +151,7 @@ def classify_and_filter(
     for h in raw_holders:
         ta = h["address"]
         owner = owner_map.get(ta, ta)  # fall back to token account itself
-        pct = float(h.get("uiAmountString") or h.get("amount") or 0) / total_supply_est * 100
-        if pct >= 5.0 and not is_lp_or_system(owner):
+        if not is_lp_or_system(owner):
             check_candidates.append(owner)
 
     exec_flags: dict[str, bool] = {}
