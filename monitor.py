@@ -736,6 +736,8 @@ def get_cluster_ai_insight(
     cached = _cluster_ai_cache.get(cache_key)
     if cached and (time.time() - cached[1]) < 1800:
         return cached[0]
+    if abs(net_delta) < 0.001:
+        return "🔍 No net supply change detected this interval."
     if not ANTHROPIC_API_KEY:
         return ""
     try:
@@ -743,21 +745,18 @@ def get_cluster_ai_insight(
         client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         price_1h_line = f"- Price 1h: {price_change_1h:+.1f}%\n" if price_change_1h is not None else "- Price 1h: unknown\n"
         prompt = (
-            f"You are a crypto trading analyst specialising in Solana meme coins "
-            f"and on-chain flow analysis.\n\n"
-            f"Data:\n"
-            f"- Token: ${token}\n"
-            f"- {n_wallets} bundled/coordinated wallets (control {pct:.1f}% supply)\n"
-            f"- Direction: {direction} ({net_delta:+.3f}% net supply change)\n"
+            f"Crypto on-chain analyst. One sentence only.\n\n"
+            f"${token} bundled wallet cluster ({n_wallets} wallets, "
+            f"{pct:.1f}% real supply, {risk}):\n"
+            f"Net {direction}: {abs(net_delta):.3f}% supply shift.\n"
             f"{price_1h_line}"
-            f"- Detection: {method}\n"
-            f"- Risk: {risk}\n\n"
-            f"In ONE sentence give a directional assessment. "
-            f"If accumulating + price stable/up = bullish signal. "
-            f"If distributing + price dropping = bearish/exit signal. "
-            f"If accumulating + price dropping = potential buy zone or dump incoming. "
-            f"If HIGH_RISK bundled wallets accumulating = caution, possible manipulation. "
-            f"State the likely implication for other holders. Be direct and specific."
+            f"Detection: {method}\n\n"
+            f"Give ONE directional sentence:\n"
+            f"- Accumulating + price up/stable = bullish\n"
+            f"- Accumulating + price down = possible buy zone OR distribution disguised as accumulation\n"
+            f"- Distributing + price dropping = bearish exit signal\n"
+            f"- Distributing + price stable = quiet exit, caution\n"
+            f"Be specific to this data. No generic statements."
         )
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1105,7 +1104,7 @@ def _notify_new_cluster(
                 wpct     = supply_map.get(w, 0.0)
                 raw      = wpct / 100 * denom
                 rnd_flag = " ⚠️ round" if w in round_set else ""
-                d        = recent_deltas.get(w)
+                d        = deltas.get(w)
                 if d is not None and abs(d) >= 0.001:
                     delta_str = f" (+{d:.3f}% 🟢)" if d > 0 else f" ({d:.3f}% 🔴)"
                 else:
@@ -1533,6 +1532,7 @@ def send_daily_digest() -> None:
             .execute()
         )
         rows = result.data or []
+        rows = [r for r in rows if r.get("wallet_address") not in KNOWN_EXCLUDED_ADDRESSES]
     except Exception as exc:
         log.error("Daily digest query failed: %s", exc)
         return
