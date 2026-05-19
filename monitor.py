@@ -872,31 +872,87 @@ def send_cross_coin_digest(
         log.error("Cross-coin digest failed: %s", err)
 
 
-def _notify_new_cluster(symbol: str, token_address: str, cluster: dict[str, Any]) -> None:
-    """Send a Telegram alert when a new HIGH_RISK cluster is first detected."""
+def _notify_new_cluster(
+    symbol: str,
+    token_address: str,
+    cluster: dict[str, Any],
+    current_holders: list[dict[str, Any]] | None = None,
+) -> None:
+    """Send a Telegram alert when a new HIGH_RISK or MEDIUM cluster is first detected."""
     try:
         wallets = cluster.get("wallets", [])
         method  = cluster.get("detection_method", "UNKNOWN")
         pct     = cluster.get("total_supply_pct", 0)
         n       = cluster.get("wallet_count", len(wallets))
         risk    = cluster.get("risk_level", "UNKNOWN")
-        ctype   = cluster.get("cluster_type", "UNKNOWN")
         icon    = "🔴" if risk == "HIGH_RISK" else "🟡"
+
+        # Build per-wallet supply map from current_holders for individual %
+        total_supply = sum(
+            float(h.get("uiAmountString") or h.get("amount") or 0)
+            for h in (current_holders or [])
+        ) or 1.0
+        supply_map: dict[str, float] = {}
+        round_set: set[str] = set()
+        for h in (current_holders or []):
+            addr    = h.get("address", "")
+            amt     = float(h.get("uiAmountString") or h.get("amount") or 0)
+            supply_map[addr] = amt / total_supply * 100
+            # Flag round-million balances
+            millions = amt / 1_000_000
+            if millions >= 1 and abs(millions - round(millions)) < 0.001:
+                round_set.add(addr)
+
+        conf = cluster.get("confidence_score",
+                           {"HIGH_RISK": 92, "MEDIUM": 75}.get(risk, 70))
+
         msg = (
-            f"{icon} <b>NEW WALLET CLUSTER — {symbol}</b>\n"
+            f"🚨 <b>BUNDLED WALLETS — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Type: {ctype} | Method: {method} | Risk: {risk}\n"
-            f"{n} wallets controlling {pct:.2f}% supply\n"
+            f"Method: {method} | Risk: {icon} {risk} | Confidence: {conf}%\n"
+            f"Real wallet supply: {pct:.2f}% (LP excluded ✅)\n\n"
         )
+
+        if n > 0:
+            msg += "Top holders (excl. LP):\n"
+            shown = 0
+            for rank, w in enumerate(wallets[:8], 1):
+                wpct = supply_map.get(w, 0.0)
+                raw  = wpct / 100 * total_supply
+                rnd_flag = " ⚠️ round" if w in round_set else ""
+                msg += (
+                    f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — "
+                    f"{wpct:.2f}% ({raw/1e6:.1f}M{rnd_flag})\n"
+                )
+                shown += 1
+            if n > shown:
+                msg += f"… and {n - shown} more wallets\n"
+
+        # Round-number summary
+        round_in_cluster = [w for w in wallets if w in round_set]
+        if len(round_in_cluster) >= 2:
+            bal_m = round(supply_map.get(round_in_cluster[0], 0) / 100 * total_supply / 1e6)
+            msg += f"\n⚠️ {len(round_in_cluster)} wallets hold identical {bal_m}M amounts\n"
+
         if cluster.get("funder_address"):
-            f = cluster["funder_address"]
-            msg += f'Funder: <a href="https://solscan.io/account/{f}">{f[:8]}…{f[-6:]}</a>\n'
-        for w in wallets[:3]:
-            msg += f'  📋 <code>{w}</code>\n'
-        if len(wallets) > 3:
-            msg += f"  … and {len(wallets) - 3} more\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━"
-        send_alert(msg)
+            f_ = cluster["funder_address"]
+            msg += f'\nFunder: <a href="https://solscan.io/account/{f_}">{f_[:8]}…{f_[-6:]}</a>\n'
+
+        msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        # Show first wallet full address as copyable code
+        if wallets:
+            msg += f"📋 <code>{wallets[0]}</code>\n"
+
+        dex_url     = f"https://dexscreener.com/solana/{token_address}"
+        solscan_url = f"https://solscan.io/account/{wallets[0]}" if wallets else f"https://solscan.io/token/{token_address}"
+        bubblemap   = f"https://app.bubblemaps.io/sol/token/{token_address}"
+        kb = {"inline_keyboard": [[
+            {"text": "📊 DexScreener", "url": dex_url},
+            {"text": "🔍 Solscan",     "url": solscan_url},
+            {"text": "🫧 Bubblemaps",  "url": bubblemap},
+        ]]}
+        send_alert(msg, kb)
     except Exception as exc:
         log.warning("_notify_new_cluster failed: %s", exc)
 
@@ -1510,7 +1566,7 @@ def run_holder_monitor() -> None:
                 risk = cl.get("risk_level", "")
                 cid  = cl.get("cluster_id", "")
                 if risk in ("HIGH_RISK", "MEDIUM") and not _is_cluster_already_alerted(cid):
-                    _notify_new_cluster(symbol, token_address, cl)
+                    _notify_new_cluster(symbol, token_address, cl, current)
                     _mark_cluster_alerted(cid)
         except Exception as exc:
             log.warning("Relationship detection failed for %s: %s", symbol, exc)

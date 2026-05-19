@@ -861,6 +861,103 @@ async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
+async def cmd_checkbundles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /checkbundles [SYMBOL]
+    Run round-number and identical-balance detection on the latest holder snapshot.
+    Owner only.
+    """
+    if not _authorized(update):
+        await _deny(update)
+        return
+
+    from wallet_relationship_engine import detect_round_number_holders, detect_identical_balance_pairs
+
+    arg = context.args[0].upper() if context.args else None
+    tokens_to_check = {arg: TOKENS[arg]} if (arg and arg in TOKENS) else dict(TOKENS)
+
+    if not tokens_to_check:
+        await update.message.reply_text("No tracked tokens. Use /addtoken to add one.")
+        return
+
+    await update.message.reply_text(f"⏳ Scanning bundles for {', '.join(tokens_to_check)}…")
+
+    loop = asyncio.get_running_loop()
+    lines: list[str] = []
+
+    for sym, token_address in tokens_to_check.items():
+        try:
+            raw = await loop.run_in_executor(None, fetch_holders, token_address)
+        except Exception as exc:
+            lines.append(f"❌ {sym}: fetch failed — {exc}")
+            continue
+        if not raw:
+            lines.append(f"❌ {sym}: no holders returned")
+            continue
+
+        _rpc = (
+            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+            if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+        )
+        from address_filters import classify_and_filter
+        filter_result = classify_and_filter(raw, _rpc, resolve_owners_batch, _supabase)
+        holders = filter_result["real_holders"]
+
+        round_rels = detect_round_number_holders(holders, token_address, sym)
+        ident_rels = detect_identical_balance_pairs(holders, token_address, sym)
+
+        lines.append(f"\n<b>🔍 {sym} Bundle Check</b>")
+        lines.append(f"Real holders: {len(holders)} (LP excluded ✅)")
+
+        # Summarise round-number bundles
+        import json as _json
+        from collections import defaultdict
+        round_groups: dict[int, set[str]] = defaultdict(set)
+        for rel in round_rels:
+            try:
+                ev = _json.loads(rel.get("evidence") or "{}")
+                m = ev.get("round_millions", 0)
+                round_groups[m].update([rel["wallet_a"], rel["wallet_b"]])
+            except Exception:
+                pass
+
+        if round_groups:
+            lines.append("⚠️ <b>Round-number bundles:</b>")
+            for amount, wallets in sorted(round_groups.items(), key=lambda x: -len(x[1])):
+                lines.append(f"  {len(wallets)} wallets × {amount}M tokens each:")
+                for w in list(wallets)[:4]:
+                    lines.append(f"    📋 <code>{w}</code>")
+                if len(wallets) > 4:
+                    lines.append(f"    … +{len(wallets) - 4} more")
+        else:
+            lines.append("✅ No round-number bundles detected")
+
+        # Summarise identical-balance pairs
+        if ident_rels:
+            lines.append(f"⚠️ <b>Identical-balance pairs ({len(ident_rels)}):</b>")
+            for rel in ident_rels[:5]:
+                try:
+                    ev = _json.loads(rel.get("evidence") or "{}")
+                    diff = ev.get("diff_pct", 0)
+                    bal  = ev.get("balance_a", 0)
+                    lines.append(
+                        f"  <code>{rel['wallet_a'][:8]}…</code> ≈ "
+                        f"<code>{rel['wallet_b'][:8]}…</code>  "
+                        f"({bal/1e6:.2f}M, {diff:.4f}% diff)"
+                    )
+                except Exception:
+                    pass
+            if len(ident_rels) > 5:
+                lines.append(f"  … +{len(ident_rels) - 5} more pairs")
+        else:
+            lines.append("✅ No identical-balance pairs detected")
+
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…"
+    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -885,6 +982,7 @@ def main() -> None:
     app.add_handler(CommandHandler("relationships", cmd_relationships))
     app.add_handler(CommandHandler("classify",      cmd_classify))
     app.add_handler(CommandHandler("related",       cmd_related))
+    app.add_handler(CommandHandler("checkbundles",  cmd_checkbundles))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 

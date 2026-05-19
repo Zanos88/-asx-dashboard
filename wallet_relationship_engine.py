@@ -30,11 +30,13 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIDENCE = {
-    "JITO_BUNDLE":        99,
-    "INTER_TRANSFER":     95,
-    "COMMON_FUNDER":      90,
-    "TEMPORAL_CLUSTER":   75,
-    "CROSS_TOKEN_HOLDER": 70,
+    "JITO_BUNDLE":           99,
+    "INTER_TRANSFER":        95,
+    "ROUND_NUMBER_BUNDLE":   92,
+    "COMMON_FUNDER":         90,
+    "IDENTICAL_BALANCE":     88,
+    "TEMPORAL_CLUSTER":      75,
+    "CROSS_TOKEN_HOLDER":    70,
 }
 
 HELIUS_TX_RATE_SEC = 0.13   # ~8 req/sec headroom under 10/sec limit
@@ -593,6 +595,131 @@ def detect_jito_bundles(
 
 # ── Supabase persistence ─────────────────────────────────────────────────
 
+def _get_balance(h: dict) -> float:
+    """Extract token balance from either classify_and_filter or wallet_snapshots format."""
+    return float(h.get("uiAmountString") or h.get("amount") or h.get("balance") or 0)
+
+
+def _get_address(h: dict) -> str:
+    """Extract wallet address from either holder format."""
+    return h.get("address") or h.get("wallet_address") or ""
+
+
+def detect_round_number_holders(
+    current_holders: list[dict],
+    token_address: str,
+    token_symbol: str,
+    min_wallets: int = 3,
+    min_millions: float = 1.0,
+    tolerance: float = 0.001,
+) -> list[dict]:
+    """
+    Detect wallets holding identical round token amounts — classic bundle split at launch.
+    Example: ALON wallets #16-19 each holding exactly 10,000,000 tokens.
+
+    Returns relationship dicts (wallet pairs) that can be fed directly to build_clusters().
+    Groups of min_wallets or more with the same round-million amount → ROUND_NUMBER_BUNDLE.
+    """
+    from collections import defaultdict
+
+    round_wallets: list[dict] = []
+    for h in current_holders:
+        addr    = _get_address(h)
+        balance = _get_balance(h)
+        if not addr or balance <= 0:
+            continue
+        millions = balance / 1_000_000
+        rounded  = round(millions)
+        if rounded >= min_millions and abs(millions - rounded) <= tolerance:
+            round_wallets.append({"address": addr, "balance": balance, "round_millions": rounded})
+
+    by_amount: dict[int, list[dict]] = defaultdict(list)
+    for w in round_wallets:
+        by_amount[w["round_millions"]].append(w)
+
+    relationships: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for amount, group in by_amount.items():
+        if len(group) < min_wallets:
+            continue
+        log.info(
+            "  [bundle] Round-number bundle: %d wallets each holding %dM (%s)",
+            len(group), amount, token_symbol,
+        )
+        for i, w1 in enumerate(group):
+            for w2 in group[i + 1:]:
+                a, b = sorted([w1["address"], w2["address"]])
+                relationships.append({
+                    "wallet_a":          a,
+                    "wallet_b":          b,
+                    "relationship_type": "ROUND_NUMBER_BUNDLE",
+                    "token_address":     token_address,
+                    "confidence_score":  92,
+                    "evidence":          json.dumps({
+                        "round_millions": amount,
+                        "balance_a":      w1["balance"],
+                        "balance_b":      w2["balance"],
+                        "group_size":     len(group),
+                    }),
+                    "detected_at": now_iso,
+                    "updated_at":  now_iso,
+                })
+
+    return relationships
+
+
+def detect_identical_balance_pairs(
+    current_holders: list[dict],
+    token_address: str,
+    token_symbol: str,
+    min_balance: float = 1_000_000,
+    tolerance_pct: float = 0.01,
+) -> list[dict]:
+    """
+    Detect wallet pairs with near-identical balances — same entity split across wallets.
+    Example: ALON #4 and #5 hold 20,000,038 vs 19,998,794 (0.007% diff).
+
+    Returns relationship dicts for pairs within tolerance_pct of each other.
+    """
+    relationships: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    eligible = [
+        (_get_address(h), _get_balance(h))
+        for h in current_holders
+        if _get_balance(h) >= min_balance and _get_address(h)
+    ]
+
+    for i, (addr1, b1) in enumerate(eligible):
+        for addr2, b2 in eligible[i + 1:]:
+            if addr1 == addr2:
+                continue
+            diff_pct = abs(b1 - b2) / max(b1, b2) * 100
+            if diff_pct <= tolerance_pct:
+                a, b = sorted([addr1, addr2])
+                log.info(
+                    "  [bundle] Identical-balance pair: %s…%s ≈ %s…%s (%.4f%% diff, %s)",
+                    addr1[:6], addr1[-4:], addr2[:6], addr2[-4:], diff_pct, token_symbol,
+                )
+                relationships.append({
+                    "wallet_a":          a,
+                    "wallet_b":          b,
+                    "relationship_type": "IDENTICAL_BALANCE",
+                    "token_address":     token_address,
+                    "confidence_score":  88,
+                    "evidence":          json.dumps({
+                        "balance_a": b1,
+                        "balance_b": b2,
+                        "diff_pct":  round(diff_pct, 4),
+                    }),
+                    "detected_at": now_iso,
+                    "updated_at":  now_iso,
+                })
+
+    return relationships
+
+
 def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
     """Upsert relationship rows; returns count persisted."""
     if not supabase or not relationships:
@@ -690,7 +817,10 @@ def build_clusters(
         total_pct = sum(supply_map.get(w, 0.0) for w in members)
 
         # Determine risk level and cluster type
-        has_high_conf = bool(methods & {"JITO_BUNDLE", "COMMON_FUNDER", "INTER_TRANSFER"})
+        has_high_conf = bool(methods & {
+            "JITO_BUNDLE", "COMMON_FUNDER", "INTER_TRANSFER",
+            "ROUND_NUMBER_BUNDLE", "IDENTICAL_BALANCE",
+        })
         has_temporal  = "TEMPORAL_CLUSTER" in methods
         has_cross     = methods == {"CROSS_TOKEN_HOLDER"}
 
@@ -711,6 +841,10 @@ def build_clusters(
             det_method = "COMMON_FUNDER"
         elif "INTER_TRANSFER" in methods:
             det_method = "INTER_TRANSFER"
+        elif "ROUND_NUMBER_BUNDLE" in methods:
+            det_method = "ROUND_NUMBER_BUNDLE"
+        elif "IDENTICAL_BALANCE" in methods:
+            det_method = "IDENTICAL_BALANCE"
         elif len(methods) > 1:
             det_method = "MIXED"
         else:
@@ -738,18 +872,19 @@ def build_clusters(
         # One row per wallet in cluster
         for wallet in members:
             rows_for_db.append({
-                "token_address":    token_address,
-                "token_symbol":     token_symbol,
-                "cluster_id":       cluster_id,
-                "wallet_address":   wallet,
-                "cluster_type":     cluster_type,
-                "detection_method": det_method,
-                "total_supply_pct": round(total_pct, 4),
-                "risk_level":       risk_level,
-                "funder_address":   funder,
-                "first_bundle_tx":  bundle_tx,
-                "wallet_count":     len(members),
-                "updated_at":       now_iso,
+                "token_address":        token_address,
+                "token_symbol":         token_symbol,
+                "cluster_id":           cluster_id,
+                "wallet_address":       wallet,
+                "cluster_type":         cluster_type,
+                "detection_method":     det_method,
+                "total_supply_pct":     round(total_pct, 4),
+                "individual_supply_pct": round(supply_map.get(wallet, 0.0), 4),
+                "risk_level":           risk_level,
+                "funder_address":       funder,
+                "first_bundle_tx":      bundle_tx,
+                "wallet_count":         len(members),
+                "updated_at":           now_iso,
             })
 
     # Persist clusters
@@ -831,6 +966,22 @@ def run_relationship_detection(
                 )
             except Exception as exc:
                 log.warning("  [relation] JITO_BUNDLE failed: %s", exc)
+
+    # 6. Round-number bundle detection (no API — balance math only)
+    try:
+        all_relationships += detect_round_number_holders(
+            current_holders, token_address, token_symbol
+        )
+    except Exception as exc:
+        log.warning("  [relation] ROUND_NUMBER_BUNDLE failed: %s", exc)
+
+    # 7. Identical-balance pair detection (no API — balance math only)
+    try:
+        all_relationships += detect_identical_balance_pairs(
+            current_holders, token_address, token_symbol
+        )
+    except Exception as exc:
+        log.warning("  [relation] IDENTICAL_BALANCE failed: %s", exc)
 
     # Persist relationships
     saved = upsert_relationships(all_relationships, supabase)
