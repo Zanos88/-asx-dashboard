@@ -88,6 +88,19 @@ def is_lp_or_system(owner: str) -> bool:
     return owner in KNOWN_EXCLUDED_ADDRESSES or len(owner) < _MIN_ADDR_LEN
 
 
+def is_lp_or_system_address(address: str) -> bool:
+    """
+    Unified LP/program check across all three exclusion sets.
+    Checks KNOWN_LP_ADDRESSES, KNOWN_LP_OWNER_PROGRAMS, and KNOWN_EXCLUDED_ADDRESSES.
+    Use this for single-address validation and tests.
+    """
+    return (
+        address in KNOWN_LP_ADDRESSES
+        or address in KNOWN_LP_OWNER_PROGRAMS
+        or is_lp_or_system(address)
+    )
+
+
 # ── Account info cache (24 h) ─────────────────────────────────────────────────
 # Stores {executable: bool, owner: str} per address — avoids repeated RPC calls.
 _account_cache: dict[str, tuple[dict[str, Any], float]] = {}
@@ -276,14 +289,14 @@ def classify_and_filter(
         if ta in KNOWN_LP_ADDRESSES:
             excluded.append((ta, owner, "KNOWN_LP_ADDRESS"))
             lp_amount += amt
-            log.debug("  LP filter: excluded known LP address %s", ta[:8])
+            log.info("🚫 Excluded LP pool: %s (reason: KNOWN_LP_ADDRESS)", ta[:16])
             continue
 
         # Check 2: Supabase DB cache (token account or resolved owner)
         if db_lp_cache.get(ta) or db_lp_cache.get(owner):
             excluded.append((ta, owner, "DB_CACHE"))
             lp_amount += amt
-            log.debug("  LP filter: excluded DB-cached LP %s", ta[:8])
+            log.info("🚫 Excluded LP pool: %s (reason: DB_CACHE)", ta[:16])
             continue
 
         # Check 3: resolved SPL owner in known excluded programs
@@ -291,7 +304,7 @@ def classify_and_filter(
             reason = "KNOWN_PROGRAM" if owner in KNOWN_EXCLUDED_ADDRESSES else "SYSTEM"
             excluded.append((ta, owner, reason))
             lp_amount += amt
-            log.debug("  LP filter: excluded %s (owner=%s, reason=%s)", ta[:8], owner[:8], reason)
+            log.info("🚫 Excluded LP pool: %s (owner=%s, reason=%s)", ta[:16], owner[:16], reason)
             continue
 
         # Check 4: token account program owner in KNOWN_LP_OWNER_PROGRAMS
@@ -302,14 +315,14 @@ def classify_and_filter(
         if prog_owner in KNOWN_LP_OWNER_PROGRAMS:
             excluded.append((ta, prog_owner, "LP_POOL_OWNER"))
             lp_amount += amt
-            log.debug("  LP filter: excluded LP pool (prog owner=%s, ta=%s)", prog_owner[:8], ta[:8])
+            log.info("🚫 Excluded LP pool: %s (prog owner=%s, reason: LP_POOL_OWNER)", ta[:16], prog_owner[:16])
             continue
 
         # Check 5: resolved owner is an executable on-chain program
         if exec_flags.get(owner, False):
             excluded.append((ta, owner, "EXECUTABLE"))
             lp_amount += amt
-            log.debug("  LP filter: excluded executable program %s", owner[:8])
+            log.info("🚫 Excluded program account: %s (reason: EXECUTABLE)", owner[:16])
             continue
 
         # Unresolved token account (no SPL owner found) — keep but flag

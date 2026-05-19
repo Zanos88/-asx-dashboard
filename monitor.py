@@ -29,6 +29,8 @@ from address_filters import (  # noqa: E402
     classify_and_filter,
     classify_address,
     KNOWN_EXCLUDED_ADDRESSES,
+    KNOWN_LP_ADDRESSES,
+    KNOWN_LP_OWNER_PROGRAMS,
 )
 from wallet_relationship_engine import (  # noqa: E402
     run_relationship_detection,
@@ -1451,6 +1453,8 @@ def log_startup_diagnostics() -> None:
     log.info("MOVE_THRESHOLD_PCT   : %.4f%%", MOVE_THRESHOLD_PCT)
     log.info("MIN_HOLDER_CHANGE_TOKENS: %.0f", MIN_HOLDER_CHANGE_TOKENS)
     log.info("Tokens tracked       : %s", list(TOKENS.keys()))
+    log.info("LP filter active     : %d known LP addresses, %d owner programs",
+             len(KNOWN_LP_ADDRESSES), len(KNOWN_LP_OWNER_PROGRAMS))
     log.info("────────────────────────────────────────────────────────────")
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
