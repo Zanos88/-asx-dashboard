@@ -747,6 +747,7 @@ def build_clusters(
     relationships: list[dict],
     current_holders: list[dict],
     supabase: Any = None,
+    total_supply: float = 0.0,
 ) -> list[dict]:
     """
     Use union-find to build wallet clusters from relationships.
@@ -773,16 +774,15 @@ def build_clusters(
         log.info("  [cluster] No clusters found for %s", token_symbol)
         return []
 
-    # Build supply map from current_holders
-    total_supply = sum(
-        float(h.get("uiAmountString") or h.get("amount") or 0)
-        for h in current_holders
-    ) or 1.0
+    # Build supply map from current_holders; use true circulating supply if provided
+    denom = total_supply if total_supply > 0 else (
+        sum(float(h.get("uiAmountString") or h.get("amount") or 0) for h in current_holders) or 1.0
+    )
     supply_map: dict[str, float] = {}
     for h in current_holders:
         addr = h.get("address", "")
         amt  = float(h.get("uiAmountString") or h.get("amount") or 0)
-        supply_map[addr] = amt / total_supply * 100
+        supply_map[addr] = amt / denom * 100
 
     # Determine detection methods per cluster
     cluster_methods: dict[str, set[str]] = defaultdict(set)
@@ -910,6 +910,7 @@ def run_relationship_detection(
     supabase: Any,
     helius_key: str = "",
     changed_wallets: list[str] | None = None,
+    total_supply: float = 0.0,
 ) -> list[dict]:
     """
     Run all relationship detection methods for a token.
@@ -992,7 +993,8 @@ def run_relationship_detection(
 
     # Build and save clusters
     clusters = build_clusters(
-        token_address, token_symbol, all_relationships, current_holders, supabase
+        token_address, token_symbol, all_relationships, current_holders, supabase,
+        total_supply=total_supply,
     )
 
     # Alert if new HIGH_RISK cluster found

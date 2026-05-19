@@ -191,14 +191,20 @@ def update_bot_config(key: str, value: str) -> bool:
 
 # ── Supabase writers ──────────────────────────────────────────────────────────
 
-def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[dict]) -> None:
+def write_snapshot_to_supabase(
+    symbol: str,
+    token_address: str,
+    holders: list[dict],
+    total_supply: float = 0.0,
+    lp_pct_excluded: float = 0.0,
+) -> None:
     if DRY_RUN:
         log.info("[DRY RUN] Supabase wallet_snapshots write skipped (%s)", symbol)
         return
     if _supabase is None:
         return
-    total        = sum(get_amount(h) for h in holders) or 1.0
-    top10_pct    = sum(get_amount(h) / total * 100 for h in holders[:10])
+    denom        = total_supply if total_supply > 0 else sum(get_amount(h) for h in holders) or 1.0
+    top10_pct    = sum(get_amount(h) / denom * 100 for h in holders[:10])
     holder_count = len(holders)
     captured_at  = datetime.now(timezone.utc).isoformat()
     rows = [
@@ -206,9 +212,11 @@ def write_snapshot_to_supabase(symbol: str, token_address: str, holders: list[di
             "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
             "wallet_address": h["address"], "rank": rank,
             "balance": get_amount(h),
-            "pct_supply": round(get_amount(h) / total * 100, 6),
+            "pct_supply": round(get_amount(h) / denom * 100, 6),
             "captured_at": captured_at, "holder_count": holder_count,
             "top10_pct": round(top10_pct, 4),
+            "total_supply": round(total_supply) if total_supply > 0 else None,
+            "lp_pct_excluded": round(lp_pct_excluded, 4),
         }
         for rank, h in enumerate(holders, 1)
     ]
@@ -695,6 +703,30 @@ def fetch_holders(token_address: str) -> list[dict[str, Any]]:
                 break
 
     raise RuntimeError(f"All RPC endpoints failed for {token_address[:8]}: {last_exc}")
+
+
+def fetch_token_supply(token_address: str) -> float:
+    """Return true circulating supply (uiAmount) via getTokenSupply RPC."""
+    rpc_url = (
+        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+    )
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getTokenSupply",
+        "params": [token_address],
+    }
+    try:
+        resp = requests.post(rpc_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            log.warning("getTokenSupply error for %s: %s", token_address[:8], data["error"])
+            return 0.0
+        return float(data.get("result", {}).get("value", {}).get("uiAmount") or 0.0)
+    except Exception as exc:
+        log.warning("fetch_token_supply failed for %s: %s", token_address[:8], exc)
+        return 0.0
 
 
 # ── Snapshot helpers ──────────────────────────────────────────────────────────
@@ -1509,6 +1541,7 @@ def run_holder_monitor() -> None:
     all_current:   dict[str, list[dict[str, Any]]] = {}
     all_price_ctx: dict[str, dict[str, Any]]        = {}
     all_addresses: dict[str, str]                   = {}
+    all_supplies:  dict[str, float]                  = {}
 
     for symbol, token_address in TOKENS.items():
         log.info("Fetching %s (%s...)", symbol, token_address[:8])
@@ -1541,10 +1574,19 @@ def run_holder_monitor() -> None:
         all_current[symbol]   = current
         all_addresses[symbol] = token_address
         try:
+            all_supplies[symbol] = fetch_token_supply(token_address)
+            log.info("  Total supply: %.0f tokens", all_supplies[symbol])
+        except Exception:
+            all_supplies[symbol] = 0.0
+        try:
             all_price_ctx[symbol] = fetch_price_context(token_address)
         except Exception:
             all_price_ctx[symbol] = {}
-        write_snapshot_to_supabase(symbol, token_address, current)
+        write_snapshot_to_supabase(
+            symbol, token_address, current,
+            total_supply=all_supplies.get(symbol, 0.0),
+            lp_pct_excluded=filter_result["lp_pct"],
+        )
 
     cross_holdings = build_cross_holdings(all_current)
     persist_wallet_relationships(cross_holdings)
@@ -1563,6 +1605,7 @@ def run_holder_monitor() -> None:
                 cross_holdings=cross_holdings,
                 supabase=_supabase,
                 helius_key=HELIUS_API_KEY,
+                total_supply=all_supplies.get(symbol, 0.0),
             )
             _all_clusters[symbol] = clusters
             # Notify once per cluster (HIGH_RISK or MEDIUM), deduped by 24h window
