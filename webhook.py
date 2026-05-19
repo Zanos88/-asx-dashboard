@@ -114,7 +114,7 @@ def _bot_config_set(key: str, value: str) -> bool:
         return False
     try:
         existing = sb.table("bot_config").select("key").eq("key", key).execute()
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         if existing.data:
             sb.table("bot_config").update({"value": value, "updated_at": now}).eq("key", key).execute()
         else:

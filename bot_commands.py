@@ -740,6 +740,31 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ Monitor process exited immediately.\n<pre>{html.escape(err)}</pre>",
             parse_mode="HTML",
         )
+        return
+
+    # Wait up to 120s for completion and report result
+    loop = asyncio.get_running_loop()
+    try:
+        exit_code = await asyncio.wait_for(
+            loop.run_in_executor(None, _monitor_proc.wait),
+            timeout=120,
+        )
+        if exit_code == 0:
+            await update.message.reply_text("✅ Monitor run complete — check above for any alerts.")
+        else:
+            _stderr_log.flush()
+            try:
+                err = open("/tmp/monitor_run.log").read(500).strip()
+            except OSError:
+                err = "(no log)"
+            await update.message.reply_text(
+                f"❌ Monitor exited with code {exit_code}.\n<pre>{html.escape(err)}</pre>",
+                parse_mode="HTML",
+            )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "⏱ Monitor still running after 120s — alerts will appear when ready."
+        )
 
 
 async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -719,6 +719,51 @@ def save_snapshot(symbol: str, holders: list[dict[str, Any]]) -> None:
         log.error("Could not save snapshot for %s: %s", symbol, exc)
 
 
+def _load_supabase_fallback_snapshot(symbol: str, token_address: str) -> dict[str, Any] | None:
+    """
+    Load the most recent snapshot from Supabase wallet_snapshots.
+    Used as a fallback when the local snapshots/ directory is empty (e.g. after Railway redeploy).
+    Must be called BEFORE the current run's write_snapshot_to_supabase() to avoid comparing current vs current.
+    """
+    if _supabase is None:
+        return None
+    try:
+        # Find the most recent captured_at for this token
+        r = _supabase.table("wallet_snapshots") \
+            .select("captured_at") \
+            .eq("token_address", token_address) \
+            .order("captured_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if not r.data:
+            log.info("  Supabase fallback: no prior snapshots for %s", symbol)
+            return None
+        latest_ts = r.data[0]["captured_at"]
+
+        # Fetch all holder rows from that snapshot
+        rows_r = _supabase.table("wallet_snapshots") \
+            .select("wallet_address,balance,rank") \
+            .eq("token_address", token_address) \
+            .eq("captured_at", latest_ts) \
+            .order("rank") \
+            .execute()
+        if not rows_r.data:
+            return None
+
+        holders = [
+            {"address": row["wallet_address"], "uiAmount": float(row["balance"] or 0)}
+            for row in rows_r.data
+        ]
+        log.info(
+            "  Supabase fallback loaded for %s: %d holders from %s",
+            symbol, len(holders), latest_ts[:19],
+        )
+        return {"timestamp": latest_ts, "holders": holders}
+    except Exception as exc:
+        log.warning("_load_supabase_fallback_snapshot failed for %s: %s", symbol, exc)
+        return None
+
+
 # ── Holder comparison ─────────────────────────────────────────────────────────
 
 def get_amount(holder: dict[str, Any]) -> float:
@@ -1312,7 +1357,7 @@ def _maybe_send_daily_digest() -> None:
     if _supabase:
         try:
             r = _supabase.table("bot_config").select("value").eq("key", "last_daily_digest").execute()
-            if r.data and r.data[0]["value"].startswith(today_str):
+            if r.data and (r.data[0].get("value") or "").startswith(today_str):
                 log.info("Daily digest already sent today — skipping")
                 return
         except Exception:
@@ -1390,6 +1435,15 @@ def run_holder_monitor() -> None:
     )
 
     token_emojis = {sym: info.get("emoji", "🔹") for sym, info in _cfg.get("solana_tokens", {}).items()}
+
+    # Pre-load Supabase fallback snapshots BEFORE Pass 1 writes (avoids comparing current vs current
+    # on Railway where the local snapshots/ directory is wiped on every redeploy).
+    _supabase_fallbacks: dict[str, dict[str, Any]] = {}
+    for symbol, token_address in TOKENS.items():
+        if not load_snapshot(symbol):
+            fb = _load_supabase_fallback_snapshot(symbol, token_address)
+            if fb:
+                _supabase_fallbacks[symbol] = fb
 
     # Pass 1: fetch all token holders + prices
     all_current:   dict[str, list[dict[str, Any]]] = {}
@@ -1471,7 +1525,7 @@ def run_holder_monitor() -> None:
 
         log.info("Checking %s — pct=%.4f%%  tokens=%.0f", symbol, MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS)
 
-        snapshot = load_snapshot(symbol)
+        snapshot = load_snapshot(symbol) or _supabase_fallbacks.get(symbol)
         if snapshot:
             try:
                 changes = compare_holders(snapshot["holders"], current)
