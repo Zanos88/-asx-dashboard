@@ -114,6 +114,7 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 DRY_RUN: bool                                    = False  # set via --dry-run
 _ai_cache: dict[str, tuple[str, float]]          = {}
 _coord_ai_cache: dict[str, tuple[str, float]]    = {}
+_cluster_ai_cache: dict[str, tuple[str, float]]  = {}
 _alert_timestamps: dict[str, float]              = {}
 _wallet_intel_cache: dict[str, tuple[dict, float]] = {}
 _price_cache: dict[str, tuple[dict, float]]      = {}
@@ -227,29 +228,48 @@ def write_snapshot_to_supabase(
         log.error("  ❌ wallet_snapshots insert failed for %s: %s", symbol, exc)
 
 
-def write_alert_to_supabase(symbol: str, token_address: str, change: dict, telegram_sent: bool) -> None:
+def write_alert_to_supabase(
+    symbol: str,
+    token_address: str,
+    change: dict,
+    telegram_sent: bool,
+    wallet_info: dict | None = None,
+    price_ctx: dict | None = None,
+    cluster_info: dict | None = None,
+) -> None:
     if DRY_RUN:
         log.info("[DRY RUN] Supabase whale_alerts write skipped (%s)", symbol)
         return
     if _supabase is None:
         return
-    now         = datetime.now(timezone.utc).isoformat()
-    token_delta = change.get("tokens_delta") or change.get("token_delta") or 0
-    delta       = change.get("delta", 0)
-    flow_type   = (
+    now          = datetime.now(timezone.utc).isoformat()
+    # Signed token delta: positive = accumulate, negative = distribute
+    new_tokens   = change.get("new_tokens", 0) or 0
+    old_tokens   = change.get("old_tokens", 0) or 0
+    token_delta  = new_tokens - old_tokens
+    delta        = change.get("delta", 0)
+    flow_type    = (
         "entry" if change["type"] == "NEW"
         else "exit" if change["type"] == "EXIT"
         else "buy"  if delta > 0
         else "sell"
     )
+    price_usd     = (price_ctx or {}).get("price") or None
+    wallet_age_d  = (wallet_info or {}).get("age_days") if wallet_info else None
+    cluster_id_v  = (cluster_info or {}).get("cluster_id") if cluster_info else None
+    tok_delta_usd = round(token_delta * price_usd, 4) if (price_usd and token_delta) else None
     try:
         _supabase.table("whale_alerts").insert({
             "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
             "wallet_address": change["address"], "change_type": change["type"],
             "old_pct": change.get("old_pct"), "new_pct": change.get("new_pct"),
-            "delta_pct": round(delta, 6), "token_delta": token_delta,
+            "delta_pct": round(delta, 6), "token_delta": round(token_delta),
             "trigger": change.get("trigger", "pct"),
             "alerted_at": now, "telegram_sent": telegram_sent,
+            "wallet_age_days": wallet_age_d,
+            "price_usd":       price_usd,
+            "token_delta_usd": tok_delta_usd,
+            "cluster_id":      cluster_id_v,
         }).execute()
     except Exception as exc:
         log.error("  ❌ whale_alerts insert failed: %s", exc)
@@ -662,6 +682,41 @@ def get_coordinated_move_ai(
         return ""
 
 
+def get_cluster_ai_insight(
+    token: str,
+    n_wallets: int,
+    pct: float,
+    method: str,
+    risk: str,
+) -> str:
+    """Claude one-liner for a newly detected bundle cluster. Cached 30 min."""
+    cache_key = f"cluster:{token}:{n_wallets}:{pct:.1f}:{method}"
+    cached = _cluster_ai_cache.get(cache_key)
+    if cached and (time.time() - cached[1]) < 1800:
+        return cached[0]
+    if not ANTHROPIC_API_KEY:
+        return ""
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = (
+            f"In one sentence, what does it mean for traders when {n_wallets} wallets "
+            f"holding {pct:.1f}% of ${token} supply are detected as a coordinated bundle "
+            f"via {method} ({risk} risk)?"
+        )
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        interp = msg.content[0].text.strip()
+        _cluster_ai_cache[cache_key] = (interp, time.time())
+        return interp
+    except Exception as exc:
+        log.warning("Cluster AI insight failed: %s", exc)
+        return ""
+
+
 # ── Helius RPC with public fallback ───────────────────────────────────────────
 
 def fetch_holders(token_address: str) -> list[dict[str, Any]]:
@@ -957,6 +1012,8 @@ def _notify_new_cluster(
                 msg += (
                     f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — "
                     f"{wpct:.2f}% ({raw/1e6:.1f}M{rnd_flag})\n"
+                    f"       📋 <code>{w}</code>\n"
+                    f'       🔍 <a href="https://solscan.io/account/{w}">Solscan</a>\n'
                 )
                 shown += 1
             if n > shown:
@@ -971,6 +1028,10 @@ def _notify_new_cluster(
         if cluster.get("funder_address"):
             f_ = cluster["funder_address"]
             msg += f'\nFunder: <a href="https://solscan.io/account/{f_}">{f_[:8]}…{f_[-6:]}</a>\n'
+
+        ai_insight = get_cluster_ai_insight(symbol, n, pct, method, risk)
+        if ai_insight:
+            msg += f"\n🤖 <i>{ai_insight}</i>\n"
 
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
@@ -1096,6 +1157,7 @@ def detect_coordinated_moves(
                     cl_tag = f"  [CLUSTER #{cid_short}]"
                 lines.append(f"  #{rank} <code>{short}</code>  {c['delta']:+.3f}%{cl_tag}")
                 lines.append(f"       📋 <code>{addr}</code>")
+                lines.append(f'       🔍 <a href="https://solscan.io/account/{addr}">Solscan</a>')
 
             if dominant_cl and dominant_cl.get("wallets"):
                 inter_count = 0
@@ -1195,8 +1257,8 @@ def format_quant_alert(
     elif change_type == "EXIT":
         supply_str, sign = f"{change['old_pct']:.3f}% → 0% (-{change['old_pct']:.3f}%)", "-"
     else:
-        sign       = "+" if delta > 0 else ""
-        supply_str = f"{change['old_pct']:.3f}% → {change['new_pct']:.3f}% ({sign}{delta:.3f}%)"
+        sign       = "+" if delta > 0 else "-"
+        supply_str = f"{change['old_pct']:.3f}% → {change['new_pct']:.3f}% ({delta:+.3f}%)"
 
     # Token / USD
     price   = price_ctx.get("price") or 0.0
@@ -1696,7 +1758,12 @@ def run_holder_monitor() -> None:
                     token_flows.append({"address": addr, "delta": delta, "rank": new_rank})
                     log.info("  Alert sent — %s #%s %s %+.4f%%", symbol, new_rank, change_type, delta)
 
-                write_alert_to_supabase(symbol, token_address, change, telegram_sent)
+                write_alert_to_supabase(
+                    symbol, token_address, change, telegram_sent,
+                    wallet_info=wallet_info,
+                    price_ctx=price_ctx,
+                    cluster_info=cluster_info,
+                )
 
             if not changes:
                 log.info("  No significant changes")
