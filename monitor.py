@@ -308,6 +308,28 @@ def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any
         return default
 
 
+def _fetch_recent_wallet_deltas(wallets: list[str], symbol: str) -> dict[str, float]:
+    """Return the most recent delta_pct per wallet from whale_alerts in the last hour."""
+    if not _supabase or not wallets:
+        return {}
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        r = _supabase.table("whale_alerts").select("wallet_address,delta_pct").in_(
+            "wallet_address", wallets
+        ).eq("token_symbol", symbol).gte("alerted_at", since).order(
+            "alerted_at", desc=True
+        ).execute()
+        result: dict[str, float] = {}
+        for row in (r.data or []):
+            addr = row.get("wallet_address")
+            if addr and addr not in result:  # keep only most recent per wallet
+                result[addr] = float(row.get("delta_pct") or 0.0)
+        return result
+    except Exception as exc:
+        log.debug("_fetch_recent_wallet_deltas failed: %s", exc)
+        return {}
+
+
 def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) -> None:
     """Persist CROSS_TOKEN_HOLDER relationships to the new wallet_relationships schema."""
     if _supabase is None:
@@ -688,9 +710,11 @@ def get_cluster_ai_insight(
     pct: float,
     method: str,
     risk: str,
+    direction: str = "holding",
+    price_change_1h: float | None = None,
 ) -> str:
-    """Claude one-liner for a newly detected bundle cluster. Cached 30 min."""
-    cache_key = f"cluster:{token}:{n_wallets}:{pct:.1f}:{method}"
+    """Neutral Claude one-liner for a newly detected bundle cluster. Cached 30 min."""
+    cache_key = f"cluster:{token}:{n_wallets}:{pct:.1f}:{method}:{direction}"
     cached = _cluster_ai_cache.get(cache_key)
     if cached and (time.time() - cached[1]) < 1800:
         return cached[0]
@@ -699,10 +723,18 @@ def get_cluster_ai_insight(
     try:
         import anthropic as _anthropic
         client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        price_line = (
+            f"Price is {price_change_1h:+.1f}% in the last hour. "
+            if price_change_1h is not None else ""
+        )
         prompt = (
-            f"In one sentence, what does it mean for traders when {n_wallets} wallets "
-            f"holding {pct:.1f}% of ${token} supply are detected as a coordinated bundle "
-            f"via {method} ({risk} risk)?"
+            f"You are a neutral on-chain data analyst. "
+            f"Observe ONLY — do not make recommendations or trading advice.\n\n"
+            f"Data: {n_wallets} of the top-20 holders of ${token} are {direction} simultaneously. "
+            f"They control {pct:.1f}% of real wallet supply (LP pools excluded). "
+            f"{price_line}Detection method: {method}\n\n"
+            f"In ONE sentence, state what this pattern objectively indicates about holder behaviour. "
+            f"No recommendations. Facts only."
         )
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -761,27 +793,49 @@ def fetch_holders(token_address: str) -> list[dict[str, Any]]:
 
 
 def fetch_token_supply(token_address: str) -> float:
-    """Return true circulating supply (uiAmount) via getTokenSupply RPC."""
-    rpc_url = (
-        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-        if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
-    )
+    """Return true circulating supply via getTokenSupply RPC. Tries Helius then public RPC."""
     payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "getTokenSupply",
         "params": [token_address],
     }
-    try:
-        resp = requests.post(rpc_url, json=payload, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            log.warning("getTokenSupply error for %s: %s", token_address[:8], data["error"])
-            return 0.0
-        return float(data.get("result", {}).get("value", {}).get("uiAmount") or 0.0)
-    except Exception as exc:
-        log.warning("fetch_token_supply failed for %s: %s", token_address[:8], exc)
-        return 0.0
+    endpoints: list[tuple[str, str]] = []
+    if HELIUS_API_KEY:
+        endpoints.append(("Helius", f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"))
+    endpoints.append(("Solana-public", PUBLIC_SOLANA_RPC))
+
+    log.info("  Fetching total supply for %s...", token_address[:8])
+    for name, url in endpoints:
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                log.warning("  [supply] %s error for %s: %s", name, token_address[:8], data["error"])
+                continue
+            value = (data.get("result") or {}).get("value") or {}
+            # uiAmount can be null for very large token supplies; fall back to uiAmountString
+            ui_amount = value.get("uiAmount")
+            if ui_amount is not None:
+                supply = float(ui_amount)
+                if supply > 0:
+                    log.info("  [supply] %s → %.0f tokens (uiAmount, %s)", token_address[:8], supply, name)
+                    return supply
+            ui_str = value.get("uiAmountString") or ""
+            if ui_str:
+                supply = float(ui_str)
+                if supply > 0:
+                    log.info("  [supply] %s → %.0f tokens (uiAmountString, %s)", token_address[:8], supply, name)
+                    return supply
+            log.warning("  [supply] %s returned zero/null for %s via %s", token_address[:8], name, url[:50])
+        except Exception as exc:
+            log.error("  [supply] %s failed for %s: %s", name, token_address[:8], exc)
+
+    log.warning(
+        "⚠️ getTokenSupply failed for %s — using filtered holder sum as fallback; pct values will be inflated",
+        token_address[:8],
+    )
+    return 0.0
 
 
 # ── Snapshot helpers ──────────────────────────────────────────────────────────
@@ -966,6 +1020,8 @@ def _notify_new_cluster(
     token_address: str,
     cluster: dict[str, Any],
     current_holders: list[dict[str, Any]] | None = None,
+    total_supply_tokens: float = 0.0,
+    price_ctx: dict[str, Any] | None = None,
 ) -> None:
     """Send a Telegram alert when a new HIGH_RISK or MEDIUM cluster is first detected."""
     try:
@@ -976,42 +1032,63 @@ def _notify_new_cluster(
         risk    = cluster.get("risk_level", "UNKNOWN")
         icon    = "🔴" if risk == "HIGH_RISK" else "🟡"
 
-        # Build per-wallet supply map from current_holders for individual %
-        total_supply = sum(
-            float(h.get("uiAmountString") or h.get("amount") or 0)
-            for h in (current_holders or [])
-        ) or 1.0
+        # Use true circulating supply if available; fall back to filtered holder sum
+        supply_available = total_supply_tokens > 0
+        denom = total_supply_tokens if supply_available else (
+            sum(float(h.get("uiAmountString") or h.get("amount") or 0)
+                for h in (current_holders or [])) or 1.0
+        )
         supply_map: dict[str, float] = {}
         round_set: set[str] = set()
         for h in (current_holders or []):
             addr    = h.get("address", "")
             amt     = float(h.get("uiAmountString") or h.get("amount") or 0)
-            supply_map[addr] = amt / total_supply * 100
-            # Flag round-million balances
+            supply_map[addr] = amt / denom * 100
             millions = amt / 1_000_000
             if millions >= 1 and abs(millions - round(millions)) < 0.001:
                 round_set.add(addr)
 
-        conf = cluster.get("confidence_score",
-                           {"HIGH_RISK": 92, "MEDIUM": 75}.get(risk, 70))
+        # Recent deltas for net direction line
+        recent_deltas  = _fetch_recent_wallet_deltas(wallets[:8], symbol)
+        net_delta      = sum(recent_deltas.values()) if recent_deltas else 0.0
+        if net_delta > 0.0005:
+            net_str   = f"📈 Net: +{net_delta:.3f}% ACCUMULATING"
+            direction = "accumulating"
+        elif net_delta < -0.0005:
+            net_str   = f"📉 Net: {net_delta:.3f}% DISTRIBUTING"
+            direction = "distributing"
+        else:
+            net_str   = None
+            direction = "holding"
+
+        conf         = cluster.get("confidence_score", {"HIGH_RISK": 92, "MEDIUM": 75}.get(risk, 70))
+        supply_note  = "" if supply_available else " ⚠️ (supply data unavailable)"
 
         msg = (
             f"🚨 <b>BUNDLED WALLETS — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Method: {method} | Risk: {icon} {risk} | Confidence: {conf}%\n"
-            f"Real wallet supply: {pct:.2f}% (LP excluded ✅)\n\n"
+            f"Real wallet supply: {pct:.2f}%{supply_note} (LP excluded ✅)\n"
         )
+        if net_str:
+            msg += f"{net_str}\n"
+        msg += "\n"
 
         if n > 0:
             msg += "Top holders (excl. LP):\n"
             shown = 0
             for rank, w in enumerate(wallets[:8], 1):
-                wpct = supply_map.get(w, 0.0)
-                raw  = wpct / 100 * total_supply
+                wpct     = supply_map.get(w, 0.0)
+                raw      = wpct / 100 * denom
                 rnd_flag = " ⚠️ round" if w in round_set else ""
+                d        = recent_deltas.get(w)
+                if d is not None and abs(d) >= 0.001:
+                    delta_str = f" (+{d:.3f}% 🟢)" if d > 0 else f" ({d:.3f}% 🔴)"
+                else:
+                    delta_str = ""
                 msg += (
                     f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — "
-                    f"{wpct:.2f}% ({raw/1e6:.1f}M{rnd_flag})\n"
+                    f"{wpct:.2f}%{delta_str} ({raw/1e6:.1f}M{rnd_flag})\n"
                     f"       📋 <code>{w}</code>\n"
                     f'       🔍 <a href="https://solscan.io/account/{w}">Solscan</a>\n'
                 )
@@ -1022,20 +1099,20 @@ def _notify_new_cluster(
         # Round-number summary
         round_in_cluster = [w for w in wallets if w in round_set]
         if len(round_in_cluster) >= 2:
-            bal_m = round(supply_map.get(round_in_cluster[0], 0) / 100 * total_supply / 1e6)
+            bal_m = round(supply_map.get(round_in_cluster[0], 0) / 100 * denom / 1e6)
             msg += f"\n⚠️ {len(round_in_cluster)} wallets hold identical {bal_m}M amounts\n"
 
         if cluster.get("funder_address"):
             f_ = cluster["funder_address"]
             msg += f'\nFunder: <a href="https://solscan.io/account/{f_}">{f_[:8]}…{f_[-6:]}</a>\n'
 
-        ai_insight = get_cluster_ai_insight(symbol, n, pct, method, risk)
+        price_change_1h = (price_ctx or {}).get("change_1h")
+        ai_insight = get_cluster_ai_insight(symbol, n, pct, method, risk, direction, price_change_1h)
         if ai_insight:
             msg += f"\n🤖 <i>{ai_insight}</i>\n"
 
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
-        # Show first wallet full address as copyable code
         if wallets:
             msg += f"📋 <code>{wallets[0]}</code>\n"
 
@@ -1675,7 +1752,11 @@ def run_holder_monitor() -> None:
                 risk = cl.get("risk_level", "")
                 cid  = cl.get("cluster_id", "")
                 if risk in ("HIGH_RISK", "MEDIUM") and not _is_cluster_already_alerted(cid):
-                    _notify_new_cluster(symbol, token_address, cl, current)
+                    _notify_new_cluster(
+                        symbol, token_address, cl, current,
+                        total_supply_tokens=all_supplies.get(symbol, 0.0),
+                        price_ctx=all_price_ctx.get(symbol),
+                    )
                     _mark_cluster_alerted(cid)
         except Exception as exc:
             log.warning("Relationship detection failed for %s: %s", symbol, exc)

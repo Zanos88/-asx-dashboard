@@ -775,9 +775,15 @@ def build_clusters(
         return []
 
     # Build supply map from current_holders; use true circulating supply if provided
-    denom = total_supply if total_supply > 0 else (
-        sum(float(h.get("uiAmountString") or h.get("amount") or 0) for h in current_holders) or 1.0
-    )
+    if total_supply > 0:
+        denom = total_supply
+    else:
+        denom = sum(float(h.get("uiAmountString") or h.get("amount") or 0) for h in current_holders) or 1.0
+        log.warning(
+            "  [cluster] %s: total_supply unavailable — using filtered holder sum as denom; "
+            "total_supply_pct will be inflated",
+            token_symbol,
+        )
     supply_map: dict[str, float] = {}
     for h in current_holders:
         addr = h.get("address", "")
