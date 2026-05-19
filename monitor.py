@@ -170,10 +170,16 @@ def _load_bot_config_from_supabase() -> None:
 
 def update_bot_config(key: str, value: str) -> bool:
     """Upsert a key/value pair in the bot_config Supabase table. Returns True on success."""
+    global _supabase
     if _supabase is None:
+        _supabase = init_supabase()
+    if _supabase is None:
+        log.warning("bot_config update skipped — Supabase not connected (%s)", key)
         return False
     try:
-        _supabase.table("bot_config").upsert({"key": key, "value": value}).execute()
+        _supabase.table("bot_config").upsert(
+            {"key": key, "value": value}, on_conflict="key"
+        ).execute()
         log.info("bot_config updated: %s = %s", key, value[:80])
         return True
     except Exception as exc:

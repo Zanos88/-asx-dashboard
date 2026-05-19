@@ -143,9 +143,10 @@ def _cache_tx_events(
                 "block_time":     bt_iso,
             })
     if rows:
+        deduped = {r["tx_signature"]: r for r in rows}
         try:
             supabase.table("wallet_tx_events").upsert(
-                rows, on_conflict="tx_signature"
+                list(deduped.values()), on_conflict="tx_signature"
             ).execute()
         except Exception as exc:
             log.debug("wallet_tx_events cache write failed: %s", exc)

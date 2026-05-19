@@ -145,7 +145,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cfg = _load_config()
     tokens = {sym: info["address"] for sym, info in cfg.get("solana_tokens", {}).items()}
     helius_ok  = "✅" if os.environ.get("HELIUS_API_KEY") else "⚠️ not set (public RPC)"
-    supabase_ok = "✅" if os.environ.get("SUPABASE_URL") else "❌ not configured"
+    supabase_ok = "✅" if _supabase is not None else "❌ not connected (check SUPABASE_SERVICE_ROLE_KEY)"
     token_lines = "\n".join(
         f"  • <b>{sym}</b>: <code>{addr[:8]}…</code>" for sym, addr in tokens.items()
     ) or "  (none)"
@@ -717,16 +717,29 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _monitor_proc and _monitor_proc.poll() is None:
         await update.message.reply_text("⏳ A run is already in progress — please wait.")
         return
+    import sys
     monitor_path = os.path.join(_REPO_DIR, "monitor.py")
+    _stderr_log = open("/tmp/monitor_run.log", "w")
     _monitor_proc = subprocess.Popen(
-        ["python", monitor_path],
+        [sys.executable, monitor_path],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=_stderr_log,
     )
     await update.message.reply_text(
         "⏳ Manual monitor run started.\n"
         "Alerts will appear in the group within ~60s."
     )
+    await asyncio.sleep(2)
+    if _monitor_proc.poll() is not None:
+        _stderr_log.flush()
+        try:
+            err = open("/tmp/monitor_run.log").read(500).strip()
+        except OSError:
+            err = "(no log)"
+        await update.message.reply_text(
+            f"❌ Monitor process exited immediately.\n<pre>{html.escape(err)}</pre>",
+            parse_mode="HTML",
+        )
 
 
 async def cmd_topwallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
