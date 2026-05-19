@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-05-19T00:08:08.425700+00:00",
+  "timestamp": "2026-05-19T04:34:25.037923+00:00",
   "holders": [
     {
       "address": "Gi1VCbPL6Sdcytjp6f1uG1PvCHq25FuNgnVqySHBnKNk",
-      "uiAmount": 139736026.514405,
+      "uiAmount": 139667105.886829,
       "decimals": 6,
-      "amount": "139736026514405",
-      "uiAmountString": "139736026.514405",
+      "amount": "139667105886829",
+      "uiAmountString": "139667105.886829",
       "token_account": "Gi1VCbPL6Sdcytjp6f1uG1PvCHq25FuNgnVqySHBnKNk"
     },
     {
