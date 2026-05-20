@@ -1073,7 +1073,7 @@ def _notify_new_cluster(
 
         # In-memory deltas from current run's snapshot comparison (no DB query)
         deltas    = wallet_deltas or {}
-        net_delta = sum(deltas.get(w, 0.0) for w in wallets[:8])
+        net_delta = sum(deltas.get(w, 0.0) for w in wallets[:20])
         if net_delta > 0.0005:
             net_str   = f"📈 Net: +{net_delta:.3f}% ACCUMULATING"
             direction = "accumulating"
@@ -1097,27 +1097,28 @@ def _notify_new_cluster(
             msg += f"{net_str}\n"
         msg += "\n"
 
+        def _wallet_line(rank: int, w: str) -> str:
+            wpct     = supply_map.get(w, 0.0)
+            raw      = wpct / 100 * denom
+            rnd_flag = " ⚠️ round" if w in round_set else ""
+            d        = deltas.get(w)
+            if d is not None and abs(d) >= 0.001:
+                delta_str = f" (+{d:.3f}% 🟢)" if d > 0 else f" ({d:.3f}% 🔴)"
+            else:
+                delta_str = ""
+            return (
+                f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — "
+                f"{wpct:.2f}%{delta_str} ({raw/1e6:.1f}M{rnd_flag})\n"
+                f"       📋 <code>{w}</code>\n"
+                f'       🔍 <a href="https://solscan.io/account/{w}">Solscan</a>\n'
+            )
+
         if n > 0:
             msg += "Top holders (excl. LP):\n"
-            shown = 0
-            for rank, w in enumerate(wallets[:8], 1):
-                wpct     = supply_map.get(w, 0.0)
-                raw      = wpct / 100 * denom
-                rnd_flag = " ⚠️ round" if w in round_set else ""
-                d        = deltas.get(w)
-                if d is not None and abs(d) >= 0.001:
-                    delta_str = f" (+{d:.3f}% 🟢)" if d > 0 else f" ({d:.3f}% 🔴)"
-                else:
-                    delta_str = ""
-                msg += (
-                    f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — "
-                    f"{wpct:.2f}%{delta_str} ({raw/1e6:.1f}M{rnd_flag})\n"
-                    f"       📋 <code>{w}</code>\n"
-                    f'       🔍 <a href="https://solscan.io/account/{w}">Solscan</a>\n'
-                )
-                shown += 1
-            if n > shown:
-                msg += f"… and {n - shown} more wallets\n"
+            for rank, w in enumerate(wallets[:10], 1):
+                msg += _wallet_line(rank, w)
+            if n > 10:
+                msg += f"… (+{n - 10} more — see next message)\n"
 
         # Round-number summary
         round_in_cluster = [w for w in wallets if w in round_set]
@@ -1148,6 +1149,12 @@ def _notify_new_cluster(
             {"text": "🫧 Bubblemaps",  "url": bubblemap},
         ]]}
         send_alert(msg, kb)
+        if wallets[10:20]:
+            msg2 = f"📋 <b>BUNDLED WALLETS — {symbol}</b> (continued)\n"
+            msg2 += "━━━━━━━━━━━━━━━━━━━━━━\n"
+            for rank, w in enumerate(wallets[10:20], 11):
+                msg2 += _wallet_line(rank, w)
+            send_alert(msg2)
     except Exception as exc:
         log.warning("_notify_new_cluster failed: %s", exc)
 
@@ -1754,20 +1761,7 @@ def run_holder_monitor() -> None:
     cross_holdings = build_cross_holdings(all_current)
     persist_wallet_relationships(cross_holdings)
 
-    # Build in-memory wallet deltas for cluster alert enrichment (before Pass 2)
-    # compare_holders is run here so _notify_new_cluster() can use current-run deltas
-    # without a DB query (all_run_changes is populated in Pass 2, after cluster alerts)
-    all_preview_deltas: dict[str, dict[str, float]] = {}
-    for _sym, _current in all_current.items():
-        _snapshot = load_snapshot(_sym) or _supabase_fallbacks.get(_sym)
-        if _snapshot:
-            try:
-                _preview = compare_holders(_snapshot["holders"], _current)
-                all_preview_deltas[_sym] = {c["address"]: c.get("delta", 0.0) for c in _preview}
-            except Exception:
-                all_preview_deltas[_sym] = {}
-        else:
-            all_preview_deltas[_sym] = {}
+    _pending_cluster_alerts: list[tuple[str, str, dict, list]] = []
 
     # Run relationship detection + cluster building for each tracked token
     _all_clusters: dict[str, list[dict[str, Any]]] = {}
@@ -1786,18 +1780,12 @@ def run_holder_monitor() -> None:
                 total_supply=all_supplies.get(symbol, 0.0),
             )
             _all_clusters[symbol] = clusters
-            # Notify once per cluster (HIGH_RISK or MEDIUM), deduped by 24h window
+            # Collect cluster alerts — fire after Pass 2 using actual run deltas
             for cl in clusters:
                 risk = cl.get("risk_level", "")
                 cid  = cl.get("cluster_id", "")
                 if risk in ("HIGH_RISK", "MEDIUM") and not _is_cluster_already_alerted(cid):
-                    _notify_new_cluster(
-                        symbol, token_address, cl, current,
-                        total_supply_tokens=all_supplies.get(symbol, 0.0),
-                        price_ctx=all_price_ctx.get(symbol),
-                        wallet_deltas=all_preview_deltas.get(symbol, {}),
-                    )
-                    _mark_cluster_alerted(cid)
+                    _pending_cluster_alerts.append((symbol, token_address, cl, current))
         except Exception as exc:
             log.warning("Relationship detection failed for %s: %s", symbol, exc)
 
@@ -1903,6 +1891,24 @@ def run_holder_monitor() -> None:
 
         save_snapshot(symbol, current)
         log.info("  Snapshot saved → snapshots/%s_holders.json", symbol)
+
+    # Fire cluster alerts deferred from cluster detection — use actual Pass 2 deltas
+    for sym, tok_addr, cl, holders in _pending_cluster_alerts:
+        cid          = cl.get("cluster_id", "")
+        cluster_wals = cl.get("wallets", [])
+        run_chg      = all_run_changes.get(sym, [])
+        moved_addrs  = {c["address"] for c in run_chg}
+        wallet_deltas_map = {c["address"]: c.get("delta", 0.0) for c in run_chg}
+        if not any(w in moved_addrs for w in cluster_wals):
+            log.info("Cluster %s — no member movement this run, suppressing alert", cid)
+            continue
+        _notify_new_cluster(
+            sym, tok_addr, cl, holders,
+            total_supply_tokens=all_supplies.get(sym, 0.0),
+            price_ctx=all_price_ctx.get(sym),
+            wallet_deltas=wallet_deltas_map,
+        )
+        _mark_cluster_alerted(cid)
 
     detect_coordinated_moves(all_run_changes, all_addresses, all_price_ctx)
     send_cross_coin_digest(cross_holdings, all_price_ctx, token_emojis)
