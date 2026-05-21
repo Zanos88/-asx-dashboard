@@ -1894,14 +1894,9 @@ def run_holder_monitor() -> None:
 
     # Fire cluster alerts deferred from cluster detection — use actual Pass 2 deltas
     for sym, tok_addr, cl, holders in _pending_cluster_alerts:
-        cid          = cl.get("cluster_id", "")
-        cluster_wals = cl.get("wallets", [])
-        run_chg      = all_run_changes.get(sym, [])
-        moved_addrs  = {c["address"] for c in run_chg}
+        cid               = cl.get("cluster_id", "")
+        run_chg           = all_run_changes.get(sym, [])
         wallet_deltas_map = {c["address"]: c.get("delta", 0.0) for c in run_chg}
-        if not any(w in moved_addrs for w in cluster_wals):
-            log.info("Cluster %s — no member movement this run, suppressing alert", cid)
-            continue
         _notify_new_cluster(
             sym, tok_addr, cl, holders,
             total_supply_tokens=all_supplies.get(sym, 0.0),
