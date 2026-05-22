@@ -1070,6 +1070,8 @@ def _notify_new_cluster(
             millions = amt / 1_000_000
             if millions >= 1 and abs(millions - round(millions)) < 0.001:
                 round_set.add(addr)
+        wallets = [w for w in wallets if supply_map.get(w, 0.0) > 0]
+        n = len(wallets)
 
         # In-memory deltas from current run's snapshot comparison (no DB query)
         deltas    = wallet_deltas or {}
@@ -1168,7 +1170,7 @@ def _is_cluster_already_alerted(cluster_id: str) -> bool:
         r = _supabase.table("bot_config").select("value,updated_at").eq("key", key).execute()
         if not r.data:
             return False
-        updated = (r.data[0].get("updated_at") or "").replace("Z", "+00:00")
+        updated = (r.data[0].get("value") or "").replace("Z", "+00:00")
         last = datetime.fromisoformat(updated)
         return (datetime.now(timezone.utc) - last).total_seconds() < 86400
     except Exception:
