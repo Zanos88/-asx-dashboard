@@ -11,11 +11,12 @@ import json
 import logging
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import monitor as _monitor_mod
 from monitor import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -558,18 +559,98 @@ async def cmd_clusters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _bundle_token_report(update: Update, symbol: str) -> None:
+    """On-demand cluster/bundle report for a token with last-movement data."""
+    cfg    = _load_config()
+    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    if symbol not in tokens:
+        await update.message.reply_text(f"❌ Unknown token: {symbol}")
+        return
+    token_address = tokens[symbol]
+    snap          = load_snapshot(symbol)
+    holders       = (snap or {}).get("holders", [])
+    total         = sum(get_amount(h) for h in holders) or 1.0
+    supply_map    = {h["address"]: get_amount(h) / total * 100 for h in holders}
+
+    loop     = asyncio.get_running_loop()
+    clusters = await loop.run_in_executor(
+        None, get_wallet_clusters_for_token, token_address, _supabase
+    )
+    if not clusters:
+        await update.message.reply_text(f"No clusters detected for {symbol}.")
+        return
+
+    for cl in clusters[:3]:
+        risk    = cl.get("risk_level", "?")
+        cid     = cl.get("cluster_id", "")
+        method  = cl.get("detection_method", "?")
+        pct     = cl.get("total_supply_pct") or 0
+        wallets = [w for w in cl.get("wallets", []) if supply_map.get(w, 0.0) > 0]
+        n       = len(wallets)
+        icon    = "🔴" if risk == "HIGH_RISK" else "🟡"
+
+        lines = [
+            f"📦 <b>BUNDLE REPORT — {symbol}</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"{icon} {risk} | {method} | {pct:.2f}% supply | {n} wallets",
+            "",
+            "Top holders (excl. LP):",
+        ]
+        now_utc = datetime.now(timezone.utc)
+        for rank, w in enumerate(wallets[:20], 1):
+            wpct      = supply_map.get(w, 0.0)
+            raw_m     = wpct / 100 * total / 1e6
+            last_move = None
+            if _supabase:
+                try:
+                    r = (_supabase.table("whale_alerts")
+                         .select("alerted_at,delta_pct")
+                         .eq("wallet_address", w).eq("token_symbol", symbol)
+                         .order("alerted_at", desc=True).limit(1).execute())
+                    if r.data:
+                        ts  = r.data[0]["alerted_at"].replace("Z", "+00:00")
+                        ldt = datetime.fromisoformat(ts)
+                        ldt = ldt if ldt.tzinfo else ldt.replace(tzinfo=timezone.utc)
+                        days_ago  = (now_utc - ldt).days
+                        dpct      = r.data[0].get("delta_pct", 0) or 0
+                        sign      = "🟢" if dpct > 0 else "🔴"
+                        dormant   = " ⚠️ DORMANT" if days_ago > 30 else ""
+                        last_move = f"Last move: {days_ago}d ago ({dpct:+.3f}% {sign}){dormant}"
+                except Exception:
+                    pass
+            lines.append(
+                f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — {wpct:.2f}% ({raw_m:.1f}M)\n"
+                f"       {last_move or 'No recorded moves'}\n"
+                f"       📋 <code>{w}</code>"
+            )
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f'<a href="https://dexscreener.com/solana/{token_address}">DexScreener</a>'
+            f' | <a href="https://app.bubblemaps.io/sol/token/{token_address}">Bubblemaps</a>',
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+        )
+
+
 async def cmd_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check if a specific wallet is in any bundle/cluster."""
+    """Token cluster report (/bundle SYMBOL) or wallet lookup (/bundle <WALLET_ADDRESS>)."""
     if not _authorized(update):
         await _deny(update)
         return
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /bundle &lt;WALLET_ADDRESS&gt;", parse_mode="HTML"
-        )
+        cfg    = _load_config()
+        tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+        for sym in tokens:
+            await _bundle_token_report(update, sym)
         return
 
-    wallet = context.args[0].strip()
+    arg = context.args[0].strip()
+    if len(arg) <= 12:
+        await _bundle_token_report(update, arg.upper())
+        return
+
+    wallet = arg
     if len(wallet) < 32 or len(wallet) > 44:
         await update.message.reply_text("❌ Invalid Solana address.")
         return
@@ -958,6 +1039,120 @@ async def cmd_checkbundles(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
 
+def _time_ago(dt: datetime) -> str:
+    diff = datetime.now(timezone.utc) - dt
+    d, s = diff.days, int(diff.total_seconds())
+    if d >= 1:  return f"{d}d ago"
+    if s >= 3600: return f"{s // 3600}h ago"
+    return f"{s // 60}m ago"
+
+
+async def cmd_moves(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all wallet movements in the last 24h for a token."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    cfg    = _load_config()
+    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    symbol = context.args[0].upper() if context.args else None
+    syms   = [symbol] if symbol and symbol in tokens else list(tokens.keys())
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    for sym in syms:
+        if not _supabase:
+            await update.message.reply_text("❌ Supabase not configured.")
+            return
+        try:
+            r = (_supabase.table("whale_alerts")
+                 .select("wallet_address,change_type,delta_pct,alerted_at")
+                 .eq("token_symbol", sym)
+                 .gt("alerted_at", cutoff)
+                 .order("alerted_at", desc=True)
+                 .execute())
+        except Exception as exc:
+            await update.message.reply_text(f"❌ DB error: {exc}")
+            return
+        if not r.data:
+            await update.message.reply_text(f"No movements above threshold in 24h for {sym}.")
+            continue
+        lines = [f"📊 <b>{sym} — Movements (24h)</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for row in r.data:
+            addr = row["wallet_address"]
+            dt   = datetime.fromisoformat(row["alerted_at"].replace("Z", "+00:00"))
+            dpct = row.get("delta_pct") or 0
+            sign = "🟢" if dpct > 0 else "🔴"
+            lines.append(
+                f"{sign} {row['change_type']} {dpct:+.3f}% — "
+                f"<code>{addr[:6]}…{addr[-4:]}</code> ({_time_ago(dt)})"
+            )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+        )
+
+
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show top 20 holders with last-movement date and dormancy flags."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    cfg    = _load_config()
+    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    symbol = context.args[0].upper() if context.args else None
+    syms   = [symbol] if symbol and symbol in tokens else list(tokens.keys())
+    for sym in syms:
+        snap    = load_snapshot(sym)
+        holders = (snap or {}).get("holders", [])
+        if not holders:
+            await update.message.reply_text(f"No snapshot for {sym}.")
+            continue
+        total = sum(get_amount(h) for h in holders) or 1.0
+        now   = datetime.now(timezone.utc)
+        lines = [f"🏆 <b>{sym} — Top 20 Holders</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        for rank, h in enumerate(holders[:20], 1):
+            addr = h.get("address", "")
+            wpct = get_amount(h) / total * 100
+            flag = ""
+            if _supabase and addr:
+                try:
+                    r = (_supabase.table("whale_alerts")
+                         .select("alerted_at")
+                         .eq("wallet_address", addr).eq("token_symbol", sym)
+                         .order("alerted_at", desc=True).limit(1).execute())
+                    if r.data:
+                        ldt  = datetime.fromisoformat(r.data[0]["alerted_at"].replace("Z", "+00:00"))
+                        ldt  = ldt if ldt.tzinfo else ldt.replace(tzinfo=timezone.utc)
+                        days = (now - ldt).days
+                        if days < 1:   flag = f"🔥 Active ({_time_ago(ldt)})"
+                        elif days > 30: flag = f"⚠️ Dormant ({days}d)"
+                        else:           flag = f"Last: {days}d ago"
+                    else:
+                        flag = "No recorded moves"
+                except Exception:
+                    pass
+            lines.append(f"#{rank:>2}  <code>{addr[:6]}…{addr[-4:]}</code>  {wpct:.2f}%  {flag}")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+        )
+
+
+async def cmd_alert_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mute or unmute all automatic alerts. Owner only. Usage: /alert on|off"""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    owner_id = int(os.environ.get("OWNER_USER_ID", "0"))
+    if owner_id and update.effective_user and update.effective_user.id != owner_id:
+        await update.message.reply_text("❌ Owner only command.")
+        return
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text("Usage: /alert on|off")
+        return
+    muting = context.args[0].lower() == "off"
+    update_bot_config("alerts_muted", "true" if muting else "false")
+    _monitor_mod.ALERTS_MUTED = muting
+    state = "🔇 MUTED" if muting else "🔔 ACTIVE"
+    await update.message.reply_text(f"Alerts: {state}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -983,6 +1178,9 @@ def main() -> None:
     app.add_handler(CommandHandler("classify",      cmd_classify))
     app.add_handler(CommandHandler("related",       cmd_related))
     app.add_handler(CommandHandler("checkbundles",  cmd_checkbundles))
+    app.add_handler(CommandHandler("moves",         cmd_moves))
+    app.add_handler(CommandHandler("top",           cmd_top))
+    app.add_handler(CommandHandler("alert",         cmd_alert_toggle))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 

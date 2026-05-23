@@ -85,6 +85,7 @@ MIN_HOLDER_CHANGE_TOKENS = float(
 )
 
 PUBLIC_SOLANA_RPC = _cfg.get("helius_fallback_rpc", "https://api.mainnet-beta.solana.com")
+ALERTS_MUTED: bool = False
 
 TOKENS: dict[str, str] = {
     sym: info["address"]
@@ -143,7 +144,7 @@ _supabase: Client | None = init_supabase()
 
 def _load_bot_config_from_supabase() -> None:
     """Override config.json values with live settings written by the Telegram bot."""
-    global MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS, TOKENS
+    global MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS, TOKENS, ALERTS_MUTED
     if _supabase is None:
         return
     try:
@@ -167,6 +168,11 @@ def _load_bot_config_from_supabase() -> None:
                     log.info("bot_config override: tracked_tokens=%s", list(TOKENS.keys()))
             except json.JSONDecodeError:
                 pass
+
+        if "alerts_muted" in cfg:
+            ALERTS_MUTED = cfg["alerts_muted"].strip().lower() == "true"
+            if ALERTS_MUTED:
+                log.info("bot_config override: alerts_muted=True — Telegram alerts suppressed")
     except Exception as exc:
         log.warning("Failed to load bot_config from Supabase: %s", exc)
 
@@ -448,6 +454,9 @@ def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None, *, chat_
 
 def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
     """Send alert to channel when configured, else fall back to owner chat."""
+    if ALERTS_MUTED:
+        log.info("Alerts muted — skipping Telegram send")
+        return True, "muted"
     target = TELEGRAM_CHANNEL_ID or TELEGRAM_CHAT_ID
     if not target:
         return False, "no_targets"
@@ -936,7 +945,7 @@ def get_amount(holder: dict[str, Any]) -> float:
     return float(ui) if ui is not None else float(holder.get("amount", 0))
 
 
-def compare_holders(old_holders: list[dict], new_holders: list[dict]) -> list[dict[str, Any]]:
+def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold: float | None = None) -> list[dict[str, Any]]:
     old_map      = {h["address"]: h for h in old_holders}
     new_map      = {h["address"]: h for h in new_holders}
     old_total    = sum(get_amount(h) for h in old_holders) or 1.0
@@ -976,7 +985,7 @@ def compare_holders(old_holders: list[dict], new_holders: list[dict]) -> list[di
         new_pct     = new_amt / new_total * 100
         delta       = new_pct - old_pct
         token_delta = abs(new_amt - old_amt)
-        pct_trig    = abs(delta) >= MOVE_THRESHOLD_PCT
+        pct_trig    = abs(delta) >= (threshold if threshold is not None else MOVE_THRESHOLD_PCT)
         tok_trig    = MIN_HOLDER_CHANGE_TOKENS > 0 and token_delta >= MIN_HOLDER_CHANGE_TOKENS
         if pct_trig or tok_trig:
             changes.append({
@@ -1035,6 +1044,24 @@ def send_cross_coin_digest(
         log.info("Cross-coin digest sent (%d wallets)", len(multi))
     else:
         log.error("Cross-coin digest failed: %s", err)
+
+
+def _get_wallet_last_moved(addr: str, symbol: str) -> "datetime | None":
+    if not _supabase:
+        return None
+    try:
+        r = (_supabase.table("whale_alerts")
+             .select("alerted_at")
+             .eq("wallet_address", addr)
+             .eq("token_symbol", symbol)
+             .order("alerted_at", desc=True)
+             .limit(1)
+             .execute())
+        if r.data:
+            return datetime.fromisoformat(r.data[0]["alerted_at"].replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
 
 
 def _notify_new_cluster(
@@ -1172,6 +1199,7 @@ def _is_cluster_already_alerted(cluster_id: str) -> bool:
             return False
         updated = (r.data[0].get("value") or "").replace("Z", "+00:00")
         last = datetime.fromisoformat(updated)
+        last = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - last).total_seconds() < 86400
     except Exception:
         return False
@@ -1763,8 +1791,6 @@ def run_holder_monitor() -> None:
     cross_holdings = build_cross_holdings(all_current)
     persist_wallet_relationships(cross_holdings)
 
-    _pending_cluster_alerts: list[tuple[str, str, dict, list]] = []
-
     # Run relationship detection + cluster building for each tracked token
     _all_clusters: dict[str, list[dict[str, Any]]] = {}
     for symbol, current in all_current.items():
@@ -1782,12 +1808,6 @@ def run_holder_monitor() -> None:
                 total_supply=all_supplies.get(symbol, 0.0),
             )
             _all_clusters[symbol] = clusters
-            # Collect cluster alerts — fire after Pass 2 using actual run deltas
-            for cl in clusters:
-                risk = cl.get("risk_level", "")
-                cid  = cl.get("cluster_id", "")
-                if risk in ("HIGH_RISK", "MEDIUM") and not _is_cluster_already_alerted(cid):
-                    _pending_cluster_alerts.append((symbol, token_address, cl, current))
         except Exception as exc:
             log.warning("Relationship detection failed for %s: %s", symbol, exc)
 
@@ -1812,6 +1832,28 @@ def run_holder_monitor() -> None:
 
             all_run_changes[symbol] = changes
             log.info("  %d change(s) detected", len(changes))
+
+            # Dormant wallet wake: movement ≥0.001% by wallets inactive >7d
+            _alerted_addrs   = {c["address"] for c in changes}
+            _dormant_changes = compare_holders(snapshot["holders"], current, threshold=0.001)
+            for _ch in _dormant_changes:
+                _addr = _ch["address"]
+                if _addr in _alerted_addrs or _ch["type"] != "MOVE":
+                    continue
+                _last = _get_wallet_last_moved(_addr, symbol)
+                _days = (datetime.now(timezone.utc) - _last).days if _last else 999
+                if _days >= 7:
+                    _dmsg = (
+                        f"⚡ <b>DORMANT WALLET ACTIVE — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<code>{_addr}</code>\n"
+                        f"Move: {_ch['delta']:+.4f}%  (MOVE)\n"
+                        f"Last active: {_days} days ago ⚠️\n"
+                        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━"
+                    )
+                    send_alert(_dmsg, reply_markup=make_inline_keyboard(_addr, token_address))
+                    log.info("  Dormant wake: %s %s (inactive %d days)", symbol, _addr[:8], _days)
 
             for change in changes:
                 addr        = change["address"]
@@ -1893,19 +1935,6 @@ def run_holder_monitor() -> None:
 
         save_snapshot(symbol, current)
         log.info("  Snapshot saved → snapshots/%s_holders.json", symbol)
-
-    # Fire cluster alerts deferred from cluster detection — use actual Pass 2 deltas
-    for sym, tok_addr, cl, holders in _pending_cluster_alerts:
-        cid               = cl.get("cluster_id", "")
-        run_chg           = all_run_changes.get(sym, [])
-        wallet_deltas_map = {c["address"]: c.get("delta", 0.0) for c in run_chg}
-        _notify_new_cluster(
-            sym, tok_addr, cl, holders,
-            total_supply_tokens=all_supplies.get(sym, 0.0),
-            price_ctx=all_price_ctx.get(sym),
-            wallet_deltas=wallet_deltas_map,
-        )
-        _mark_cluster_alerted(cid)
 
     detect_coordinated_moves(all_run_changes, all_addresses, all_price_ctx)
     send_cross_coin_digest(cross_holdings, all_price_ctx, token_emojis)
