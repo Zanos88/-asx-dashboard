@@ -56,6 +56,27 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+BOTFATHER_COMMANDS = """\
+ping - Check bot is alive
+status - Config & connection status
+run - Trigger a full monitor run immediately
+alert - Mute or unmute all automatic alerts
+snapshot - Latest saved snapshot for all tokens
+holders - Live top-10 holders from Helius
+top - Full top-20 with activity status
+moves - Wallet movements in last 24h
+bundle - Cluster report for token OR wallet lookup
+clusters - All detected wallet clusters
+relationships - Full wallet relationship graph
+classify - Classify address: wallet, LP pool, or program
+topwallets - Rank wallets by win rate
+addtoken - Start tracking a token
+removetoken - Stop tracking a token
+threshold - Set move alert threshold
+movethreshold - Alias for threshold
+testalert - Fire a synthetic alert to verify pipeline
+related - External token holdings for top wallets"""
+
 def _parse_chat_ids(raw: str) -> set[int]:
     return {int(cid.strip()) for cid in raw.split(",") if cid.strip().lstrip("-").isdigit()}
 
@@ -118,23 +139,37 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update)
         return
     await update.message.reply_text(
-        "📋 <b>Commands</b>\n\n"
+        "<b>📋 Bot Commands</b>\n\n"
+
+        "<b>🔍 MONITORING</b>\n"
         "/ping — Check bot is alive\n"
         "/status — Config &amp; connection status\n"
-        "/snapshot — Latest saved snapshot for all tokens\n"
-        "/holders &lt;SYMBOL&gt; — Fetch live top-10 holders\n"
-        "/related — External token holdings for top wallets\n"
-        "/run — Trigger a full monitor run immediately\n"
-        "/testalert [SYMBOL] — Fire a synthetic alert to verify the pipeline\n"
-        "/topwallets [TOKEN] — Rank top wallets by meme win rate\n"
-        "/clusters [SYMBOL] — Show detected wallet clusters &amp; bundles\n"
-        "/bundle &lt;WALLET&gt; — Check if wallet is in a bundle/cluster\n"
+        "/run — Trigger a full monitor run now\n"
+        "/alert on|off — Mute/unmute automatic alerts (owner)\n\n"
+
+        "<b>📊 PORTFOLIO</b>\n"
+        "/snapshot — Latest saved snapshot (all tokens)\n"
+        "/holders &lt;SYMBOL&gt; — Live top-10 holders\n"
+        "/top [SYMBOL] — Top 20 holders with dormancy flags\n"
+        "/moves [SYMBOL] — Wallet movements in last 24h\n\n"
+
+        "<b>🔬 INTELLIGENCE</b>\n"
+        "/bundle [SYMBOL|WALLET] — Token cluster report or wallet lookup\n"
+        "/clusters [SYMBOL] — Detected wallet clusters\n"
         "/relationships [SYMBOL] — Full wallet relationship graph\n"
-        "/classify &lt;ADDRESS&gt; — Check if an address is a wallet, LP pool, or program\n"
+        "/classify &lt;ADDRESS&gt; — Wallet / LP pool / program check\n"
+        "/topwallets [TOKEN] — Rank wallets by meme win rate\n"
+        "/related — External token holdings for top wallets\n"
+        "/checkbundles [SYMBOL] — Round-number &amp; identical-balance detection\n\n"
+
+        "<b>⚙️ CONFIG</b>\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
         "/removetoken &lt;SYMBOL&gt; — Stop tracking a token\n"
         "/threshold &lt;PCT&gt; — Set move alert threshold (e.g. 0.01)\n"
-        "/movethreshold &lt;PCT&gt; — Alias for /threshold\n",
+        "/movethreshold &lt;PCT&gt; — Alias for /threshold\n\n"
+
+        "<b>🧪 TESTING</b>\n"
+        "/testalert [SYMBOL] — Fire a synthetic alert to test the pipeline",
         parse_mode="HTML",
     )
 
@@ -1159,6 +1194,7 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    log.info("BotFather commands:\n%s", BOTFATHER_COMMANDS)
     app.add_handler(CommandHandler("ping",          cmd_ping))
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_help))
