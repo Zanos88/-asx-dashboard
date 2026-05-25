@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-05-25T06:24:43.982229+00:00",
+  "timestamp": "2026-05-25T10:56:14.535029+00:00",
   "holders": [
     {
       "address": "D5aivThejtD9Fc7sGC3VfovfCe3VvVtpogTpvbrnEW4j",
@@ -83,10 +83,10 @@
     },
     {
       "address": "4WxfHh4LYaiyT9NcJidKGXYm6eagHjBAib5GP518T1TP",
-      "uiAmount": 12253537.753315,
+      "uiAmount": 12235161.090246,
       "decimals": 6,
-      "amount": "12253537753315",
-      "uiAmountString": "12253537.753315",
+      "amount": "12235161090246",
+      "uiAmountString": "12235161.090246",
       "token_account": "4WxfHh4LYaiyT9NcJidKGXYm6eagHjBAib5GP518T1TP"
     },
     {
