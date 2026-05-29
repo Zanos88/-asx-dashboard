@@ -153,10 +153,16 @@ def _get_signatures(
     req_counter: list[int],
     verbose: bool = False,
 ) -> list[str]:
+    import json as _json
+
     cutoff = time.time() - days * 86400
+    cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d")
+    log.info("  _get_signatures: wallet=%s cutoff=%s (%d days ago)", wallet[:12], cutoff_dt, days)
+
     sigs: list[str] = []
     before: str | None = None
     label = f"{wallet[:8]}…{wallet[-4:]}"
+    first_page = True
 
     while True:
         params: dict[str, Any] = {"limit": 1000}
@@ -174,18 +180,37 @@ def _get_signatures(
             label,
             req_counter[0],
         )
+
+        if first_page:
+            log.info(
+                "  [RAW first page] %s",
+                _json.dumps(result)[:800] if result is not None else "None",
+            )
+            first_page = False
+
         if not result:
+            log.warning("  _get_signatures: rpc_call returned None for %s", label)
+            break
+
+        if result.get("error"):
+            log.warning(
+                "  _get_signatures: RPC error for %s: %s", label, result["error"]
+            )
             break
 
         page = result.get("result") or []
         if not page:
+            log.info(
+                "  _get_signatures: empty page for %s — no transactions in window", label
+            )
             break
 
         for entry in page:
             block_time = entry.get("blockTime") or 0
             if block_time and block_time < cutoff:
-                if verbose:
-                    log.info("  Reached cutoff (%d days) for %s", days, label)
+                log.info(
+                    "  Reached cutoff (%s) for %s after %d sigs", cutoff_dt, label, len(sigs)
+                )
                 return sigs
             sig = entry.get("signature")
             if sig:
@@ -194,8 +219,7 @@ def _get_signatures(
         if len(page) < 1000:
             break
 
-    if verbose:
-        log.info("  %s: %d signatures collected", label, len(sigs))
+    log.info("  %s: %d signatures collected", label, len(sigs))
     return sigs
 
 
