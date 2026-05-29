@@ -534,17 +534,32 @@ def scan_cluster(
     transfers: list[dict] = []
     sig_list = list(all_sigs)
     for idx, sig in enumerate(sig_list, 1):
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         if verbose:
             log.info("  Fetching tx %d/%d: %s…", idx, len(sig_list), sig[:16])
+        if test_mode and progress_cb:
+            progress_cb(f"[{ts}] Checking sig {idx}/{len(sig_list)} | fetching tx…")
         tx = _get_transaction(sig, limiter, req_counter, verbose=verbose)
         if not tx:
+            if test_mode and progress_cb:
+                progress_cb(f"[{ts}] Sig {idx} — tx not found or error")
             continue
         found = _detect_sol_transfers(tx, wallet_set)
         if found:
             log.info("  ✅ SOL transfer found in tx %s…: %s", sig[:12], found)
+            for t in found:
+                if test_mode and progress_cb:
+                    progress_cb(
+                        f"[{ts}] Sig {idx} — SOL moved: "
+                        f"{_short(t['from_wallet'])} → {_short(t['to_wallet'])} "
+                        f"{t['sol']:.4f} SOL"
+                    )
             transfers.extend(found)
-        elif verbose:
-            log.info("  tx %s… — no cluster SOL transfer", sig[:12])
+        else:
+            if verbose:
+                log.info("  tx %s… — no cluster SOL transfer", sig[:12])
+            if test_mode and progress_cb:
+                progress_cb(f"[{ts}] Sig {idx} — no cluster transfer found")
 
     log.info("Phase 2 complete: %d SOL transfers found", len(transfers))
 
@@ -561,6 +576,12 @@ def scan_cluster(
                 f"| {t['sol']:.4f} SOL | {t['sig'][:16]}…"
             )
         print("=" * 60)
+        if progress_cb:
+            if transfers:
+                unique_transfers = list({t["sig"]: t for t in transfers}.values())
+                progress_cb(_fmt_confirmed(symbol, cluster_id, len(wallets), supply_pct, unique_transfers))
+            else:
+                progress_cb(_fmt_no_transfers(symbol, cluster_id, len(wallets), supply_pct))
         return {
             "cluster_id":   cluster_id,
             "wallet_count": len(wallets),
