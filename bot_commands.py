@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -75,7 +76,9 @@ removetoken - Stop tracking a token
 threshold - Set move alert threshold
 movethreshold - Alias for threshold
 testalert - Fire a synthetic alert to verify pipeline
-related - External token holdings for top wallets"""
+related - External token holdings for top wallets
+scancluster - On-chain SOL transfer scan for a token's bundle cluster
+scantest - Test inter-transfer scan (2 wallets, 30 days, no DB write)"""
 
 def _parse_chat_ids(raw: str) -> set[int]:
     return {int(cid.strip()) for cid in raw.split(",") if cid.strip().lstrip("-").isdigit()}
@@ -594,6 +597,27 @@ async def cmd_clusters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _cluster_confirmation_status(wallets: list[str], supabase: Any) -> str:
+    """Check wallet_relationships to determine inter-transfer confirmation status."""
+    if not supabase or not wallets:
+        return "❓ UNSCANNED — no detection run yet"
+    try:
+        r = (
+            supabase.table("wallet_relationships")
+            .select("relationship_type")
+            .in_("wallet_a", wallets[:20])
+            .execute()
+        )
+        types = {row["relationship_type"] for row in (r.data or [])}
+        if "INTER_TRANSFER" in types:
+            return "✅ ON-CHAIN CONFIRMED — INTER_TRANSFER proven (confidence 95)"
+        if types:
+            return "⏳ TIMING ONLY — TEMPORAL_CLUSTER, not yet scanned"
+        return "❓ UNSCANNED — no detection run yet"
+    except Exception:
+        return "❓ UNSCANNED"
+
+
 async def _bundle_token_report(update: Update, symbol: str) -> None:
     """On-demand cluster/bundle report for a token with last-movement data."""
     cfg    = _load_config()
@@ -623,11 +647,13 @@ async def _bundle_token_report(update: Update, symbol: str) -> None:
         wallets = [w for w in cl.get("wallets", []) if supply_map.get(w, 0.0) > 0]
         n       = len(wallets)
         icon    = "🔴" if risk == "HIGH_RISK" else "🟡"
+        status  = _cluster_confirmation_status(wallets, _supabase)
 
         lines = [
             f"📦 <b>BUNDLE REPORT — {symbol}</b>",
             "━━━━━━━━━━━━━━━━━━━━━━",
             f"{icon} {risk} | {method} | {pct:.2f}% supply | {n} wallets",
+            f"🔍 {status}",
             "",
             "Top holders (excl. LP):",
         ]
@@ -1188,6 +1214,142 @@ async def cmd_alert_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(f"Alerts: {state}")
 
 
+# ── Inter-transfer scan commands ─────────────────────────────────────────────
+
+def _run_scan_with_progress(
+    loop: asyncio.AbstractEventLoop,
+    chat_id: int,
+    app: Any,
+    symbol: str,
+    test_mode: bool,
+) -> None:
+    """Runs in executor thread. Sends Telegram progress updates every 10 wallets."""
+    import inter_transfer_detector as itd
+
+    def progress_cb(msg: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=msg),
+            loop,
+        )
+
+    cfg       = _load_config()
+    tokens    = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    token_addr = tokens.get(symbol.upper(), "")
+    sb         = _supabase
+
+    if not sb:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text="❌ Supabase not configured."),
+            loop,
+        )
+        return
+
+    try:
+        r = (
+            sb.table("wallet_clusters")
+            .select("cluster_id")
+            .eq("token_address", token_addr)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as exc:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=f"❌ DB error: {exc}"),
+            loop,
+        )
+        return
+
+    if not rows:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(
+                chat_id=chat_id,
+                text=f"No clusters found for {symbol}. Run /run first.",
+            ),
+            loop,
+        )
+        return
+
+    cluster_id = rows[0]["cluster_id"]
+    asyncio.run_coroutine_threadsafe(
+        app.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ Starting {'test ' if test_mode else ''}scan for cluster <code>{cluster_id}</code>…",
+            parse_mode="HTML",
+        ),
+        loop,
+    )
+
+    result = itd.scan_cluster(
+        cluster_id,
+        symbol=symbol.upper(),
+        test_mode=test_mode,
+        dry_run=test_mode,
+        progress_cb=progress_cb,
+        supabase=sb,
+    )
+
+    n_transfers = len(result.get("transfers") or [])
+    n_sigs      = result.get("sig_count", 0)
+    n_wallets   = result.get("wallet_count", 0)
+    summary = (
+        f"✅ Scan complete — {cluster_id}\n"
+        f"Wallets: {n_wallets} | Sigs checked: {n_sigs} | Transfers found: {n_transfers}"
+    )
+    if test_mode:
+        summary = f"[TEST MODE — no DB written]\n{summary}"
+    asyncio.run_coroutine_threadsafe(
+        app.bot.send_message(chat_id=chat_id, text=summary),
+        loop,
+    )
+
+
+async def cmd_scancluster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Trigger on-chain SOL inter-transfer scan for a token's cluster. Admin only."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    cfg    = _load_config()
+    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    sym    = (context.args[0].upper() if context.args else None) or next(iter(tokens), None)
+    if not sym or sym not in tokens:
+        known = ", ".join(tokens) or "none"
+        await update.message.reply_text(f"Usage: /scancluster [SYMBOL]\nTracked: {known}")
+        return
+    await update.message.reply_text(
+        f"🔍 Queuing inter-transfer scan for <b>{sym}</b>…\n"
+        "This may take several minutes (5 req/min rate limit). "
+        "Progress updates will appear here.",
+        parse_mode="HTML",
+    )
+    loop = asyncio.get_running_loop()
+    app  = context.application
+    chat_id = update.effective_chat.id
+    loop.run_in_executor(None, _run_scan_with_progress, loop, chat_id, app, sym, False)
+
+
+async def cmd_scantest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Test inter-transfer scan (2 wallets, 30 days, no DB write). Admin only."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    cfg    = _load_config()
+    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    sym    = (context.args[0].upper() if context.args else None) or next(iter(tokens), None)
+    if not sym or sym not in tokens:
+        known = ", ".join(tokens) or "none"
+        await update.message.reply_text(f"Usage: /scantest [SYMBOL]\nTracked: {known}")
+        return
+    await update.message.reply_text(
+        f"🧪 Running TEST scan for <b>{sym}</b> (2 wallets, 30 days, no DB write)…",
+        parse_mode="HTML",
+    )
+    loop = asyncio.get_running_loop()
+    app  = context.application
+    chat_id = update.effective_chat.id
+    loop.run_in_executor(None, _run_scan_with_progress, loop, chat_id, app, sym, True)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1217,6 +1379,8 @@ def main() -> None:
     app.add_handler(CommandHandler("moves",         cmd_moves))
     app.add_handler(CommandHandler("top",           cmd_top))
     app.add_handler(CommandHandler("alert",         cmd_alert_toggle))
+    app.add_handler(CommandHandler("scancluster",   cmd_scancluster))
+    app.add_handler(CommandHandler("scantest",      cmd_scantest))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
