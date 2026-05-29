@@ -1228,7 +1228,7 @@ def _run_scan_with_progress(
 
     def progress_cb(msg: str) -> None:
         asyncio.run_coroutine_threadsafe(
-            app.bot.send_message(chat_id=chat_id, text=msg),
+            app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML"),
             loop,
         )
 

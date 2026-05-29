@@ -152,6 +152,7 @@ def _get_signatures(
     limiter: RateLimiter,
     req_counter: list[int],
     verbose: bool = False,
+    diag: dict | None = None,
 ) -> list[str]:
     import json as _json
 
@@ -182,20 +183,25 @@ def _get_signatures(
         )
 
         if first_page:
-            log.info(
-                "  [RAW first page] %s",
-                _json.dumps(result)[:800] if result is not None else "None",
-            )
+            raw_snippet = _json.dumps(result)[:800] if result is not None else "None"
+            log.info("  [RAW first page] %s", raw_snippet)
             first_page = False
+
+            if diag is not None:
+                diag["raw_snippet"] = raw_snippet
+                diag["cutoff_dt"]   = cutoff_dt
 
         if not result:
             log.warning("  _get_signatures: rpc_call returned None for %s", label)
+            if diag is not None:
+                diag["outcome"] = "rpc_call returned None (network/HTTP error after retries)"
             break
 
         if result.get("error"):
-            log.warning(
-                "  _get_signatures: RPC error for %s: %s", label, result["error"]
-            )
+            err = result["error"]
+            log.warning("  _get_signatures: RPC error for %s: %s", label, err)
+            if diag is not None:
+                diag["outcome"] = f"RPC error: {err}"
             break
 
         page = result.get("result") or []
@@ -203,6 +209,8 @@ def _get_signatures(
             log.info(
                 "  _get_signatures: empty page for %s — no transactions in window", label
             )
+            if diag is not None:
+                diag["outcome"] = "empty page — wallet has no transactions in this window"
             break
 
         for entry in page:
@@ -211,6 +219,8 @@ def _get_signatures(
                 log.info(
                     "  Reached cutoff (%s) for %s after %d sigs", cutoff_dt, label, len(sigs)
                 )
+                if diag is not None:
+                    diag["outcome"] = f"hit cutoff {cutoff_dt} after {len(sigs)} sigs"
                 return sigs
             sig = entry.get("signature")
             if sig:
@@ -219,6 +229,8 @@ def _get_signatures(
         if len(page) < 1000:
             break
 
+    if diag is not None and "outcome" not in diag:
+        diag["outcome"] = f"collected {len(sigs)} sigs across all pages"
     log.info("  %s: %d signatures collected", label, len(sigs))
     return sigs
 
@@ -465,9 +477,20 @@ def scan_cluster(
             progress_cb(f"🔍 Scanning wallet {idx}/{len(wallets)}…")
         label = f"{wallet[:8]}…{wallet[-4:]}"
         log.info("  [%d/%d] collecting sigs for %s", idx, len(wallets), label)
-        sigs = _get_signatures(wallet, days, limiter, req_counter, verbose=verbose)
+        diag: dict[str, Any] = {}
+        sigs = _get_signatures(wallet, days, limiter, req_counter, verbose=verbose, diag=diag)
         all_sigs.update(sigs)
         log.info("  %s: %d sigs → total unique so far: %d", label, len(sigs), len(all_sigs))
+        if test_mode and progress_cb:
+            outcome  = diag.get("outcome", "unknown")
+            raw      = diag.get("raw_snippet", "")[:200]
+            cutoff   = diag.get("cutoff_dt", "?")
+            progress_cb(
+                f"🔬 Wallet {idx}/{len(wallets)}: <code>{label}</code>\n"
+                f"Cutoff: {cutoff} | Sigs: {len(sigs)}\n"
+                f"Outcome: {outcome}\n"
+                f"Raw: <code>{raw}</code>"
+            )
 
     log.info("Phase 1 complete: %d unique signatures across %d wallets", len(all_sigs), len(wallets))
 
