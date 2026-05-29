@@ -148,71 +148,84 @@ class RateLimiter:
 
 def _get_signatures(
     wallet: str,
-    days: int,
+    days: int | None,
     limiter: RateLimiter,
     req_counter: list[int],
     verbose: bool = False,
     diag: dict | None = None,
 ) -> list[str]:
+    """
+    Fetch transaction signatures for a wallet.
+    days=None → no date cutoff, single page of 1000 (test mode).
+    days=N    → paginate until blockTime older than N days ago.
+    """
     import json as _json
 
-    cutoff = time.time() - days * 86400
-    cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d")
-    log.info("  _get_signatures: wallet=%s cutoff=%s (%d days ago)", wallet[:12], cutoff_dt, days)
+    if days is not None:
+        cutoff    = time.time() - days * 86400
+        cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d")
+        log.info(
+            "  _get_signatures: wallet=%s cutoff=%s (%d days ago)", wallet[:12], cutoff_dt, days
+        )
+    else:
+        cutoff    = None
+        cutoff_dt = "none (test — latest 1000 only)"
+        log.info("  _get_signatures: wallet=%s no cutoff (test mode)", wallet[:12])
 
     sigs: list[str] = []
-    before: str | None = None
     label = f"{wallet[:8]}…{wallet[-4:]}"
     first_page = True
 
+    # In test mode (no cutoff) fetch exactly one page of 1000 — no pagination needed.
+    req_counter[0] += 1
+    result = limiter.rpc_call(
+        {
+            "jsonrpc": "2.0",
+            "id": req_counter[0],
+            "method": "getSignaturesForAddress",
+            "params": [wallet, {"limit": 1000}],
+        },
+        label,
+        req_counter[0],
+    )
+
+    raw_snippet = _json.dumps(result)[:800] if result is not None else "None"
+    log.info("  [RAW first page] %s", raw_snippet)
+    if diag is not None:
+        diag["raw_snippet"] = raw_snippet
+        diag["cutoff_dt"]   = cutoff_dt
+
+    if not result:
+        log.warning("  _get_signatures: rpc_call returned None for %s", label)
+        if diag is not None:
+            diag["outcome"] = "rpc_call returned None (network/HTTP error after retries)"
+        return sigs
+
+    if result.get("error"):
+        err = result["error"]
+        log.warning("  _get_signatures: RPC error for %s: %s", label, err)
+        if diag is not None:
+            diag["outcome"] = f"RPC error: {err}"
+        return sigs
+
+    page = result.get("result") or []
+    if not page:
+        log.info("  _get_signatures: empty page for %s", label)
+        if diag is not None:
+            diag["outcome"] = "empty page — wallet has no transactions"
+        return sigs
+
+    if cutoff is None:
+        # Test mode: take all sigs from this single page, no date filtering.
+        sigs = [e["signature"] for e in page if e.get("signature")]
+        if diag is not None:
+            diag["outcome"] = f"test mode — fetched {len(sigs)} sigs (no cutoff, no pagination)"
+        log.info("  %s: %d signatures (test mode)", label, len(sigs))
+        return sigs
+
+    # Paginated mode with date cutoff.
+    before: str | None = None
     while True:
-        params: dict[str, Any] = {"limit": 1000}
-        if before:
-            params["before"] = before
-
-        req_counter[0] += 1
-        result = limiter.rpc_call(
-            {
-                "jsonrpc": "2.0",
-                "id": req_counter[0],
-                "method": "getSignaturesForAddress",
-                "params": [wallet, params],
-            },
-            label,
-            req_counter[0],
-        )
-
-        if first_page:
-            raw_snippet = _json.dumps(result)[:800] if result is not None else "None"
-            log.info("  [RAW first page] %s", raw_snippet)
-            first_page = False
-
-            if diag is not None:
-                diag["raw_snippet"] = raw_snippet
-                diag["cutoff_dt"]   = cutoff_dt
-
-        if not result:
-            log.warning("  _get_signatures: rpc_call returned None for %s", label)
-            if diag is not None:
-                diag["outcome"] = "rpc_call returned None (network/HTTP error after retries)"
-            break
-
-        if result.get("error"):
-            err = result["error"]
-            log.warning("  _get_signatures: RPC error for %s: %s", label, err)
-            if diag is not None:
-                diag["outcome"] = f"RPC error: {err}"
-            break
-
-        page = result.get("result") or []
-        if not page:
-            log.info(
-                "  _get_signatures: empty page for %s — no transactions in window", label
-            )
-            if diag is not None:
-                diag["outcome"] = "empty page — wallet has no transactions in this window"
-            break
-
         for entry in page:
             block_time = entry.get("blockTime") or 0
             if block_time and block_time < cutoff:
@@ -221,12 +234,35 @@ def _get_signatures(
                 )
                 if diag is not None:
                     diag["outcome"] = f"hit cutoff {cutoff_dt} after {len(sigs)} sigs"
+                log.info("  %s: %d signatures collected", label, len(sigs))
                 return sigs
             sig = entry.get("signature")
             if sig:
                 sigs.append(sig)
+
         before = page[-1].get("signature")
         if len(page) < 1000:
+            break
+
+        req_counter[0] += 1
+        result = limiter.rpc_call(
+            {
+                "jsonrpc": "2.0",
+                "id": req_counter[0],
+                "method": "getSignaturesForAddress",
+                "params": [wallet, {"limit": 1000, "before": before}],
+            },
+            label,
+            req_counter[0],
+        )
+        if not result:
+            log.warning("  _get_signatures: rpc_call returned None mid-pagination for %s", label)
+            break
+        if result.get("error"):
+            log.warning("  _get_signatures: RPC error mid-pagination for %s: %s", label, result["error"])
+            break
+        page = result.get("result") or []
+        if not page:
             break
 
     if diag is not None and "outcome" not in diag:
@@ -459,15 +495,15 @@ def scan_cluster(
     supply_pct:    float     = info["total_supply_pct"]
     verbose:       bool      = test_mode
 
-    days          = 30 if test_mode else 180
+    days          = None if test_mode else 180  # None = no cutoff, fetch latest 1000 only
     wallets       = all_wallets[:2] if test_mode else all_wallets
     wallet_set    = set(wallets)
     limiter       = RateLimiter()
     req_counter   = [0]
 
     log.info(
-        "scan_cluster: %s | %d wallets | %d days | test=%s dry_run=%s",
-        cluster_id, len(wallets), days, test_mode, dry_run,
+        "scan_cluster: %s | %d wallets | days=%s | test=%s dry_run=%s",
+        cluster_id, len(wallets), days if days is not None else "no-cutoff", test_mode, dry_run,
     )
 
     # Phase 1: collect all unique signatures
