@@ -1950,6 +1950,7 @@ def run() -> None:
 
 if __name__ == "__main__":
     import argparse
+    import sys
     parser = argparse.ArgumentParser(description="Solana whale monitor")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run all logic but skip Telegram messages and Supabase writes")
@@ -1957,4 +1958,13 @@ if __name__ == "__main__":
     if _args.dry_run:
         DRY_RUN = True
         log.info("DRY RUN — Telegram and Supabase writes disabled")
-    run()
+    try:
+        run()
+    except Exception as _exc:
+        _crash_msg = f"🚨 monitor.py crashed: {_exc}"
+        log.critical(_crash_msg, exc_info=True)
+        try:
+            send_alert(_crash_msg)
+        except Exception:
+            pass
+        sys.exit(1)

@@ -22,10 +22,16 @@ logging.basicConfig(
 )
 
 
+bot_thread: threading.Thread | None = None
+
+
 def _run_bot() -> None:
     from bot_commands import main as bot_main
     log.info("Bot thread starting…")
-    bot_main()
+    try:
+        bot_main()
+    except Exception as exc:
+        log.critical("Bot thread died unexpectedly: %s", exc, exc_info=True)
 
 
 if __name__ == "__main__":
@@ -33,6 +39,7 @@ if __name__ == "__main__":
 
     # Start the Telegram polling loop in a background daemon thread.
     # Daemon=True means it exits automatically when the main thread (uvicorn) stops.
+    # bot_thread is module-level so webhook.py /health can check is_alive().
     bot_thread = threading.Thread(target=_run_bot, name="telegram-bot", daemon=True)
     bot_thread.start()
     log.info("Bot thread started (id=%s)", bot_thread.ident)

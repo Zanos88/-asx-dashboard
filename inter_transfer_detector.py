@@ -495,7 +495,7 @@ def scan_cluster(
     supply_pct:    float     = info["total_supply_pct"]
     verbose:       bool      = test_mode
 
-    days          = None if test_mode else 180  # None = no cutoff, fetch latest 1000 only
+    days          = None if test_mode else 365  # None = no cutoff, fetch latest 1000 only
     wallets       = all_wallets[:2] if test_mode else all_wallets
     wallet_set    = set(wallets)
     limiter       = RateLimiter()

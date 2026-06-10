@@ -325,9 +325,12 @@ def classify_and_filter(
             log.info("🚫 Excluded program account: %s (reason: EXECUTABLE)", owner[:16])
             continue
 
-        # Unresolved token account (no SPL owner found) — keep but flag
+        # Unresolved token account — owner resolution failed; treat as LP/program to be safe
         if ta not in owner_map:
-            log.debug("  LP filter: owner not resolved for %s — keeping", ta[:8])
+            log.warning("  LP filter: owner not resolved for %s — excluding (unresolved)", ta[:8])
+            excluded.append((ta, ta, "UNRESOLVED_OWNER"))
+            lp_amount += amt
+            continue
 
         # Real wallet — replace token account address with owner wallet address
         holder_entry = dict(h)

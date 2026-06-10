@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import subprocess
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -89,6 +91,8 @@ _AUTHORIZED_CHATS: frozenset[int] = frozenset(
 )
 _REPO_DIR = os.path.dirname(os.path.abspath(_CONFIG_PATH))
 _monitor_proc: subprocess.Popen | None = None
+_active_scans: dict[str, float] = {}   # cluster_id → start epoch
+_scan_lock = threading.Lock()
 
 
 # ── Auth + config helpers ─────────────────────────────────────────────────────
@@ -124,6 +128,9 @@ def _persist_config(cfg: dict) -> str:
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     await update.message.reply_text("🟢 Bot online")
 
 
@@ -1271,6 +1278,23 @@ def _run_scan_with_progress(
         return
 
     cluster_id = rows[0]["cluster_id"]
+
+    with _scan_lock:
+        if cluster_id in _active_scans:
+            started = _active_scans[cluster_id]
+            elapsed = int(time.time() - started)
+            m, s = divmod(elapsed, 60)
+            asyncio.run_coroutine_threadsafe(
+                app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ Scan already running for <code>{cluster_id}</code> (started {m}m {s}s ago). Please wait.",
+                    parse_mode="HTML",
+                ),
+                loop,
+            )
+            return
+        _active_scans[cluster_id] = time.time()
+
     asyncio.run_coroutine_threadsafe(
         app.bot.send_message(
             chat_id=chat_id,
@@ -1280,28 +1304,32 @@ def _run_scan_with_progress(
         loop,
     )
 
-    result = itd.scan_cluster(
-        cluster_id,
-        symbol=symbol.upper(),
-        test_mode=test_mode,
-        dry_run=test_mode,
-        progress_cb=progress_cb,
-        supabase=sb,
-    )
+    try:
+        result = itd.scan_cluster(
+            cluster_id,
+            symbol=symbol.upper(),
+            test_mode=test_mode,
+            dry_run=test_mode,
+            progress_cb=progress_cb,
+            supabase=sb,
+        )
 
-    n_transfers = len(result.get("transfers") or [])
-    n_sigs      = result.get("sig_count", 0)
-    n_wallets   = result.get("wallet_count", 0)
-    summary = (
-        f"✅ Scan complete — {cluster_id}\n"
-        f"Wallets: {n_wallets} | Sigs checked: {n_sigs} | Transfers found: {n_transfers}"
-    )
-    if test_mode:
-        summary = f"[TEST MODE — no DB written]\n{summary}"
-    asyncio.run_coroutine_threadsafe(
-        app.bot.send_message(chat_id=chat_id, text=summary),
-        loop,
-    )
+        n_transfers = len(result.get("transfers") or [])
+        n_sigs      = result.get("sig_count", 0)
+        n_wallets   = result.get("wallet_count", 0)
+        summary = (
+            f"✅ Scan complete — {cluster_id}\n"
+            f"Wallets: {n_wallets} | Sigs checked: {n_sigs} | Transfers found: {n_transfers}"
+        )
+        if test_mode:
+            summary = f"[TEST MODE — no DB written]\n{summary}"
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=summary),
+            loop,
+        )
+    finally:
+        with _scan_lock:
+            _active_scans.pop(cluster_id, None)
 
 
 async def cmd_scancluster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

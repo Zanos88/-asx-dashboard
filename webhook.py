@@ -68,7 +68,10 @@ WHALE_THRESHOLD_USD   = float(os.environ.get("WHALE_THRESHOLD_USD", "10000"))
 XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
 SENTIMENT_TOKENS      = [t.strip() for t in os.environ.get("SENTIMENT_TOKENS", "ALON").split(",")]
 SUPABASE_URL          = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY          = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_KEY          = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_SERVICE_KEY", "")
+)
 HELIUS_API_KEY        = os.environ.get("HELIUS_API_KEY", "")
 HELIUS_RPC_URL        = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if os.environ.get("HELIUS_API_KEY") else "https://api.mainnet-beta.solana.com"
 
@@ -755,13 +758,18 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health() -> dict:
-    return {
-        "status": "ok",
+async def health() -> JSONResponse:
+    import main as _main
+    bot_alive = _main.bot_thread is not None and _main.bot_thread.is_alive()
+    payload = {
+        "status": "ok" if bot_alive else "degraded",
+        "bot_thread": "alive" if bot_alive else "dead",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
         "supabase_configured": bool(SUPABASE_URL),
     }
+    status_code = 200 if bot_alive else 503
+    return JSONResponse(payload, status_code=status_code)
 
 
 @app.post("/webhook/helius")
@@ -769,7 +777,10 @@ async def helius_webhook(request: Request) -> JSONResponse:
     body = await request.body()
 
     signature = request.headers.get("authorization", "")
-    if HELIUS_WEBHOOK_SECRET and not verify_helius_signature(body, signature, HELIUS_WEBHOOK_SECRET):
+    if not HELIUS_WEBHOOK_SECRET:
+        log.error("HELIUS_WEBHOOK_SECRET not configured — rejecting webhook POST")
+        raise HTTPException(status_code=401, detail="Webhook auth not configured")
+    if not verify_helius_signature(body, signature, HELIUS_WEBHOOK_SECRET):
         log.warning("Rejected webhook — invalid signature")
         raise HTTPException(status_code=401, detail="Invalid signature")
 

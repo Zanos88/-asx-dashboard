@@ -473,7 +473,10 @@ async def helius_webhook(request: Request) -> JSONResponse:
 
     # Signature check
     signature = request.headers.get("authorization", "")
-    if HELIUS_WEBHOOK_SECRET and not verify_helius_signature(signature, HELIUS_WEBHOOK_SECRET):
+    if not HELIUS_WEBHOOK_SECRET:
+        log.error("HELIUS_WEBHOOK_SECRET not configured — rejecting webhook POST")
+        return JSONResponse({"error": "auth_not_configured"}, status_code=401)
+    if not verify_helius_signature(signature, HELIUS_WEBHOOK_SECRET):
         log.warning("Rejected webhook — invalid auth token")
         return JSONResponse({"error": "invalid_signature"}, status_code=401)
 
