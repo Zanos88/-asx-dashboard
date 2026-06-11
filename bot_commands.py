@@ -11,7 +11,12 @@ import json
 import logging
 import os
 import subprocess
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import requests
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -1535,7 +1540,7 @@ def _check_tx_history(addr: str) -> bool:
     """Returns True if wallet has on-chain tx history (any 1 sig found)."""
     helius_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     try:
-        resp = __import__("requests").post(
+        resp = requests.post(
             helius_rpc,
             json={
                 "jsonrpc": "2.0", "id": 1,
