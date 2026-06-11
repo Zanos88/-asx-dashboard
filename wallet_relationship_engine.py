@@ -720,8 +720,69 @@ def detect_identical_balance_pairs(
     return relationships
 
 
+def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
+    """
+    Write per-tx evidence rows to relationship_evidence for high-confidence detections.
+    Called after wallet_relationships upsert — does not block on failure.
+    """
+    if not supabase:
+        return
+    rows: list[dict] = []
+    for rel in relationships:
+        rel_type = rel.get("relationship_type", "")
+        if rel_type not in ("JITO_BUNDLE", "COMMON_FUNDER", "ROUND_NUMBER_BUNDLE",
+                            "IDENTICAL_BALANCE"):
+            continue
+        wa, wb = rel.get("wallet_a", ""), rel.get("wallet_b", "")
+        if not wa or not wb:
+            continue
+        ev: dict = {}
+        try:
+            ev = json.loads(rel.get("evidence") or "{}")
+        except Exception:
+            pass
+
+        if rel_type == "JITO_BUNDLE":
+            # One evidence row per launch tx signature
+            for sig in (ev.get("launch_txs") or []):
+                rows.append({
+                    "wallet_a":          min(wa, wb),
+                    "wallet_b":          max(wa, wb),
+                    "relationship_type": "JITO_BUNDLE",
+                    "tx_signature":      sig,
+                    "token_address":     rel.get("token_address"),
+                    "raw_json":          {
+                        "bundle_id":       ev.get("bundle_id"),
+                        "bundled_wallets": ev.get("bundled_wallets"),
+                        "detection_note":  ev.get("detection_note"),
+                    },
+                })
+        else:
+            # No tx signature for other types — write one row with raw_json evidence
+            rows.append({
+                "wallet_a":          min(wa, wb),
+                "wallet_b":          max(wa, wb),
+                "relationship_type": rel_type,
+                "tx_signature":      None,
+                "token_address":     rel.get("token_address"),
+                "raw_json":          ev,
+            })
+
+    if not rows:
+        return
+    for i in range(0, len(rows), 50):
+        chunk = rows[i:i + 50]
+        try:
+            supabase.table("relationship_evidence").upsert(
+                chunk,
+                on_conflict="wallet_a,wallet_b,tx_signature",
+            ).execute()
+        except Exception as exc:
+            log.debug("  [relation] evidence write failed (chunk %d): %s", i, exc)
+
+
 def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
-    """Upsert relationship rows; returns count persisted."""
+    """Upsert relationship rows; returns count persisted. Also writes tx-level evidence."""
     if not supabase or not relationships:
         return 0
     saved = 0
@@ -736,6 +797,7 @@ def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
             saved += len(chunk)
         except Exception as exc:
             log.warning("  [relation] upsert_relationships failed (chunk %d): %s", i, exc)
+    _write_evidence_rows(relationships, supabase)
     return saved
 
 
