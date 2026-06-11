@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 import uvicorn
 
@@ -27,11 +28,31 @@ bot_thread: threading.Thread | None = None
 
 def _run_bot() -> None:
     from bot_commands import main as bot_main
-    log.info("Bot thread starting…")
-    try:
-        bot_main()
-    except Exception as exc:
-        log.critical("Bot thread died unexpectedly: %s", exc, exc_info=True)
+    # Retry loop — handles transient Telegram Conflict errors that occur during
+    # Railway blue-green deploys when two instances briefly overlap.
+    attempt = 0
+    while True:
+        attempt += 1
+        log.info("Bot polling attempt %d starting…", attempt)
+        try:
+            bot_main()
+            # bot_main() returned normally (should not happen in production)
+            log.warning("Bot polling loop exited cleanly — restarting in 5s")
+            time.sleep(5)
+        except Exception as exc:
+            msg = str(exc)
+            if "Conflict" in msg or "terminated by other getUpdates" in msg:
+                # Old instance is still alive; wait for it to be killed then retry.
+                wait = min(10 * attempt, 60)
+                log.warning(
+                    "Telegram Conflict detected (two instances overlap) — "
+                    "waiting %ds then retrying (attempt %d)", wait, attempt
+                )
+                time.sleep(wait)
+            else:
+                log.critical("Bot thread crashed: %s", exc, exc_info=True)
+                # Back off before restart to avoid tight crash loops
+                time.sleep(min(15 * attempt, 120))
 
 
 if __name__ == "__main__":

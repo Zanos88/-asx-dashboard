@@ -1852,6 +1852,26 @@ async def cmd_rejections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+# ── Global Telegram error handler ────────────────────────────────────────────
+
+async def _telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Catch-all error handler registered on the Application.
+    Conflict errors (two instances polling simultaneously during Railway blue-green deploy)
+    are logged at WARNING and suppressed — the outer retry loop in main.py handles recovery.
+    All other errors are logged at ERROR.
+    """
+    from telegram.error import Conflict, NetworkError, TimedOut
+    exc = context.error
+    if isinstance(exc, Conflict):
+        log.warning("Telegram Conflict: %s (old instance still running — will resolve shortly)", exc)
+        return  # suppress — outer loop in main.py will restart if needed
+    if isinstance(exc, (NetworkError, TimedOut)):
+        log.warning("Telegram network error (transient): %s", exc)
+        return
+    log.error("Unhandled Telegram error", exc_info=exc)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1889,6 +1909,7 @@ def main() -> None:
     app.add_handler(CommandHandler("evidence",      cmd_evidence))
     app.add_handler(CommandHandler("rejections",     cmd_rejections))
     app.add_handler(CommandHandler("injectevidence", cmd_injectevidence))
+    app.add_error_handler(_telegram_error_handler)
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
