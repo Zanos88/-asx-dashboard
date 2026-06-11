@@ -65,6 +65,11 @@ if __name__ == "__main__":
     bot_thread.start()
     log.info("Bot thread started (id=%s)", bot_thread.ident)
 
+    # Alias __main__ as "main" so that `import main` in webhook.py gets this
+    # module object (where bot_thread was set) rather than a fresh import.
+    import sys
+    sys.modules["main"] = sys.modules["__main__"]
+
     # Run uvicorn in the main thread — Railway health-checks this port.
     log.info("Starting uvicorn on 0.0.0.0:%d", port)
     uvicorn.run(

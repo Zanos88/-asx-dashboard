@@ -759,8 +759,10 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    import main as _main
-    bot_alive = _main.bot_thread is not None and _main.bot_thread.is_alive()
+    import sys
+    _main = sys.modules.get("main") or sys.modules.get("__main__")
+    bot_thread = getattr(_main, "bot_thread", None) if _main else None
+    bot_alive = bot_thread is not None and bot_thread.is_alive()
     payload = {
         "status": "ok" if bot_alive else "degraded",
         "bot_thread": "alive" if bot_alive else "dead",
