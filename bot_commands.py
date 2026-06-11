@@ -175,7 +175,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/classify &lt;ADDRESS&gt; — Wallet / LP pool / program check\n"
         "/topwallets [TOKEN] — Rank wallets by meme win rate\n"
         "/related — External token holdings for top wallets\n"
-        "/checkbundles [SYMBOL] — Round-number &amp; identical-balance detection\n\n"
+        "/checkbundles [SYMBOL] — Round-number &amp; identical-balance detection\n"
+        "/scancluster [SYMBOL] — On-chain SOL transfer scan for cluster\n"
+        "/scantest [SYMBOL] — Test scan (2 wallets, no DB write)\n\n"
 
         "<b>⚙️ CONFIG</b>\n"
         "/addtoken &lt;SYMBOL&gt; &lt;ADDRESS&gt; — Start tracking a token\n"
@@ -191,7 +193,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/tier &lt;ADDR&gt; — Show tier and performance stats\n"
         "/backfill &lt;ADDR&gt; — Re-run swap backfill for a wallet\n"
         "/evidence &lt;ADDR&gt; — On-chain proof for wallet relationships\n"
-        "/rejections — Last 20 toxic-flow filter rejections",
+        "/rejections — Last 20 toxic-flow filter rejections\n"
+        "/injectevidence — Full-history evidence scan for all clusters",
         parse_mode="HTML",
     )
 
