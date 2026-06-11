@@ -81,7 +81,8 @@ addwallet - Track a smart wallet (validates + runs 30d backfill)
 tier - Show tier and stats for a tracked wallet
 backfill - Re-run 30d swap backfill for a wallet
 evidence - Show on-chain proof for a wallet's relationships
-rejections - Last 20 toxic-flow filter rejections"""
+rejections - Last 20 toxic-flow filter rejections
+injectevidence - Full-history evidence scan for all clusters"""
 
 def _parse_chat_ids(raw: str) -> set[int]:
     return {int(cid.strip()) for cid in raw.split(",") if cid.strip().lstrip("-").isdigit()}
@@ -1428,6 +1429,104 @@ def _run_wallet_evidence_scan(
         log.warning("_run_wallet_evidence_scan failed: %s", exc)
 
 
+_inject_lock = threading.Lock()
+_inject_running: bool = False
+
+
+def _run_inject_evidence(
+    loop: asyncio.AbstractEventLoop,
+    chat_id: int,
+    app: Any,
+) -> None:
+    """
+    Runs in executor thread. Scans every cluster with full_history=True,
+    writing per-tx SOL-transfer proof to relationship_evidence.
+    """
+    global _inject_running
+    import inter_transfer_detector as itd
+
+    def _send(msg: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML"),
+            loop,
+        )
+
+    sb = _supabase
+    if not sb:
+        _send("❌ Supabase not configured.")
+        with _inject_lock:
+            _inject_running = False
+        return
+
+    try:
+        r = sb.table("wallet_clusters").select("cluster_id,token_symbol").execute()
+        rows = r.data or []
+    except Exception as exc:
+        _send(f"❌ Failed to fetch clusters: {exc}")
+        with _inject_lock:
+            _inject_running = False
+        return
+
+    clusters: dict[str, str] = {}
+    for row in rows:
+        cid = row["cluster_id"]
+        if cid not in clusters:
+            clusters[cid] = row.get("token_symbol", "")
+
+    if not clusters:
+        _send("⚠️ No clusters found in wallet_clusters — nothing to inject.")
+        with _inject_lock:
+            _inject_running = False
+        return
+
+    _send(
+        f"🔬 <b>Evidence injection started</b> — {len(clusters)} cluster(s)\n"
+        f"Full history scan (no date cutoff). This may take several minutes."
+    )
+
+    total_transfers = 0
+    total_sigs      = 0
+
+    for idx, (cluster_id, symbol) in enumerate(clusters.items(), 1):
+        _send(f"[{idx}/{len(clusters)}] Scanning <code>{cluster_id}</code> ({symbol})…")
+        try:
+            result = itd.scan_cluster(
+                cluster_id,
+                symbol=symbol or "UNKNOWN",
+                full_history=True,
+                supabase=sb,
+            )
+            n_tx   = len(result.get("transfers") or [])
+            n_sigs = result.get("sig_count", 0)
+            saved  = result.get("pairs_saved", 0)
+            total_transfers += n_tx
+            total_sigs      += n_sigs
+            _send(
+                f"  ✅ <code>{cluster_id}</code> — "
+                f"{n_sigs} sigs | {n_tx} transfers | {saved} pairs saved"
+            )
+        except Exception as exc:
+            log.error("_run_inject_evidence: cluster %s failed: %s", cluster_id, exc)
+            _send(f"  ❌ <code>{cluster_id}</code> — error: {exc}")
+
+    # Final count from DB
+    try:
+        r2 = sb.table("relationship_evidence").select("id", count="exact").execute()
+        db_count = getattr(r2, "count", None) or len(r2.data or [])
+    except Exception:
+        db_count = "?"
+
+    _send(
+        f"🏁 <b>Injection complete</b>\n"
+        f"Clusters scanned: {len(clusters)} | "
+        f"Sigs checked: {total_sigs} | "
+        f"Transfers found: {total_transfers}\n"
+        f"relationship_evidence total rows: <b>{db_count}</b>"
+    )
+    with _inject_lock:
+        _inject_running = False
+
+
 def _validate_solana_address(addr: str) -> bool:
     return bool(addr) and 32 <= len(addr) <= 44 and addr.isalnum()
 
@@ -1454,6 +1553,27 @@ def _check_tx_history(addr: str) -> bool:
 
 
 # ── Smart-wallet Telegram commands ──────────────────────────────────────────
+
+async def cmd_injectevidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run full-history evidence injection for all clusters. Admin only."""
+    global _inject_running
+    if not _authorized(update):
+        await _deny(update)
+        return
+    with _inject_lock:
+        if _inject_running:
+            await update.message.reply_text("⏳ Injection already running — please wait.")
+            return
+        _inject_running = True
+    loop    = asyncio.get_running_loop()
+    app_ref = context.application
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        "🔬 Starting full-history evidence injection for all clusters…\n"
+        "Progress updates will appear here.",
+    )
+    loop.run_in_executor(None, _run_inject_evidence, loop, chat_id, app_ref)
+
 
 async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Add a smart wallet to track. Validates on-chain, runs 30d swap backfill."""
@@ -1759,7 +1879,8 @@ def main() -> None:
     app.add_handler(CommandHandler("tier",          cmd_tier))
     app.add_handler(CommandHandler("backfill",      cmd_backfill))
     app.add_handler(CommandHandler("evidence",      cmd_evidence))
-    app.add_handler(CommandHandler("rejections",    cmd_rejections))
+    app.add_handler(CommandHandler("rejections",     cmd_rejections))
+    app.add_handler(CommandHandler("injectevidence", cmd_injectevidence))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
