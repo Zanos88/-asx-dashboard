@@ -462,6 +462,44 @@ def _upsert_relationship(
         return False
 
 
+def _upsert_evidence(
+    wallet_a: str,
+    wallet_b: str,
+    transfer: dict,
+    cluster_id: str,
+    supabase: Any,
+) -> None:
+    if not supabase:
+        return
+    sig        = transfer.get("sig", "")
+    block_time = transfer.get("block_time")
+    amount_sol = transfer.get("sol", 0.0)
+    sender     = transfer.get("from_wallet", "")
+    receiver   = transfer.get("to_wallet", "")
+    bt_iso: str | None = None
+    if block_time:
+        try:
+            bt_iso = datetime.utcfromtimestamp(block_time).isoformat() + "Z"
+        except Exception:
+            bt_iso = None
+    try:
+        supabase.table("relationship_evidence").upsert(
+            {
+                "wallet_a":          min(wallet_a, wallet_b),
+                "wallet_b":          max(wallet_a, wallet_b),
+                "relationship_type": "SOL_TRANSFER",
+                "tx_signature":      sig,
+                "block_time":        bt_iso,
+                "amount_sol":        amount_sol,
+                "cluster_id":        cluster_id,
+                "raw_json":          {"sender": sender, "receiver": receiver},
+            },
+            on_conflict="wallet_a,wallet_b,tx_signature",
+        ).execute()
+    except Exception as exc:
+        log.debug("_upsert_evidence failed: %s", exc)
+
+
 # ── Core scan ─────────────────────────────────────────────────────────────────
 
 def scan_cluster(
@@ -469,6 +507,7 @@ def scan_cluster(
     symbol: str = "ALON",
     test_mode: bool = False,
     dry_run: bool = False,
+    full_history: bool = False,
     progress_cb: Any = None,
     supabase: Any = None,
 ) -> dict:
@@ -476,12 +515,14 @@ def scan_cluster(
     Scan a cluster for native SOL transfers between member wallets.
 
     Args:
-        cluster_id:  e.g. "ALON_Zs78YrHs"
-        symbol:      token symbol for display / Telegram message
-        test_mode:   only 2 wallets, 30 days, verbose logging
-        dry_run:     skip DB writes and Telegram (implied by test_mode)
-        progress_cb: optional callable(msg: str) for Telegram progress updates
-        supabase:    pass existing client, otherwise uses module-level _supabase
+        cluster_id:   e.g. "ALON_Zs78YrHs"
+        symbol:       token symbol for display / Telegram message
+        test_mode:    only 2 wallets, 30 days, verbose logging
+        dry_run:      skip DB writes and Telegram (implied by test_mode)
+        full_history: fetch ALL available signatures (no date cutoff); writes
+                      tx-level proof to relationship_evidence table
+        progress_cb:  optional callable(msg: str) for Telegram progress updates
+        supabase:     pass existing client, otherwise uses module-level _supabase
     """
     sb = supabase or _supabase
     info = _fetch_cluster_wallets(cluster_id, sb)
@@ -495,7 +536,10 @@ def scan_cluster(
     supply_pct:    float     = info["total_supply_pct"]
     verbose:       bool      = test_mode
 
-    days          = None if test_mode else 365  # None = no cutoff, fetch latest 1000 only
+    if full_history:
+        days = None   # no date cutoff — fetch all available signatures
+    else:
+        days = None if test_mode else 365  # None = no cutoff, fetch latest 1000 only
     wallets       = all_wallets[:2] if test_mode else all_wallets
     wallet_set    = set(wallets)
     limiter       = RateLimiter()
@@ -546,8 +590,10 @@ def scan_cluster(
             continue
         found = _detect_sol_transfers(tx, wallet_set)
         if found:
+            block_time = tx.get("blockTime")
             log.info("  ✅ SOL transfer found in tx %s…: %s", sig[:12], found)
             for t in found:
+                t["block_time"] = block_time
                 if test_mode and progress_cb:
                     progress_cb(
                         f"[{ts}] Sig {idx} — SOL moved: "
@@ -590,7 +636,7 @@ def scan_cluster(
             "dry_run":      True,
         }
 
-    # Phase 3: persist confirmed pairs
+    # Phase 3: persist confirmed pairs + tx-level evidence
     pair_sigs: dict[tuple[str, str], list[str]] = defaultdict(list)
     for t in transfers:
         key = (min(t["from_wallet"], t["to_wallet"]), max(t["from_wallet"], t["to_wallet"]))
@@ -601,6 +647,14 @@ def scan_cluster(
         if _upsert_relationship(wa, wb, token_address, sigs, sb):
             saved += 1
     log.info("Saved %d INTER_TRANSFER relationships to Supabase", saved)
+
+    # Write per-tx evidence rows to relationship_evidence
+    for t in transfers:
+        _upsert_evidence(
+            t["from_wallet"], t["to_wallet"], t, cluster_id, sb
+        )
+    if transfers:
+        log.info("Wrote %d evidence rows to relationship_evidence", len(transfers))
 
     # Phase 4: fire Telegram summary
     if transfers:

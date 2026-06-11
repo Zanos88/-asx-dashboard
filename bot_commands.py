@@ -11,15 +11,11 @@ import json
 import logging
 import os
 import subprocess
-import threading
-import time
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-import monitor as _monitor_mod
 from monitor import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -80,7 +76,13 @@ movethreshold - Alias for threshold
 testalert - Fire a synthetic alert to verify pipeline
 related - External token holdings for top wallets
 scancluster - On-chain SOL transfer scan for a token's bundle cluster
-scantest - Test inter-transfer scan (2 wallets, 30 days, no DB write)"""
+scantest - Test inter-transfer scan (2 wallets, 30 days, no DB write)
+addwallet - Track a smart wallet (validates + runs 30d backfill)
+tier - Show tier and stats for a tracked wallet
+backfill - Re-run 30d swap backfill for a wallet
+evidence - Show on-chain proof for a wallet's relationships
+rejections - Last 20 toxic-flow filter rejections
+injectevidence - Full-history evidence scan for all clusters"""
 
 def _parse_chat_ids(raw: str) -> set[int]:
     return {int(cid.strip()) for cid in raw.split(",") if cid.strip().lstrip("-").isdigit()}
@@ -91,7 +93,8 @@ _AUTHORIZED_CHATS: frozenset[int] = frozenset(
 )
 _REPO_DIR = os.path.dirname(os.path.abspath(_CONFIG_PATH))
 _monitor_proc: subprocess.Popen | None = None
-_active_scans: dict[str, float] = {}   # cluster_id → start epoch
+_active_scans:     dict[str, float] = {}   # cluster_id → start epoch
+_active_backfills: dict[str, float] = {}   # wallet_address → start epoch
 _scan_lock = threading.Lock()
 
 
@@ -128,9 +131,6 @@ def _persist_config(cfg: dict) -> str:
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        await _deny(update)
-        return
     await update.message.reply_text("🟢 Bot online")
 
 
@@ -179,7 +179,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/movethreshold &lt;PCT&gt; — Alias for /threshold\n\n"
 
         "<b>🧪 TESTING</b>\n"
-        "/testalert [SYMBOL] — Fire a synthetic alert to test the pipeline",
+        "/testalert [SYMBOL] — Fire a synthetic alert to test the pipeline\n\n"
+
+        "<b>🎯 SMART WALLETS</b>\n"
+        "/addwallet &lt;ADDR&gt; — Track wallet (validates + 30d backfill)\n"
+        "/tier &lt;ADDR&gt; — Show tier and performance stats\n"
+        "/backfill &lt;ADDR&gt; — Re-run swap backfill for a wallet\n"
+        "/evidence &lt;ADDR&gt; — On-chain proof for wallet relationships\n"
+        "/rejections — Last 20 toxic-flow filter rejections",
         parse_mode="HTML",
     )
 
@@ -604,121 +611,18 @@ async def cmd_clusters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-def _cluster_confirmation_status(wallets: list[str], supabase: Any) -> str:
-    """Check wallet_relationships to determine inter-transfer confirmation status."""
-    if not supabase or not wallets:
-        return "❓ UNSCANNED — no detection run yet"
-    try:
-        r = (
-            supabase.table("wallet_relationships")
-            .select("relationship_type")
-            .in_("wallet_a", wallets[:20])
-            .execute()
-        )
-        types = {row["relationship_type"] for row in (r.data or [])}
-        if "INTER_TRANSFER" in types:
-            return "✅ ON-CHAIN CONFIRMED — INTER_TRANSFER proven (confidence 95)"
-        if types:
-            return "⏳ TIMING ONLY — TEMPORAL_CLUSTER, not yet scanned"
-        return "❓ UNSCANNED — no detection run yet"
-    except Exception:
-        return "❓ UNSCANNED"
-
-
-async def _bundle_token_report(update: Update, symbol: str) -> None:
-    """On-demand cluster/bundle report for a token with last-movement data."""
-    cfg    = _load_config()
-    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
-    if symbol not in tokens:
-        await update.message.reply_text(f"❌ Unknown token: {symbol}")
-        return
-    token_address = tokens[symbol]
-    snap          = load_snapshot(symbol)
-    holders       = (snap or {}).get("holders", [])
-    total         = sum(get_amount(h) for h in holders) or 1.0
-    supply_map    = {h["address"]: get_amount(h) / total * 100 for h in holders}
-
-    loop     = asyncio.get_running_loop()
-    clusters = await loop.run_in_executor(
-        None, get_wallet_clusters_for_token, token_address, _supabase
-    )
-    if not clusters:
-        await update.message.reply_text(f"No clusters detected for {symbol}.")
-        return
-
-    for cl in clusters[:3]:
-        risk    = cl.get("risk_level", "?")
-        cid     = cl.get("cluster_id", "")
-        method  = cl.get("detection_method", "?")
-        pct     = cl.get("total_supply_pct") or 0
-        wallets = [w for w in cl.get("wallets", []) if supply_map.get(w, 0.0) > 0]
-        n       = len(wallets)
-        icon    = "🔴" if risk == "HIGH_RISK" else "🟡"
-        status  = _cluster_confirmation_status(wallets, _supabase)
-
-        lines = [
-            f"📦 <b>BUNDLE REPORT — {symbol}</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            f"{icon} {risk} | {method} | {pct:.2f}% supply | {n} wallets",
-            f"🔍 {status}",
-            "",
-            "Top holders (excl. LP):",
-        ]
-        now_utc = datetime.now(timezone.utc)
-        for rank, w in enumerate(wallets[:20], 1):
-            wpct      = supply_map.get(w, 0.0)
-            raw_m     = wpct / 100 * total / 1e6
-            last_move = None
-            if _supabase:
-                try:
-                    r = (_supabase.table("whale_alerts")
-                         .select("alerted_at,delta_pct")
-                         .eq("wallet_address", w).eq("token_symbol", symbol)
-                         .order("alerted_at", desc=True).limit(1).execute())
-                    if r.data:
-                        ts  = r.data[0]["alerted_at"].replace("Z", "+00:00")
-                        ldt = datetime.fromisoformat(ts)
-                        ldt = ldt if ldt.tzinfo else ldt.replace(tzinfo=timezone.utc)
-                        days_ago  = (now_utc - ldt).days
-                        dpct      = r.data[0].get("delta_pct", 0) or 0
-                        sign      = "🟢" if dpct > 0 else "🔴"
-                        dormant   = " ⚠️ DORMANT" if days_ago > 30 else ""
-                        last_move = f"Last move: {days_ago}d ago ({dpct:+.3f}% {sign}){dormant}"
-                except Exception:
-                    pass
-            lines.append(
-                f"#{rank} <code>{w[:6]}…{w[-4:]}</code> — {wpct:.2f}% ({raw_m:.1f}M)\n"
-                f"       {last_move or 'No recorded moves'}\n"
-                f"       📋 <code>{w}</code>"
-            )
-        lines += [
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            f'<a href="https://dexscreener.com/solana/{token_address}">DexScreener</a>'
-            f' | <a href="https://app.bubblemaps.io/sol/token/{token_address}">Bubblemaps</a>',
-        ]
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
-        )
-
-
 async def cmd_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Token cluster report (/bundle SYMBOL) or wallet lookup (/bundle <WALLET_ADDRESS>)."""
+    """Check if a specific wallet is in any bundle/cluster."""
     if not _authorized(update):
         await _deny(update)
         return
     if not context.args:
-        cfg    = _load_config()
-        tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
-        for sym in tokens:
-            await _bundle_token_report(update, sym)
+        await update.message.reply_text(
+            "Usage: /bundle &lt;WALLET_ADDRESS&gt;", parse_mode="HTML"
+        )
         return
 
-    arg = context.args[0].strip()
-    if len(arg) <= 12:
-        await _bundle_token_report(update, arg.upper())
-        return
-
-    wallet = arg
+    wallet = context.args[0].strip()
     if len(wallet) < 32 or len(wallet) > 44:
         await update.message.reply_text("❌ Invalid Solana address.")
         return
@@ -1378,6 +1282,568 @@ async def cmd_scantest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     loop.run_in_executor(None, _run_scan_with_progress, loop, chat_id, app, sym, True)
 
 
+# ── Smart-wallet backfill thread ────────────────────────────────────────────
+
+def _run_wallet_backfill(
+    loop: asyncio.AbstractEventLoop,
+    chat_id: int,
+    app: Any,
+    wallet_address: str,
+) -> None:
+    """Runs in executor thread. Fetches 30d swap history, tiers the wallet, updates DB."""
+    import signal_engine
+
+    def _send(msg: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML"),
+            loop,
+        )
+
+    helius_key = HELIUS_API_KEY
+    sb = _supabase
+    short = f"{wallet_address[:8]}…{wallet_address[-6:]}"
+
+    with _scan_lock:
+        if wallet_address in _active_backfills:
+            started = _active_backfills[wallet_address]
+            elapsed = int(time.time() - started)
+            m, s = divmod(elapsed, 60)
+            _send(f"⏳ Backfill already running for <code>{short}</code> ({m}m {s}s ago).")
+            return
+        _active_backfills[wallet_address] = time.time()
+
+    try:
+        if sb:
+            try:
+                sb.table("smart_wallets").upsert(
+                    {"wallet_address": wallet_address, "status": "BACKFILL_RUNNING",
+                     "backfill_started_at": datetime.now(timezone.utc).isoformat()},
+                    on_conflict="wallet_address",
+                ).execute()
+            except Exception as exc:
+                log.warning("smart_wallets status update failed: %s", exc)
+
+        def progress_cb(msg: str) -> None:
+            _send(msg)
+
+        stats = signal_engine.run_swap_backfill(
+            wallet_address, helius_key, days=30, progress_cb=progress_cb
+        )
+        tier = signal_engine.compute_tier(
+            stats["win_rate"], stats["avg_hold_time_min"], stats["trades_90d"]
+        )
+        status = "EXCLUDED" if tier == "TIER_C" else "ACTIVE"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if sb:
+            try:
+                sb.table("smart_wallets").upsert(
+                    {
+                        "wallet_address":       wallet_address,
+                        "tier":                 tier,
+                        "status":               status,
+                        "win_rate":             stats["win_rate"],
+                        "trade_count":          stats["trade_count"],
+                        "trades_90d":           stats["trades_90d"],
+                        "avg_hold_time_min":    stats["avg_hold_time_min"],
+                        "total_pnl_sol":        stats["total_pnl_sol"],
+                        "backfill_days":        30,
+                        "backfill_completed_at": now_iso,
+                        "updated_at":           now_iso,
+                    },
+                    on_conflict="wallet_address",
+                ).execute()
+            except Exception as exc:
+                log.warning("smart_wallets final upsert failed: %s", exc)
+
+        tier_emoji = {"TIER_A": "🟢", "TIER_B": "🟡", "TIER_C": "🔴"}.get(tier, "⚪")
+        avg_h = stats["avg_hold_time_min"] / 60
+        pnl_sign = "+" if stats["total_pnl_sol"] >= 0 else ""
+        _send(
+            f"{tier_emoji} <b>Backfill complete</b> — <code>{short}</code>\n"
+            f"Tier: <b>{tier}</b> | Status: {status}\n"
+            f"Win rate: {stats['win_rate']*100:.1f}% | "
+            f"Trades (90d): {stats['trades_90d']} | "
+            f"Avg hold: {avg_h:.1f}h\n"
+            f"PnL (30d): {pnl_sign}{stats['total_pnl_sol']:.3f} SOL"
+        )
+    except Exception as exc:
+        log.error("_run_wallet_backfill failed for %s: %s", short, exc, exc_info=True)
+        _send(f"❌ Backfill failed for <code>{short}</code>: {exc}")
+    finally:
+        with _scan_lock:
+            _active_backfills.pop(wallet_address, None)
+
+
+def _run_wallet_evidence_scan(
+    loop: asyncio.AbstractEventLoop,
+    chat_id: int,
+    app: Any,
+    wallet_address: str,
+) -> None:
+    """Runs in executor thread. Full-history inter-transfer scan for a single wallet."""
+    import inter_transfer_detector as itd
+
+    def _send(msg: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=msg),
+            loop,
+        )
+
+    sb = _supabase
+    if not sb:
+        return
+
+    short = f"{wallet_address[:8]}…{wallet_address[-6:]}"
+    try:
+        # Find any cluster containing this wallet
+        r = (
+            sb.table("wallet_clusters")
+            .select("cluster_id,token_symbol")
+            .eq("wallet_address", wallet_address)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            _send(f"🔍 Evidence scan: {short} not in any known cluster — skipping.")
+            return
+        cluster_id  = rows[0]["cluster_id"]
+        token_sym   = rows[0].get("token_symbol", "")
+        itd.scan_cluster(
+            cluster_id,
+            symbol=token_sym,
+            full_history=True,
+            supabase=sb,
+        )
+        # Count evidence rows
+        r2 = (
+            sb.table("relationship_evidence")
+            .select("id", count="exact")
+            .or_(f"wallet_a.eq.{wallet_address},wallet_b.eq.{wallet_address}")
+            .execute()
+        )
+        n_evidence = getattr(r2, "count", None) or len(r2.data or [])
+        _send(f"🔍 Evidence scan complete for <code>{short}</code> — {n_evidence} records found.")
+    except Exception as exc:
+        log.warning("_run_wallet_evidence_scan failed: %s", exc)
+
+
+_inject_lock = threading.Lock()
+_inject_running: bool = False
+
+
+def _run_inject_evidence(
+    loop: asyncio.AbstractEventLoop,
+    chat_id: int,
+    app: Any,
+) -> None:
+    """
+    Runs in executor thread. Scans every cluster with full_history=True,
+    writing per-tx SOL-transfer proof to relationship_evidence.
+    """
+    global _inject_running
+    import inter_transfer_detector as itd
+
+    def _send(msg: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML"),
+            loop,
+        )
+
+    sb = _supabase
+    if not sb:
+        _send("❌ Supabase not configured.")
+        with _inject_lock:
+            _inject_running = False
+        return
+
+    try:
+        r = sb.table("wallet_clusters").select("cluster_id,token_symbol").execute()
+        rows = r.data or []
+    except Exception as exc:
+        _send(f"❌ Failed to fetch clusters: {exc}")
+        with _inject_lock:
+            _inject_running = False
+        return
+
+    clusters: dict[str, str] = {}
+    for row in rows:
+        cid = row["cluster_id"]
+        if cid not in clusters:
+            clusters[cid] = row.get("token_symbol", "")
+
+    if not clusters:
+        _send("⚠️ No clusters found in wallet_clusters — nothing to inject.")
+        with _inject_lock:
+            _inject_running = False
+        return
+
+    _send(
+        f"🔬 <b>Evidence injection started</b> — {len(clusters)} cluster(s)\n"
+        f"Full history scan (no date cutoff). This may take several minutes."
+    )
+
+    total_transfers = 0
+    total_sigs      = 0
+
+    for idx, (cluster_id, symbol) in enumerate(clusters.items(), 1):
+        _send(f"[{idx}/{len(clusters)}] Scanning <code>{cluster_id}</code> ({symbol})…")
+        try:
+            result = itd.scan_cluster(
+                cluster_id,
+                symbol=symbol or "UNKNOWN",
+                full_history=True,
+                supabase=sb,
+            )
+            n_tx   = len(result.get("transfers") or [])
+            n_sigs = result.get("sig_count", 0)
+            saved  = result.get("pairs_saved", 0)
+            total_transfers += n_tx
+            total_sigs      += n_sigs
+            _send(
+                f"  ✅ <code>{cluster_id}</code> — "
+                f"{n_sigs} sigs | {n_tx} transfers | {saved} pairs saved"
+            )
+        except Exception as exc:
+            log.error("_run_inject_evidence: cluster %s failed: %s", cluster_id, exc)
+            _send(f"  ❌ <code>{cluster_id}</code> — error: {exc}")
+
+    # Final count from DB
+    try:
+        r2 = sb.table("relationship_evidence").select("id", count="exact").execute()
+        db_count = getattr(r2, "count", None) or len(r2.data or [])
+    except Exception:
+        db_count = "?"
+
+    _send(
+        f"🏁 <b>Injection complete</b>\n"
+        f"Clusters scanned: {len(clusters)} | "
+        f"Sigs checked: {total_sigs} | "
+        f"Transfers found: {total_transfers}\n"
+        f"relationship_evidence total rows: <b>{db_count}</b>"
+    )
+    with _inject_lock:
+        _inject_running = False
+
+
+def _validate_solana_address(addr: str) -> bool:
+    return bool(addr) and 32 <= len(addr) <= 44 and addr.isalnum()
+
+
+def _check_tx_history(addr: str) -> bool:
+    """Returns True if wallet has on-chain tx history (any 1 sig found)."""
+    helius_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    try:
+        resp = __import__("requests").post(
+            helius_rpc,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [addr, {"limit": 10, "commitment": "confirmed"}],
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            return False
+        result = resp.json().get("result") or []
+        return len(result) > 0
+    except Exception:
+        return False
+
+
+# ── Smart-wallet Telegram commands ──────────────────────────────────────────
+
+async def cmd_injectevidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run full-history evidence injection for all clusters. Admin only."""
+    global _inject_running
+    if not _authorized(update):
+        await _deny(update)
+        return
+    with _inject_lock:
+        if _inject_running:
+            await update.message.reply_text("⏳ Injection already running — please wait.")
+            return
+        _inject_running = True
+    loop    = asyncio.get_running_loop()
+    app_ref = context.application
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        "🔬 Starting full-history evidence injection for all clusters…\n"
+        "Progress updates will appear here.",
+    )
+    loop.run_in_executor(None, _run_inject_evidence, loop, chat_id, app_ref)
+
+
+async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a smart wallet to track. Validates on-chain, runs 30d swap backfill."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /addwallet &lt;SOLANA_ADDRESS&gt;", parse_mode="HTML")
+        return
+    addr = context.args[0].strip()
+    if not _validate_solana_address(addr):
+        await update.message.reply_text(
+            "❌ That doesn't look like a Solana address (must be 32-44 alphanumeric chars)."
+        )
+        return
+
+    sb = _supabase
+    # Check if already tracked
+    if sb:
+        try:
+            r = sb.table("smart_wallets").select("status,tier").eq("wallet_address", addr).limit(1).execute()
+            if r.data:
+                row = r.data[0]
+                await update.message.reply_text(
+                    f"ℹ️ Already tracked — status: <b>{row['status']}</b>, "
+                    f"tier: <b>{row.get('tier', 'UNTIERED')}</b>",
+                    parse_mode="HTML",
+                )
+                return
+        except Exception:
+            pass
+
+    await update.message.reply_text("⏳ Checking on-chain history…")
+    if not _check_tx_history(addr):
+        await update.message.reply_text(
+            "❌ No transaction history found for that address. Verify address and try again."
+        )
+        return
+
+    short = f"{addr[:8]}…{addr[-6:]}"
+    if sb:
+        try:
+            sb.table("smart_wallets").upsert(
+                {"wallet_address": addr, "status": "PENDING",
+                 "added_at": datetime.now(timezone.utc).isoformat()},
+                on_conflict="wallet_address",
+            ).execute()
+        except Exception as exc:
+            log.warning("smart_wallets insert failed: %s", exc)
+
+    await update.message.reply_text(
+        f"✅ Added <code>{short}</code>. Running 30-day swap backfill + evidence scan…\n"
+        "Results will appear here when done.",
+        parse_mode="HTML",
+    )
+    loop    = asyncio.get_running_loop()
+    app_ref = context.application
+    chat_id = update.effective_chat.id
+    loop.run_in_executor(None, _run_wallet_backfill, loop, chat_id, app_ref, addr)
+    loop.run_in_executor(None, _run_wallet_evidence_scan, loop, chat_id, app_ref, addr)
+
+
+async def cmd_tier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show tier and stats for a tracked wallet. Usage: /tier <address>"""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /tier &lt;SOLANA_ADDRESS&gt;", parse_mode="HTML")
+        return
+    addr = context.args[0].strip()
+    sb = _supabase
+    if not sb:
+        await update.message.reply_text("❌ Supabase not configured.")
+        return
+    try:
+        r = sb.table("smart_wallets").select("*").eq("wallet_address", addr).limit(1).execute()
+    except Exception as exc:
+        await update.message.reply_text(f"❌ DB error: {exc}")
+        return
+    if not r.data:
+        await update.message.reply_text(
+            f"❌ Wallet not tracked. Use /addwallet <code>{addr[:12]}…</code> first.",
+            parse_mode="HTML",
+        )
+        return
+    row = r.data[0]
+    tier   = row.get("tier") or "UNTIERED"
+    status = row.get("status") or "UNKNOWN"
+    tier_emoji = {"TIER_A": "🟢", "TIER_B": "🟡", "TIER_C": "🔴"}.get(tier, "⚪")
+    short = f"{addr[:8]}…{addr[-6:]}"
+    wr    = row.get("win_rate")
+    tc    = row.get("trade_count")
+    t90   = row.get("trades_90d")
+    hold  = row.get("avg_hold_time_min")
+    pnl   = row.get("total_pnl_sol")
+    comp  = (row.get("backfill_completed_at") or "")[:10]
+    lines = [
+        f"{tier_emoji} <b>{tier}</b> — <a href=\"https://solscan.io/account/{addr}\">{short}</a>",
+    ]
+    if wr is not None:
+        avg_h = (hold or 0) / 60
+        pnl_s = f"{'+' if (pnl or 0) >= 0 else ''}{pnl:.3f}" if pnl is not None else "N/A"
+        lines.append(
+            f"Win rate: {wr*100:.1f}% | Trades (90d): {t90 or '?'} | "
+            f"Avg hold: {avg_h:.1f}h | PnL: {pnl_s} SOL"
+        )
+    lines.append(f"Status: {status}" + (f" | Backfill: {comp}" if comp else ""))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-run 30d swap backfill for a tracked wallet. Usage: /backfill <address>"""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /backfill &lt;SOLANA_ADDRESS&gt;", parse_mode="HTML")
+        return
+    addr = context.args[0].strip()
+    if not _validate_solana_address(addr):
+        await update.message.reply_text("❌ That doesn't look like a valid Solana address.")
+        return
+
+    with _scan_lock:
+        if addr in _active_backfills:
+            started = _active_backfills[addr]
+            elapsed = int(time.time() - started)
+            m, s = divmod(elapsed, 60)
+            await update.message.reply_text(
+                f"⏳ Backfill already running for <code>{addr[:8]}…</code> (started {m}m {s}s ago).",
+                parse_mode="HTML",
+            )
+            return
+
+    sb = _supabase
+    if sb:
+        try:
+            sb.table("smart_wallets").upsert(
+                {"wallet_address": addr, "status": "PENDING",
+                 "backfill_completed_at": None,
+                 "updated_at": datetime.now(timezone.utc).isoformat()},
+                on_conflict="wallet_address",
+            ).execute()
+        except Exception:
+            pass
+
+    short = f"{addr[:8]}…{addr[-6:]}"
+    await update.message.reply_text(
+        f"🔄 Re-running 30d backfill for <code>{short}</code>…",
+        parse_mode="HTML",
+    )
+    loop    = asyncio.get_running_loop()
+    app_ref = context.application
+    chat_id = update.effective_chat.id
+    loop.run_in_executor(None, _run_wallet_backfill, loop, chat_id, app_ref, addr)
+
+
+async def cmd_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show on-chain proof for a wallet's relationships. Usage: /evidence <address>"""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /evidence &lt;SOLANA_ADDRESS&gt;", parse_mode="HTML")
+        return
+    addr = context.args[0].strip()
+    sb = _supabase
+    if not sb:
+        await update.message.reply_text("❌ Supabase not configured.")
+        return
+    try:
+        r = (
+            sb.table("relationship_evidence")
+            .select("*")
+            .or_(f"wallet_a.eq.{addr},wallet_b.eq.{addr}")
+            .order("block_time", desc=True)
+            .limit(25)
+            .execute()
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ DB error: {exc}")
+        return
+
+    rows = r.data or []
+    short = f"{addr[:8]}…{addr[-6:]}"
+    if not rows:
+        await update.message.reply_text(
+            f"🔍 No evidence found for <code>{short}</code>.\n"
+            "Run /scancluster or /addwallet to gather on-chain proof.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [f"🔗 <b>Evidence for <code>{short}</code></b> ({len(rows)} records)\n"]
+    for ev in rows[:15]:
+        rel_type  = ev.get("relationship_type", "UNKNOWN")
+        bt        = (ev.get("block_time") or "")[:16].replace("T", " ")
+        sig       = ev.get("tx_signature") or ""
+        amt       = ev.get("amount_sol")
+        raw       = ev.get("raw_json") or {}
+        counterpart = ""
+        wa, wb = ev.get("wallet_a", ""), ev.get("wallet_b", "")
+        other = wb if wa == addr else wa
+        if other and other != addr:
+            counterpart = f"  ↔ <code>{other[:8]}…{other[-4:]}</code>\n"
+        detail = ""
+        if rel_type == "SOL_TRANSFER" and amt:
+            sender   = raw.get("sender", "")
+            receiver = raw.get("receiver", "")
+            direction = "→" if sender == addr else "←"
+            detail = f"  {amt:.4f} SOL {direction} <code>{other[:8]}…{other[-4:]}</code>\n"
+        elif rel_type == "COMMON_FUNDER":
+            funder = raw.get("funder", "")
+            detail = f"  Shared funder: <code>{funder[:8]}…</code>\n" if funder else ""
+        sig_link = (
+            f'  tx: <a href="https://solscan.io/tx/{sig}">{sig[:16]}…</a>\n' if sig else ""
+        )
+        lines.append(
+            f"<b>{rel_type}</b> — {bt}\n"
+            f"{detail}{counterpart}{sig_link}"
+        )
+
+    if len(rows) > 15:
+        lines.append(f"… +{len(rows)-15} more records")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+async def cmd_rejections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show last 20 toxic-flow filter rejections."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    sb = _supabase
+    if not sb:
+        await update.message.reply_text("❌ Supabase not configured.")
+        return
+    try:
+        r = (
+            sb.table("filter_rejections")
+            .select("*")
+            .order("rejected_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ DB error: {exc}")
+        return
+
+    rows = r.data or []
+    if not rows:
+        await update.message.reply_text("✅ No filter rejections recorded yet.")
+        return
+
+    lines = [f"🚫 <b>Last {len(rows)} filter rejections</b>\n"]
+    for row in rows:
+        ts     = (row.get("rejected_at") or "")[:16].replace("T", " ")[-5:]  # HH:MM
+        code   = row.get("rejection_code") or "?"
+        reason = row.get("rejection_reason") or ""
+        wallet = row.get("wallet_address") or ""
+        sym    = row.get("token_symbol") or "?"
+        wshort = f"{wallet[:6]}…{wallet[-4:]}" if len(wallet) >= 10 else wallet
+        lines.append(f"[{ts}] <b>{code}</b> | <code>{wshort}</code> | {sym} — {reason}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1409,6 +1875,12 @@ def main() -> None:
     app.add_handler(CommandHandler("alert",         cmd_alert_toggle))
     app.add_handler(CommandHandler("scancluster",   cmd_scancluster))
     app.add_handler(CommandHandler("scantest",      cmd_scantest))
+    app.add_handler(CommandHandler("addwallet",     cmd_addwallet))
+    app.add_handler(CommandHandler("tier",          cmd_tier))
+    app.add_handler(CommandHandler("backfill",      cmd_backfill))
+    app.add_handler(CommandHandler("evidence",      cmd_evidence))
+    app.add_handler(CommandHandler("rejections",     cmd_rejections))
+    app.add_handler(CommandHandler("injectevidence", cmd_injectevidence))
     log.info("🤖 Bot polling started — authorized chats: %s", sorted(_AUTHORIZED_CHATS))
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
