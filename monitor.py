@@ -300,9 +300,6 @@ def write_alert_to_supabase(
             "token_delta_usd": tok_delta_usd,
             "cluster_id":      cluster_id_v,
         }).execute()
-        returned = len(resp.data) if getattr(resp, "data", None) is not None else 0
-        log.info("🔬DBG whale_alerts insert (%s %s %s) returned %d row(s)",
-                 symbol, change["address"][:8], change["type"], returned)
         written = 1
     except Exception as exc:
         log.error("  ❌ whale_alerts insert failed: %s: %s", type(exc).__name__, exc)
@@ -397,11 +394,8 @@ def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) ->
             log.error("❌ wallet_relationships upsert failed: %s", exc)
 
 
-_ROB_BATCH_SIZE = 5  # keep batches small — Helius rejects payloads with many accounts
-
-
 def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
-    """Batch-resolve SPL token account addresses → owner wallet addresses."""
+    """Resolve SPL token account addresses → owner wallet addresses, one call per address."""
     if not token_account_addrs:
         return {}
     rpc_url = (
@@ -409,34 +403,24 @@ def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
         if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
     )
     owners: dict[str, str] = {}
-    requested = len(token_account_addrs)
-    log.info("🔬DBG resolve_owners_batch: %d token accounts, chunk size %d",
-             requested, _ROB_BATCH_SIZE)
-    for chunk_start in range(0, len(token_account_addrs), _ROB_BATCH_SIZE):
-        chunk = token_account_addrs[chunk_start:chunk_start + _ROB_BATCH_SIZE]
-        batch = [
-            {"jsonrpc": "2.0", "id": i, "method": "getAccountInfo",
-             "params": [addr, {"encoding": "jsonParsed"}]}
-            for i, addr in enumerate(chunk)
-        ]
-        chunk_idx = chunk_start // _ROB_BATCH_SIZE
+    for addr in token_account_addrs:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+                   "params": [addr, {"encoding": "jsonParsed"}]}
         try:
-            resp = requests.post(rpc_url, json=batch, timeout=30)
-            log.info("🔬DBG resolve_owners chunk[%d] size=%d HTTP %s body[:300]=%r",
-                     chunk_idx, len(chunk), resp.status_code, resp.text[:300])
+            resp = requests.post(rpc_url, json=payload, timeout=30)
+            if resp.status_code == 429:
+                time.sleep(2)
+                resp = requests.post(rpc_url, json=payload, timeout=30)
             resp.raise_for_status()
-            for item in resp.json():
-                idx   = item.get("id")
-                value = (item.get("result") or {}).get("value") or {}
-                data  = value.get("data") or {}
-                if isinstance(data, dict):
-                    owner = (data.get("parsed") or {}).get("info", {}).get("owner")
-                    if owner and idx is not None and idx < len(chunk):
-                        owners[chunk[idx]] = owner
+            value = (resp.json().get("result") or {}).get("value") or {}
+            data  = value.get("data") or {}
+            if isinstance(data, dict):
+                owner = (data.get("parsed") or {}).get("info", {}).get("owner")
+                if owner:
+                    owners[addr] = owner
         except Exception as exc:
-            log.warning("🔬DBG resolve_owners_batch chunk[%d] failed (size=%d): %s: %s",
-                        chunk_idx, len(chunk), type(exc).__name__, exc)
-    log.info("🔬DBG resolve_owners_batch resolved %d/%d owners", len(owners), requested)
+            log.warning("resolve_owners_batch failed for %s: %s", addr[:8], exc)
+        time.sleep(0.05)
     return owners
 
 
@@ -1780,8 +1764,6 @@ def run_holder_monitor() -> None:
             log.warning("Empty holder list for %s — skipping", symbol)
             continue
         log.info("  %d holders fetched", len(raw))
-        log.info("🔬DBG %s raw holders (pre-filter): %d addresses, sample=%s",
-                 symbol, len(raw), [h.get("address", "")[:8] for h in raw[:5]])
 
         # Filter LP pools and program accounts before any analysis
         _rpc = (
@@ -1790,8 +1772,6 @@ def run_holder_monitor() -> None:
         )
         filter_result = classify_and_filter(raw, _rpc, resolve_owners_batch, _supabase)
         current = filter_result["real_holders"]
-        log.info("🔬DBG %s filter result: %d real_holders, %d excluded, lp_pct=%.2f%%",
-                 symbol, len(current), len(filter_result["excluded"]), filter_result["lp_pct"])
         if not current:
             log.warning("  %s: all holders filtered as LP/programs — skipping", symbol)
             continue
@@ -1812,7 +1792,6 @@ def run_holder_monitor() -> None:
             all_price_ctx[symbol] = fetch_price_context(token_address)
         except Exception:
             all_price_ctx[symbol] = {}
-        log.info("🔬DBG %s about to write snapshot: %d holder rows", symbol, len(current))
         snapshot_rows += write_snapshot_to_supabase(
             symbol, token_address, current,
             total_supply=all_supplies.get(symbol, 0.0),
