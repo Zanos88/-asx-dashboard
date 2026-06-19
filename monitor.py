@@ -228,11 +228,14 @@ def write_snapshot_to_supabase(
         for rank, h in enumerate(holders, 1)
     ]
     try:
-        _supabase.table("wallet_snapshots").insert(rows).execute()
-        log.info("  ✅ %d rows → wallet_snapshots (%s)", len(rows), symbol)
+        resp = _supabase.table("wallet_snapshots").insert(rows).execute()
+        returned = len(resp.data) if getattr(resp, "data", None) is not None else 0
+        log.info("  ✅ %d rows → wallet_snapshots (%s) [insert API returned %d rows]",
+                 len(rows), symbol, returned)
         return len(rows)
     except Exception as exc:
-        log.error("  ❌ wallet_snapshots insert failed for %s: %s", symbol, exc)
+        log.error("  ❌ wallet_snapshots insert failed for %s: %s: %s",
+                  symbol, type(exc).__name__, exc)
         return 0
 
 
@@ -285,7 +288,7 @@ def write_alert_to_supabase(
             pass
     written = 0
     try:
-        _supabase.table("whale_alerts").insert({
+        resp = _supabase.table("whale_alerts").insert({
             "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
             "wallet_address": change["address"], "change_type": change["type"],
             "old_pct": change.get("old_pct"), "new_pct": change.get("new_pct"),
@@ -297,9 +300,12 @@ def write_alert_to_supabase(
             "token_delta_usd": tok_delta_usd,
             "cluster_id":      cluster_id_v,
         }).execute()
+        returned = len(resp.data) if getattr(resp, "data", None) is not None else 0
+        log.info("🔬DBG whale_alerts insert (%s %s %s) returned %d row(s)",
+                 symbol, change["address"][:8], change["type"], returned)
         written = 1
     except Exception as exc:
-        log.error("  ❌ whale_alerts insert failed: %s", exc)
+        log.error("  ❌ whale_alerts insert failed: %s: %s", type(exc).__name__, exc)
 
     try:
         _supabase.table("wallet_flow_changes").insert({
@@ -403,6 +409,9 @@ def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
         if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
     )
     owners: dict[str, str] = {}
+    requested = len(token_account_addrs)
+    log.info("🔬DBG resolve_owners_batch: %d token accounts, chunk size %d",
+             requested, _ROB_BATCH_SIZE)
     for chunk_start in range(0, len(token_account_addrs), _ROB_BATCH_SIZE):
         chunk = token_account_addrs[chunk_start:chunk_start + _ROB_BATCH_SIZE]
         batch = [
@@ -410,8 +419,11 @@ def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
              "params": [addr, {"encoding": "jsonParsed"}]}
             for i, addr in enumerate(chunk)
         ]
+        chunk_idx = chunk_start // _ROB_BATCH_SIZE
         try:
             resp = requests.post(rpc_url, json=batch, timeout=30)
+            log.info("🔬DBG resolve_owners chunk[%d] size=%d HTTP %s body[:300]=%r",
+                     chunk_idx, len(chunk), resp.status_code, resp.text[:300])
             resp.raise_for_status()
             for item in resp.json():
                 idx   = item.get("id")
@@ -422,7 +434,9 @@ def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
                     if owner and idx is not None and idx < len(chunk):
                         owners[chunk[idx]] = owner
         except Exception as exc:
-            log.warning("resolve_owners_batch chunk failed: %s", exc)
+            log.warning("🔬DBG resolve_owners_batch chunk[%d] failed (size=%d): %s: %s",
+                        chunk_idx, len(chunk), type(exc).__name__, exc)
+    log.info("🔬DBG resolve_owners_batch resolved %d/%d owners", len(owners), requested)
     return owners
 
 
@@ -1766,6 +1780,8 @@ def run_holder_monitor() -> None:
             log.warning("Empty holder list for %s — skipping", symbol)
             continue
         log.info("  %d holders fetched", len(raw))
+        log.info("🔬DBG %s raw holders (pre-filter): %d addresses, sample=%s",
+                 symbol, len(raw), [h.get("address", "")[:8] for h in raw[:5]])
 
         # Filter LP pools and program accounts before any analysis
         _rpc = (
@@ -1774,6 +1790,8 @@ def run_holder_monitor() -> None:
         )
         filter_result = classify_and_filter(raw, _rpc, resolve_owners_batch, _supabase)
         current = filter_result["real_holders"]
+        log.info("🔬DBG %s filter result: %d real_holders, %d excluded, lp_pct=%.2f%%",
+                 symbol, len(current), len(filter_result["excluded"]), filter_result["lp_pct"])
         if not current:
             log.warning("  %s: all holders filtered as LP/programs — skipping", symbol)
             continue
@@ -1794,6 +1812,7 @@ def run_holder_monitor() -> None:
             all_price_ctx[symbol] = fetch_price_context(token_address)
         except Exception:
             all_price_ctx[symbol] = {}
+        log.info("🔬DBG %s about to write snapshot: %d holder rows", symbol, len(current))
         snapshot_rows += write_snapshot_to_supabase(
             symbol, token_address, current,
             total_supply=all_supplies.get(symbol, 0.0),

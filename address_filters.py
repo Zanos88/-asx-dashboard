@@ -127,6 +127,8 @@ def _fetch_account_info_batch(addresses: list[str], rpc_url: str) -> dict[str, d
     if not to_fetch:
         return result
 
+    log.info("🔬DBG _fetch_account_info_batch: %d addrs (%d cached, %d to fetch), chunk size %d",
+             len(addresses), len(addresses) - len(to_fetch), len(to_fetch), _RPC_BATCH_SIZE)
     for chunk_start in range(0, len(to_fetch), _RPC_BATCH_SIZE):
         chunk = to_fetch[chunk_start:chunk_start + _RPC_BATCH_SIZE]
         batch = [
@@ -134,8 +136,11 @@ def _fetch_account_info_batch(addresses: list[str], rpc_url: str) -> dict[str, d
              "params": [addr, {"encoding": "base64"}]}
             for i, addr in enumerate(chunk)
         ]
+        chunk_idx = chunk_start // _RPC_BATCH_SIZE
         try:
             resp = requests.post(rpc_url, json=batch, timeout=20)
+            log.info("🔬DBG getAccountInfo chunk[%d] size=%d HTTP %s body[:300]=%r",
+                     chunk_idx, len(chunk), resp.status_code, resp.text[:300])
             resp.raise_for_status()
             for item in resp.json():
                 idx = item.get("id")
@@ -150,7 +155,8 @@ def _fetch_account_info_batch(addresses: list[str], rpc_url: str) -> dict[str, d
                 _account_cache[addr] = (info, now)
                 result[addr] = info
         except Exception as exc:
-            log.warning("_fetch_account_info_batch chunk failed: %s", exc)
+            log.warning("🔬DBG _fetch_account_info_batch chunk[%d] failed (size=%d): %s: %s",
+                        chunk_idx, len(chunk), type(exc).__name__, exc)
             for addr in chunk:
                 result[addr] = {"executable": False, "owner": ""}
 
@@ -232,6 +238,9 @@ def classify_and_filter(
     owner_map = resolve_owners_fn(token_account_addrs)
     log.info("  LP filter: resolved %d/%d token accounts to owners",
              len(owner_map), len(raw_holders))
+    _unresolved = [ta for ta in token_account_addrs if ta not in owner_map]
+    log.info("🔬DBG owner resolution: %d resolved, %d UNRESOLVED %s",
+             len(owner_map), len(_unresolved), [a[:8] for a in _unresolved[:25]])
 
     # Also cache Supabase lookup for resolved owners (different addresses)
     resolved_owners = list({v for v in owner_map.values() if v})
@@ -349,6 +358,11 @@ def classify_and_filter(
         "  LP filter: %d real holders, %d excluded | LP est %.2f%% supply",
         len(real_holders), len(excluded), lp_pct,
     )
+    _reason_counts: dict[str, int] = {}
+    for (_ta, _ow, _reason) in excluded:
+        _reason_counts[_reason] = _reason_counts.get(_reason, 0) + 1
+    log.info("🔬DBG classify_and_filter: %d real, %d excluded by reason=%s",
+             len(real_holders), len(excluded), _reason_counts)
 
     if supabase_client and (real_holders or excluded):
         _persist_classifications(real_holders, excluded, supabase_client)
