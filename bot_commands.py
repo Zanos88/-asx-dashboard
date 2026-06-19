@@ -51,6 +51,7 @@ from wallet_relationship_engine import (
     get_relationships_for_token,
     run_relationship_detection,
     backfill_from_supabase,
+    is_cluster_member,
 )
 from address_filters import classify_and_filter
 
@@ -1319,6 +1320,25 @@ def _run_wallet_backfill(
             _send(f"⏳ Backfill already running for <code>{short}</code> ({m}m {s}s ago).")
             return
         _active_backfills[wallet_address] = time.time()
+
+    # Block cluster members — coordinated wallets must not pollute smart_wallets
+    if sb:
+        cluster_info = is_cluster_member(wallet_address, sb)
+        if cluster_info:
+            rel_types = ", ".join(cluster_info["relationship_types"])
+            partner_count = len(cluster_info["partners"])
+            _send(
+                f"🚫 <b>Cluster member blocked</b> — <code>{short}</code>\n"
+                f"Wallet linked to {partner_count} partner(s) via {rel_types}.\n"
+                f"Not eligible for smart_wallets — coordinated activity, not individual alpha."
+            )
+            try:
+                sb.table("smart_wallets").delete().eq("wallet_address", wallet_address).execute()
+            except Exception:
+                pass
+            with _scan_lock:
+                _active_backfills.pop(wallet_address, None)
+            return
 
     try:
         if sb:

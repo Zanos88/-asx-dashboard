@@ -1142,6 +1142,48 @@ def get_cluster_for_wallet(wallet_address: str, supabase: Any) -> dict | None:
         return None
 
 
+_CLUSTER_RELATIONSHIP_TYPES = frozenset({
+    "TEMPORAL_CLUSTER", "JITO_BUNDLE", "COMMON_FUNDER", "ROUND_NUMBER_BUNDLE",
+})
+
+
+def is_cluster_member(wallet_address: str, supabase: Any) -> dict | None:
+    """
+    Check wallet_relationships for clustering relationship types.
+    Uses wallet_relationships as source of truth — wallet_clusters stores one
+    summary row per cluster, not one row per member, so it cannot be used for
+    per-wallet lookups.
+    Returns None if not a cluster member, or a dict with membership details.
+    """
+    if not supabase or not wallet_address:
+        return None
+    try:
+        r = (
+            supabase.table("wallet_relationships")
+            .select("wallet_a,wallet_b,relationship_type,confidence_score,token_address")
+            .in_("relationship_type", list(_CLUSTER_RELATIONSHIP_TYPES))
+            .or_(f"wallet_a.eq.{wallet_address},wallet_b.eq.{wallet_address}")
+            .limit(10)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return None
+        partners = list({
+            row["wallet_b"] if row["wallet_a"] == wallet_address else row["wallet_a"]
+            for row in rows
+        })
+        return {
+            "is_member":          True,
+            "relationship_count": len(rows),
+            "relationship_types": list({row["relationship_type"] for row in rows}),
+            "partners":           partners,
+        }
+    except Exception as exc:
+        log.warning("is_cluster_member check failed for %s: %s", wallet_address[:8], exc)
+    return None
+
+
 def get_relationships_for_token(token_address: str, supabase: Any) -> list[dict]:
     """Return all relationships for a token."""
     if not supabase:
