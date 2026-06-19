@@ -204,12 +204,12 @@ def write_snapshot_to_supabase(
     holders: list[dict],
     total_supply: float = 0.0,
     lp_pct_excluded: float = 0.0,
-) -> None:
+) -> int:
     if DRY_RUN:
         log.info("[DRY RUN] Supabase wallet_snapshots write skipped (%s)", symbol)
-        return
+        return 0
     if _supabase is None:
-        return
+        return 0
     denom        = total_supply if total_supply > 0 else sum(get_amount(h) for h in holders) or 1.0
     top10_pct    = sum(get_amount(h) / denom * 100 for h in holders[:10])
     holder_count = len(holders)
@@ -230,8 +230,10 @@ def write_snapshot_to_supabase(
     try:
         _supabase.table("wallet_snapshots").insert(rows).execute()
         log.info("  ✅ %d rows → wallet_snapshots (%s)", len(rows), symbol)
+        return len(rows)
     except Exception as exc:
         log.error("  ❌ wallet_snapshots insert failed for %s: %s", symbol, exc)
+        return 0
 
 
 def write_alert_to_supabase(
@@ -242,12 +244,12 @@ def write_alert_to_supabase(
     wallet_info: dict | None = None,
     price_ctx: dict | None = None,
     cluster_info: dict | None = None,
-) -> None:
+) -> int:
     if DRY_RUN:
         log.info("[DRY RUN] Supabase whale_alerts write skipped (%s)", symbol)
-        return
+        return 0
     if _supabase is None:
-        return
+        return 0
     now          = datetime.now(timezone.utc).isoformat()
     # Signed token delta: positive = accumulate, negative = distribute
     new_tokens   = change.get("new_tokens") or 0.0
@@ -281,6 +283,7 @@ def write_alert_to_supabase(
                 cluster_id_v = r.data[0].get("cluster_id")
         except Exception:
             pass
+    written = 0
     try:
         _supabase.table("whale_alerts").insert({
             "token_address": token_address, "token_symbol": symbol, "symbol": symbol,
@@ -294,6 +297,7 @@ def write_alert_to_supabase(
             "token_delta_usd": tok_delta_usd,
             "cluster_id":      cluster_id_v,
         }).execute()
+        written = 1
     except Exception as exc:
         log.error("  ❌ whale_alerts insert failed: %s", exc)
 
@@ -307,6 +311,7 @@ def write_alert_to_supabase(
         }).execute()
     except Exception as exc:
         log.error("  ❌ wallet_flow_changes insert failed: %s", exc)
+    return written
 
 
 def get_wallet_first_seen(address: str, symbol: str, rank: int) -> dict[str, Any]:
@@ -386,35 +391,39 @@ def persist_wallet_relationships(cross_holdings: dict[str, dict[str, float]]) ->
             log.error("❌ wallet_relationships upsert failed: %s", exc)
 
 
+_ROB_BATCH_SIZE = 5  # keep batches small — Helius rejects payloads with many accounts
+
+
 def resolve_owners_batch(token_account_addrs: list[str]) -> dict[str, str]:
-    """Batch-resolve SPL token account addresses → owner wallet addresses (one RPC call)."""
+    """Batch-resolve SPL token account addresses → owner wallet addresses."""
     if not token_account_addrs:
         return {}
     rpc_url = (
         f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
         if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
     )
-    batch = [
-        {"jsonrpc": "2.0", "id": i, "method": "getAccountInfo",
-         "params": [addr, {"encoding": "jsonParsed"}]}
-        for i, addr in enumerate(token_account_addrs)
-    ]
-    try:
-        resp = requests.post(rpc_url, json=batch, timeout=30)
-        resp.raise_for_status()
-        owners: dict[str, str] = {}
-        for item in resp.json():
-            idx   = item.get("id")
-            value = (item.get("result") or {}).get("value") or {}
-            data  = value.get("data") or {}
-            if isinstance(data, dict):
-                owner = (data.get("parsed") or {}).get("info", {}).get("owner")
-                if owner and idx is not None and idx < len(token_account_addrs):
-                    owners[token_account_addrs[idx]] = owner
-        return owners
-    except Exception as exc:
-        log.warning("resolve_owners_batch failed: %s", exc)
-        return {}
+    owners: dict[str, str] = {}
+    for chunk_start in range(0, len(token_account_addrs), _ROB_BATCH_SIZE):
+        chunk = token_account_addrs[chunk_start:chunk_start + _ROB_BATCH_SIZE]
+        batch = [
+            {"jsonrpc": "2.0", "id": i, "method": "getAccountInfo",
+             "params": [addr, {"encoding": "jsonParsed"}]}
+            for i, addr in enumerate(chunk)
+        ]
+        try:
+            resp = requests.post(rpc_url, json=batch, timeout=30)
+            resp.raise_for_status()
+            for item in resp.json():
+                idx   = item.get("id")
+                value = (item.get("result") or {}).get("value") or {}
+                data  = value.get("data") or {}
+                if isinstance(data, dict):
+                    owner = (data.get("parsed") or {}).get("info", {}).get("owner")
+                    if owner and idx is not None and idx < len(chunk):
+                        owners[chunk[idx]] = owner
+        except Exception as exc:
+            log.warning("resolve_owners_batch chunk failed: %s", exc)
+    return owners
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -1737,6 +1746,9 @@ def run_holder_monitor() -> None:
             if fb:
                 _supabase_fallbacks[symbol] = fb
 
+    snapshot_rows = 0
+    alert_rows    = 0
+
     # Pass 1: fetch all token holders + prices
     all_current:   dict[str, list[dict[str, Any]]] = {}
     all_price_ctx: dict[str, dict[str, Any]]        = {}
@@ -1782,7 +1794,7 @@ def run_holder_monitor() -> None:
             all_price_ctx[symbol] = fetch_price_context(token_address)
         except Exception:
             all_price_ctx[symbol] = {}
-        write_snapshot_to_supabase(
+        snapshot_rows += write_snapshot_to_supabase(
             symbol, token_address, current,
             total_supply=all_supplies.get(symbol, 0.0),
             lp_pct_excluded=filter_result["lp_pct"],
@@ -1911,7 +1923,7 @@ def run_holder_monitor() -> None:
                     token_flows.append({"address": addr, "delta": delta, "rank": new_rank})
                     log.info("  Alert sent — %s #%s %s %+.4f%%", symbol, new_rank, change_type, delta)
 
-                write_alert_to_supabase(
+                alert_rows += write_alert_to_supabase(
                     symbol, token_address, change, telegram_sent,
                     wallet_info=wallet_info,
                     price_ctx=price_ctx,
@@ -1939,11 +1951,45 @@ def run_holder_monitor() -> None:
     detect_coordinated_moves(all_run_changes, all_addresses, all_price_ctx)
     send_cross_coin_digest(cross_holdings, all_price_ctx, token_emojis)
 
+    log.info("── run_holder_monitor done — snapshots: %d rows, alerts: %d rows",
+             snapshot_rows, alert_rows)
+
+    if snapshot_rows == 0 and alert_rows == 0 and _supabase is not None:
+        try:
+            last = _supabase.table("wallet_snapshots") \
+                .select("captured_at").order("captured_at", desc=True).limit(1).execute()
+            if last.data:
+                last_ts = datetime.fromisoformat(
+                    last.data[0]["captured_at"].replace("Z", "+00:00")
+                )
+                hours_stale = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600
+                if hours_stale > 2:
+                    send_telegram(
+                        f"⚠️ <b>Monitor: 0 rows written this run</b>\n"
+                        f"Last snapshot was {hours_stale:.1f}h ago.\n"
+                        f"Tokens tracked: {list(TOKENS.keys())}\n"
+                        f"Check Railway/Actions logs for API or filter errors."
+                    )
+        except Exception as exc:
+            log.warning("stale-data check failed: %s", exc)
+
 
 def run() -> None:
     _load_bot_config_from_supabase()
     log_startup_diagnostics()
-    run_holder_monitor()
+    try:
+        run_holder_monitor()
+    except Exception as exc:
+        log.critical("run_holder_monitor crashed: %s", exc, exc_info=True)
+        try:
+            send_telegram(
+                f"🚨 <b>Monitor crashed</b>\n"
+                f"<code>{type(exc).__name__}: {exc}</code>\n"
+                f"Check Railway/Actions logs."
+            )
+        except Exception:
+            pass
+        raise
     _maybe_send_daily_digest()
     log.info("── Monitor complete")
 

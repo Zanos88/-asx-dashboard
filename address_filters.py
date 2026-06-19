@@ -81,6 +81,7 @@ KNOWN_EXCLUDED_ADDRESSES: frozenset[str] = frozenset({
 })
 
 _MIN_ADDR_LEN = 32
+_RPC_BATCH_SIZE = 5  # Helius rejects large batch getAccountInfo; 5 avoids 413
 
 
 def is_lp_or_system(owner: str) -> bool:
@@ -126,30 +127,32 @@ def _fetch_account_info_batch(addresses: list[str], rpc_url: str) -> dict[str, d
     if not to_fetch:
         return result
 
-    batch = [
-        {"jsonrpc": "2.0", "id": i, "method": "getAccountInfo",
-         "params": [addr, {"encoding": "base64"}]}
-        for i, addr in enumerate(to_fetch)
-    ]
-    try:
-        resp = requests.post(rpc_url, json=batch, timeout=20)
-        resp.raise_for_status()
-        for item in resp.json():
-            idx = item.get("id")
-            if idx is None or idx >= len(to_fetch):
-                continue
-            addr = to_fetch[idx]
-            value = (item.get("result") or {}).get("value") or {}
-            info: dict[str, Any] = {
-                "executable": bool(value.get("executable", False)),
-                "owner":      value.get("owner", ""),
-            }
-            _account_cache[addr] = (info, now)
-            result[addr] = info
-    except Exception as exc:
-        log.warning("_fetch_account_info_batch failed: %s", exc)
-        for addr in to_fetch:
-            result[addr] = {"executable": False, "owner": ""}
+    for chunk_start in range(0, len(to_fetch), _RPC_BATCH_SIZE):
+        chunk = to_fetch[chunk_start:chunk_start + _RPC_BATCH_SIZE]
+        batch = [
+            {"jsonrpc": "2.0", "id": i, "method": "getAccountInfo",
+             "params": [addr, {"encoding": "base64"}]}
+            for i, addr in enumerate(chunk)
+        ]
+        try:
+            resp = requests.post(rpc_url, json=batch, timeout=20)
+            resp.raise_for_status()
+            for item in resp.json():
+                idx = item.get("id")
+                if idx is None or idx >= len(chunk):
+                    continue
+                addr = chunk[idx]
+                value = (item.get("result") or {}).get("value") or {}
+                info: dict[str, Any] = {
+                    "executable": bool(value.get("executable", False)),
+                    "owner":      value.get("owner", ""),
+                }
+                _account_cache[addr] = (info, now)
+                result[addr] = info
+        except Exception as exc:
+            log.warning("_fetch_account_info_batch chunk failed: %s", exc)
+            for addr in chunk:
+                result[addr] = {"executable": False, "owner": ""}
 
     return result
 
