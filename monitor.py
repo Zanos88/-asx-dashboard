@@ -1003,6 +1003,20 @@ def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold:
                 "trigger": "pct+tokens" if (pct_trig and tok_trig) else ("pct" if pct_trig else "tokens"),
             })
 
+    # Sanity: same rank + same balance but different address = address-scheme drift
+    old_by_rank = {i + 1: h for i, h in enumerate(old_holders)}
+    new_by_rank = {i + 1: h for i, h in enumerate(new_holders)}
+    for rank, old_h in old_by_rank.items():
+        new_h = new_by_rank.get(rank)
+        if new_h and old_h["address"] != new_h["address"]:
+            if round(get_amount(old_h), 2) == round(get_amount(new_h), 2):
+                log.warning(
+                    "compare_holders: rank %d same balance %.2f but different address "
+                    "(%s → %s) — possible token-account/owner-wallet mismatch",
+                    rank, round(get_amount(old_h), 2),
+                    old_h["address"][:8], new_h["address"][:8],
+                )
+
     return changes
 
 
@@ -1842,6 +1856,35 @@ def run_holder_monitor() -> None:
 
             all_run_changes[symbol] = changes
             log.info("  %d change(s) detected", len(changes))
+
+            # Guard: suppress alerts when this looks like an address-scheme mismatch
+            # (token-account keys in old snapshot vs owner-wallet keys in new snapshot)
+            # rather than real whale activity. Requires BOTH conditions:
+            #   1. Mass turnover: >70% of positions simultaneously NEW and EXIT
+            #   2. Per-rank proof: >50% of rank-matched pairs have identical balance but
+            #      different address — a real coordinated dump has genuine balance changes
+            _new_c = sum(1 for c in changes if c["type"] == "NEW")
+            _exit_c = sum(1 for c in changes if c["type"] == "EXIT")
+            _total_pos = max(len(snapshot["holders"]), len(current), 1)
+            if _new_c / _total_pos > 0.7 and _exit_c / _total_pos > 0.7:
+                _old_by_rank = {i + 1: h for i, h in enumerate(snapshot["holders"])}
+                _new_by_rank = {i + 1: h for i, h in enumerate(current)}
+                _rank_overlap = set(_old_by_rank) & set(_new_by_rank)
+                _scheme_drift = sum(
+                    1 for r in _rank_overlap
+                    if _old_by_rank[r]["address"] != _new_by_rank[r]["address"]
+                    and round(get_amount(_old_by_rank[r]), 2) == round(get_amount(_new_by_rank[r]), 2)
+                )
+                if _rank_overlap and _scheme_drift / len(_rank_overlap) > 0.5:
+                    log.warning(
+                        "  %s: address-scheme mismatch detected (%.0f%% NEW+EXIT turnover, "
+                        "%.0f%% of rank-pairs same balance/different address) — "
+                        "suppressing alerts and refreshing baseline",
+                        symbol, _new_c / _total_pos * 100,
+                        _scheme_drift / len(_rank_overlap) * 100,
+                    )
+                    save_snapshot(symbol, current)
+                    continue
 
             # Dormant wallet wake: movement ≥0.001% by wallets inactive >7d
             _alerted_addrs   = {c["address"] for c in changes}
