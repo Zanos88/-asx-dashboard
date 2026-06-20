@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 
 import requests
+from curl_cffi import requests as cffi_requests
 from supabase import create_client
 
 logging.basicConfig(
@@ -27,8 +28,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SU
 
 # Pump.fun public graduation/bonding-curve endpoint (no auth required)
 PUMP_FUN_NEW_TOKENS_URL = "https://frontend-api.pump.fun/coins"
-# Raydium new AMM pool pairs (public)
-RAYDIUM_NEW_PAIRS_URL = "https://api.raydium.io/v2/main/pairs"
+# GeckoTerminal new Solana pools (replaces Raydium direct API — createTime field unreliable)
+GECKO_NEW_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
 
 BOT_CONFIG_KEY = "token_discovery_last_polled"
 # Maximum tokens to insert per platform per run (keep runs fast)
@@ -88,16 +89,18 @@ def _fetch_pump_fun(since: datetime | None) -> list[dict]:
 
     while len(results) < MAX_PER_PLATFORM:
         try:
-            resp = requests.get(
+            resp = cffi_requests.get(
                 PUMP_FUN_NEW_TOKENS_URL,
                 params={"limit": limit, "offset": offset, "sort": "created_timestamp", "order": "DESC"},
+                impersonate="chrome124",
                 timeout=20,
             )
             if resp.status_code == 429:
                 time.sleep(5)
-                resp = requests.get(
+                resp = cffi_requests.get(
                     PUMP_FUN_NEW_TOKENS_URL,
                     params={"limit": limit, "offset": offset, "sort": "created_timestamp", "order": "DESC"},
+                    impersonate="chrome124",
                     timeout=20,
                 )
             resp.raise_for_status()
@@ -135,46 +138,77 @@ def _fetch_pump_fun(since: datetime | None) -> list[dict]:
 
 def _fetch_raydium(since: datetime | None) -> list[dict]:
     """
-    Fetch recently created Raydium AMM pools.
-    /v2/main/pairs returns all pairs; we filter by createTime > since.
+    Fetch recently created Solana pools via GeckoTerminal new_pools endpoint.
+    The direct Raydium /v2/main/pairs API does not expose a reliable createTime field,
+    so GeckoTerminal is used instead — it returns pools sorted by creation time with
+    proper ISO timestamps and covers Raydium, Orca, Meteora, etc.
     """
     since_ts = since.timestamp() if since else 0.0
-    try:
-        resp = requests.get(RAYDIUM_NEW_PAIRS_URL, timeout=30)
-        if resp.status_code == 429:
-            time.sleep(5)
-            resp = requests.get(RAYDIUM_NEW_PAIRS_URL, timeout=30)
-        resp.raise_for_status()
-        pairs = resp.json()
-    except Exception as exc:
-        log.warning("Raydium fetch failed: %s", exc)
-        return []
-
     results = []
-    # pairs sorted by createTime desc on Raydium
-    for pair in pairs:
-        created_ts = pair.get("createTime", 0)
-        if isinstance(created_ts, str):
-            try:
-                created_ts = float(created_ts)
-            except ValueError:
+
+    for page in range(1, 4):  # up to 3 pages × 20 pools = 60
+        try:
+            resp = requests.get(
+                GECKO_NEW_POOLS_URL,
+                params={"page": page},
+                headers={"Accept": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code == 429:
+                time.sleep(5)
+                resp = requests.get(
+                    GECKO_NEW_POOLS_URL,
+                    params={"page": page},
+                    headers={"Accept": "application/json"},
+                    timeout=20,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("GeckoTerminal fetch failed (page %d): %s", page, exc)
+            break
+
+        pools = data.get("data") or []
+        if not pools:
+            break
+
+        for pool in pools:
+            attrs = pool.get("attributes") or {}
+            created_at_str = attrs.get("pool_created_at")
+            if not created_at_str:
                 continue
-        if created_ts <= since_ts:
-            break
-        # Raydium pairs are token/SOL or token/USDC — use baseMint as the token address
-        mint = pair.get("baseMint")
-        if not mint or mint in ("So11111111111111111111111111111111111111112",):
-            continue  # skip SOL itself
-        results.append({
-            "token_address":       mint,
-            "token_symbol":        pair.get("name", "").split("-")[0].strip() or None,
-            "platform":            "raydium",
-            "pool_created_at":     datetime.fromtimestamp(created_ts, tz=timezone.utc).isoformat(),
-            "initial_liquidity_usd": float(pair.get("liquidity") or 0),
-            "is_watched":          False,
-        })
-        if len(results) >= MAX_PER_PLATFORM:
-            break
+            try:
+                created_ts = datetime.fromisoformat(
+                    created_at_str.replace("Z", "+00:00")
+                ).timestamp()
+            except Exception:
+                continue
+            if created_ts <= since_ts:
+                return results  # past watermark — subsequent pages are older
+
+            rels = pool.get("relationships") or {}
+            base_data = (rels.get("base_token") or {}).get("data") or {}
+            raw_id = base_data.get("id", "")
+            # GeckoTerminal IDs are "<network>_<mint_address>"
+            mint = raw_id.split("_", 1)[-1] if "_" in raw_id else raw_id
+            if not mint or mint == "So11111111111111111111111111111111111111112":
+                continue  # skip SOL itself
+
+            dex_data = (rels.get("dex") or {}).get("data") or {}
+            platform = dex_data.get("id") or "solana_dex"
+
+            results.append({
+                "token_address":         mint,
+                "token_symbol":          attrs.get("name", "").split("/")[0].strip() or None,
+                "platform":              platform,
+                "pool_created_at":       created_at_str,
+                "initial_liquidity_usd": float(attrs.get("reserve_in_usd") or 0),
+                "is_watched":            False,
+            })
+            if len(results) >= MAX_PER_PLATFORM:
+                return results
+
+        time.sleep(0.3)
 
     return results
 
@@ -196,7 +230,7 @@ def main() -> None:
     log.info("Pump.fun: %d new tokens fetched", len(pump_tokens))
 
     raydium_tokens = _fetch_raydium(last_polled)
-    log.info("Raydium: %d new tokens fetched", len(raydium_tokens))
+    log.info("GeckoTerminal (Solana new pools): %d new tokens fetched", len(raydium_tokens))
 
     all_tokens = pump_tokens + raydium_tokens
     inserted = _insert_tokens(sb, all_tokens)
