@@ -17,6 +17,7 @@ Safe by design:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -28,7 +29,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────────────────────
 CONFIDENCE = {
     "JITO_BUNDLE":           99,
     "INTER_TRANSFER":        95,
@@ -43,7 +44,7 @@ HELIUS_TX_RATE_SEC = 0.13   # ~8 req/sec headroom under 10/sec limit
 _FUNDER_CACHE: dict[str, str | None] = {}   # wallet → funder (None = not found)
 
 
-# ── Union-Find for cluster building ─────────────────────────────────────────
+# ── Union-Find for cluster building ───────────────────────────────────────────────
 
 class UnionFind:
     def __init__(self) -> None:
@@ -66,7 +67,7 @@ class UnionFind:
         return {k: sorted(v) for k, v in result.items() if len(v) >= 2}
 
 
-# ── Helius helpers ─────────────────────────────────────────────────────────
+# ── Helius helpers ─────────────────────────────────────────────────────────────────────────
 
 def _helius_get_transactions(
     wallet: str,
@@ -172,7 +173,7 @@ def _get_cached_txns(wallet: str, token_address: str, supabase: Any) -> list[dic
         return []
 
 
-# ── Detection methods ─────────────────────────────────────────────────────
+# ── Detection methods ──────────────────────────────────────────────────────────────────────
 
 def detect_cross_token_holders(
     cross_holdings: dict[str, dict[str, float]],
@@ -593,7 +594,7 @@ def detect_jito_bundles(
     return relationships
 
 
-# ── Supabase persistence ─────────────────────────────────────────────────
+# ── Supabase persistence ──────────────────────────────────────────────────────────────────────
 
 def _get_balance(h: dict) -> float:
     """Extract token balance from either classify_and_filter or wallet_snapshots format."""
@@ -770,27 +771,25 @@ def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
 
     if not rows:
         return
-    # Split by tx_signature presence — each subset hits its own partial unique index.
-    tx_rows    = [r for r in rows if r.get("tx_signature")]
-    no_tx_rows = [r for r in rows if not r.get("tx_signature")]
-    for i in range(0, len(tx_rows), 50):
-        chunk = tx_rows[i:i + 50]
+    # PostgREST cannot use partial unique indexes in ON CONFLICT (no WHERE clause support).
+    # Assign a stable synthetic tx_signature for null-tx rows so every row uses the
+    # same non-partial unique index (wallet_a, wallet_b, tx_signature WHERE NOT NULL).
+    for row in rows:
+        if not row.get("tx_signature"):
+            key = (
+                f"{row['wallet_a']}:{row['wallet_b']}"
+                f":{row['relationship_type']}:{row.get('token_address', '')}"
+            )
+            row["tx_signature"] = "syn:" + hashlib.md5(key.encode()).hexdigest()[:16]
+    for i in range(0, len(rows), 50):
+        chunk = rows[i:i + 50]
         try:
             supabase.table("relationship_evidence").upsert(
                 chunk,
                 on_conflict="wallet_a,wallet_b,tx_signature",
             ).execute()
         except Exception as exc:
-            log.debug("  [relation] evidence write (tx) failed (chunk %d): %s", i, exc)
-    for i in range(0, len(no_tx_rows), 50):
-        chunk = no_tx_rows[i:i + 50]
-        try:
-            supabase.table("relationship_evidence").upsert(
-                chunk,
-                on_conflict="wallet_a,wallet_b,relationship_type",
-            ).execute()
-        except Exception as exc:
-            log.debug("  [relation] evidence write (no-tx) failed (chunk %d): %s", i, exc)
+            log.debug("  [relation] evidence write failed (chunk %d): %s", i, exc)
 
 
 def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
@@ -813,7 +812,7 @@ def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
     return saved
 
 
-# ── Cluster builder ───────────────────────────────────────────────────────
+# ── Cluster builder ────────────────────────────────────────────────────────────────────────────
 
 def build_clusters(
     token_address: str,
@@ -978,7 +977,7 @@ def build_clusters(
     return cluster_summaries
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────
+# ── Orchestrator ──────────────────────────────────────────────────────────────────────────────
 
 def run_relationship_detection(
     token_address: str,
@@ -1080,7 +1079,7 @@ def run_relationship_detection(
     return clusters
 
 
-# ── Query helpers (for bot commands) ─────────────────────────────────────
+# ── Query helpers (for bot commands) ─────────────────────────────────────────────────
 
 def get_wallet_clusters_for_token(token_address: str, supabase: Any) -> list[dict]:
     """Return all clusters for a token, grouped by cluster_id."""
@@ -1203,7 +1202,7 @@ def get_relationships_for_token(token_address: str, supabase: Any) -> list[dict]
         return []
 
 
-# ── Backfill ─────────────────────────────────────────────────────────────
+# ── Backfill ───────────────────────────────────────────────────────────────────────────────
 
 def backfill_from_supabase(
     tokens: dict[str, str],
@@ -1320,7 +1319,7 @@ def backfill_from_supabase(
     smart_money = sum(1 for _ in range(total_clusters) if _ >= len(high_risk_clusters))
     biggest = max(high_risk_clusters, key=lambda c: c.get("total_supply_pct", 0), default=None)
 
-    log.info("── Backfill complete ─────────────────────────────────")
+    log.info("── Backfill complete ─────────────────────")
     log.info("Found %d relationships across %d unique wallets",
              total_relationships, sum(len(list(tokens)) for _ in [1]))
     log.info("%d clusters detected (%d bundled, %d coordinated, %d smart money)",
