@@ -17,6 +17,7 @@ Safe by design:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -770,27 +771,25 @@ def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
 
     if not rows:
         return
-    # Split by tx_signature presence — each subset hits its own partial unique index.
-    tx_rows    = [r for r in rows if r.get("tx_signature")]
-    no_tx_rows = [r for r in rows if not r.get("tx_signature")]
-    for i in range(0, len(tx_rows), 50):
-        chunk = tx_rows[i:i + 50]
+    # PostgREST cannot use partial unique indexes in ON CONFLICT (no WHERE clause support).
+    # Assign a stable synthetic tx_signature for null-tx rows so every row uses the
+    # same non-partial unique index (wallet_a, wallet_b, tx_signature WHERE NOT NULL).
+    for row in rows:
+        if not row.get("tx_signature"):
+            key = (
+                f"{row['wallet_a']}:{row['wallet_b']}"
+                f":{row['relationship_type']}:{row.get('token_address', '')}"
+            )
+            row["tx_signature"] = "syn:" + hashlib.md5(key.encode()).hexdigest()[:16]
+    for i in range(0, len(rows), 50):
+        chunk = rows[i:i + 50]
         try:
             supabase.table("relationship_evidence").upsert(
                 chunk,
                 on_conflict="wallet_a,wallet_b,tx_signature",
             ).execute()
         except Exception as exc:
-            log.debug("  [relation] evidence write (tx) failed (chunk %d): %s", i, exc)
-    for i in range(0, len(no_tx_rows), 50):
-        chunk = no_tx_rows[i:i + 50]
-        try:
-            supabase.table("relationship_evidence").upsert(
-                chunk,
-                on_conflict="wallet_a,wallet_b,relationship_type",
-            ).execute()
-        except Exception as exc:
-            log.debug("  [relation] evidence write (no-tx) failed (chunk %d): %s", i, exc)
+            log.debug("  [relation] evidence write failed (chunk %d): %s", i, exc)
 
 
 def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
