@@ -1428,7 +1428,7 @@ def _run_wallet_evidence_scan(
         r = (
             sb.table("wallet_clusters")
             .select("cluster_id,token_symbol")
-            .eq("wallet_address", wallet_address)
+            .filter("wallet_addresses", "cs", f"{{{wallet_address}}}")
             .limit(1)
             .execute()
         )

@@ -662,8 +662,8 @@ def detect_round_number_holders(
                         "balance_b":      w2["balance"],
                         "group_size":     len(group),
                     }),
-                    "detected_at": now_iso,
-                    "updated_at":  now_iso,
+                    "first_detected": now_iso,
+                    "last_confirmed": now_iso,
                 })
 
     return relationships
@@ -713,8 +713,8 @@ def detect_identical_balance_pairs(
                         "balance_b": b2,
                         "diff_pct":  round(diff_pct, 4),
                     }),
-                    "detected_at": now_iso,
-                    "updated_at":  now_iso,
+                    "first_detected": now_iso,
+                    "last_confirmed": now_iso,
                 })
 
     return relationships
@@ -770,15 +770,27 @@ def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
 
     if not rows:
         return
-    for i in range(0, len(rows), 50):
-        chunk = rows[i:i + 50]
+    # Split by tx_signature presence — each subset hits its own partial unique index.
+    tx_rows    = [r for r in rows if r.get("tx_signature")]
+    no_tx_rows = [r for r in rows if not r.get("tx_signature")]
+    for i in range(0, len(tx_rows), 50):
+        chunk = tx_rows[i:i + 50]
         try:
             supabase.table("relationship_evidence").upsert(
                 chunk,
                 on_conflict="wallet_a,wallet_b,tx_signature",
             ).execute()
         except Exception as exc:
-            log.debug("  [relation] evidence write failed (chunk %d): %s", i, exc)
+            log.debug("  [relation] evidence write (tx) failed (chunk %d): %s", i, exc)
+    for i in range(0, len(no_tx_rows), 50):
+        chunk = no_tx_rows[i:i + 50]
+        try:
+            supabase.table("relationship_evidence").upsert(
+                chunk,
+                on_conflict="wallet_a,wallet_b,relationship_type",
+            ).execute()
+        except Exception as exc:
+            log.debug("  [relation] evidence write (no-tx) failed (chunk %d): %s", i, exc)
 
 
 def upsert_relationships(relationships: list[dict], supabase: Any) -> int:
@@ -937,30 +949,29 @@ def build_clusters(
         }
         cluster_summaries.append(summary)
 
-        # One row per wallet in cluster
-        for wallet in members:
-            rows_for_db.append({
-                "token_address":        token_address,
-                "token_symbol":         token_symbol,
-                "cluster_id":           cluster_id,
-                "wallet_address":       wallet,
-                "cluster_type":         cluster_type,
-                "detection_method":     det_method,
-                "total_supply_pct":     round(total_pct, 4),
-                "individual_supply_pct": round(supply_map.get(wallet, 0.0), 4),
-                "risk_level":           risk_level,
-                "funder_address":       funder,
-                "first_bundle_tx":      bundle_tx,
-                "wallet_count":         len(members),
-                "updated_at":           now_iso,
-            })
+        # One summary row per cluster (wallet_addresses array, not one row per member)
+        rows_for_db.append({
+            "token_address":    token_address,
+            "token_symbol":     token_symbol,
+            "cluster_id":       cluster_id,
+            "wallet_addresses": sorted(members),
+            "wallet_count":     len(members),
+            "cluster_type":     cluster_type,
+            "detection_method": det_method,
+            "total_supply_pct": round(total_pct, 4),
+            "risk_level":       risk_level,
+            "funder_address":   funder,
+            "first_bundle_tx":  bundle_tx,
+            "updated_at":       now_iso,
+        })
 
-    # Persist clusters
+    # Persist clusters — upsert on cluster_id (unique constraint added in migration)
     if supabase and rows_for_db:
         try:
-            supabase.table("wallet_clusters").delete().eq("token_address", token_address).execute()
-            supabase.table("wallet_clusters").insert(rows_for_db).execute()
-            log.info("  [cluster] %d clusters (%d rows) saved for %s", len(cluster_summaries), len(rows_for_db), token_symbol)
+            supabase.table("wallet_clusters").upsert(
+                rows_for_db, on_conflict="cluster_id"
+            ).execute()
+            log.info("  [cluster] %d clusters saved for %s", len(rows_for_db), token_symbol)
         except Exception as exc:
             log.warning("  [cluster] wallet_clusters save failed: %s", exc)
 
@@ -1084,24 +1095,21 @@ def get_wallet_clusters_for_token(token_address: str, supabase: Any) -> list[dic
             .execute()
         )
         rows = r.data or []
-        # Group by cluster_id
-        clusters: dict[str, dict] = {}
+        # One row per cluster — wallet_addresses array is already populated
+        result = []
         for row in rows:
-            cid = row["cluster_id"]
-            if cid not in clusters:
-                clusters[cid] = {
-                    "cluster_id":       cid,
-                    "cluster_type":     row.get("cluster_type"),
-                    "detection_method": row.get("detection_method"),
-                    "total_supply_pct": row.get("total_supply_pct"),
-                    "risk_level":       row.get("risk_level"),
-                    "funder_address":   row.get("funder_address"),
-                    "first_bundle_tx":  row.get("first_bundle_tx"),
-                    "wallet_count":     row.get("wallet_count"),
-                    "wallets":          [],
-                }
-            clusters[cid]["wallets"].append(row["wallet_address"])
-        return sorted(clusters.values(), key=lambda c: -(c.get("total_supply_pct") or 0))
+            result.append({
+                "cluster_id":       row["cluster_id"],
+                "cluster_type":     row.get("cluster_type"),
+                "detection_method": row.get("detection_method"),
+                "total_supply_pct": row.get("total_supply_pct"),
+                "risk_level":       row.get("risk_level"),
+                "funder_address":   row.get("funder_address"),
+                "first_bundle_tx":  row.get("first_bundle_tx"),
+                "wallet_count":     row.get("wallet_count"),
+                "wallets":          row.get("wallet_addresses") or [],
+            })
+        return sorted(result, key=lambda c: -(c.get("total_supply_pct") or 0))
     except Exception as exc:
         log.warning("get_wallet_clusters_for_token failed: %s", exc)
         return []
@@ -1115,7 +1123,7 @@ def get_cluster_for_wallet(wallet_address: str, supabase: Any) -> dict | None:
         r = (
             supabase.table("wallet_clusters")
             .select("*")
-            .eq("wallet_address", wallet_address)
+            .filter("wallet_addresses", "cs", f"{{{wallet_address}}}")
             .order("updated_at", desc=True)
             .limit(1)
             .execute()
@@ -1124,18 +1132,10 @@ def get_cluster_for_wallet(wallet_address: str, supabase: Any) -> dict | None:
         if not rows:
             return None
         row = rows[0]
-        cid = row["cluster_id"]
-        # Fetch all wallets in this cluster
-        r2 = (
-            supabase.table("wallet_clusters")
-            .select("wallet_address")
-            .eq("cluster_id", cid)
-            .execute()
-        )
-        all_members = [x["wallet_address"] for x in (r2.data or [])]
+        # wallet_addresses array is already on the row — no second query needed
         return {
             **row,
-            "wallets": all_members,
+            "wallets": row.get("wallet_addresses") or [],
         }
     except Exception as exc:
         log.warning("get_cluster_for_wallet failed: %s", exc)

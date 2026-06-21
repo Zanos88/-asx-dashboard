@@ -279,8 +279,8 @@ def write_alert_to_supabase(
             cluster_id_v = cid
     if cluster_id_v is None and _supabase:
         try:
-            r = _supabase.table("wallet_clusters").select("cluster_id").eq(
-                "wallet_address", change["address"]
+            r = _supabase.table("wallet_clusters").select("cluster_id").filter(
+                "wallet_addresses", "cs", f'{{{change["address"]}}}'
             ).eq("token_symbol", symbol).order("updated_at", desc=True).limit(1).execute()
             if r.data:
                 cluster_id_v = r.data[0].get("cluster_id")
