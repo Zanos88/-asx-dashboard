@@ -1,0 +1,40 @@
+{
+    "inputMint": "So11111111111111111111111111111111111111112",
+    "inAmount": "50000000",
+    "outputMint": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS",
+    "outAmount": "4535836288",
+    "otherAmountThreshold": "4513157107",
+    "swapMode": "ExactIn",
+    "slippageBps": 50,
+    "platformFee": null,
+    "priceImpactPct": "0",
+    "routePlan": [
+        {
+            "swapInfo": {
+                "ammKey": "Eb9qkfiSzKd185KdWLkZrMrejKEbA2ah2BK7spNmoPej",
+                "label": "Raydium",
+                "inputMint": "So11111111111111111111111111111111111111112",
+                "outputMint": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS",
+                "inAmount": "50000000",
+                "outAmount": "4535836288"
+            },
+            "percent": 100,
+            "bps": null
+        }
+    ],
+    "contextSlot": 428499552,
+    "timeTaken": 0.000257159,
+    "swapUsdValue": "3.4819130390686450868699350396",
+    "mostReliableAmmsQuoteReport": {
+        "info": {
+            "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE": "Not used RG: Full, contains ALT: true",
+            "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS": "No MRP"
+        }
+    },
+    "longtailMarketQuoteReport": null,
+    "useIncurredSlippageForQuoting": null,
+    "useRewards": null,
+    "otherRoutePlans": null,
+    "loadedLongtailToken": false,
+    "instructionVersion": null
+}
