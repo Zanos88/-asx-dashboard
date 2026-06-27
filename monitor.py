@@ -1022,10 +1022,17 @@ def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold:
 
 # ── Cross-coin intelligence ───────────────────────────────────────────────────
 
-def build_cross_holdings(all_current: dict[str, list[dict]]) -> dict[str, dict[str, float]]:
+def build_cross_holdings(
+    all_current: dict[str, list[dict]],
+    all_supplies: dict[str, float] | None = None,
+) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
+    all_supplies = all_supplies or {}
     for symbol, holders in all_current.items():
-        total = sum(get_amount(h) for h in holders) or 1.0
+        # Use true total supply as denominator (same as write_snapshot_to_supabase),
+        # NOT the sum of filtered ex-LP holders — otherwise percentages are inflated
+        # by the LP/untracked fraction (token-specific 3-3.5x).
+        total = all_supplies.get(symbol, 0.0) or sum(get_amount(h) for h in holders) or 1.0
         for h in holders:
             addr = h["address"]
             pct  = get_amount(h) / total * 100
@@ -1812,7 +1819,7 @@ def run_holder_monitor() -> None:
             lp_pct_excluded=filter_result["lp_pct"],
         )
 
-    cross_holdings = build_cross_holdings(all_current)
+    cross_holdings = build_cross_holdings(all_current, all_supplies)
     persist_wallet_relationships(cross_holdings)
 
     # Run relationship detection + cluster building for each tracked token
