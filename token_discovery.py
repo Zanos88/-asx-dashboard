@@ -233,6 +233,14 @@ def main() -> None:
     log.info("GeckoTerminal (Solana new pools): %d new tokens fetched", len(raydium_tokens))
 
     all_tokens = pump_tokens + raydium_tokens
+    # Dedupe by token_address — GeckoTerminal lists the same base token across
+    # multiple pools, so the batch can contain duplicate token_address values.
+    # PostgreSQL rejects an upsert that touches the same ON CONFLICT target twice
+    # in one command (error 21000), failing the entire insert.
+    deduped: dict[str, dict] = {}
+    for t in all_tokens:
+        deduped.setdefault(t["token_address"], t)
+    all_tokens = list(deduped.values())
     inserted = _insert_tokens(sb, all_tokens)
     log.info("Inserted %d rows into discovered_tokens", inserted)
 
