@@ -379,7 +379,18 @@ def detect_inter_transfers(
         unique_txs = {t.get("tx_signature"): t for t in txs if t.get("tx_signature")}
         if not unique_txs:
             continue
-        latest = max(unique_txs.values(), key=lambda t: t.get("block_time") or "")
+        ordered = sorted(unique_txs.values(), key=lambda t: t.get("block_time") or "")
+        latest = ordered[-1]
+        # Retain per-tx detail (sig, amount, time) so _write_evidence_rows can persist a
+        # verifiable relationship_evidence row per transfer. Capped to bound JSON size.
+        transfers = [
+            {
+                "sig":    t.get("tx_signature"),
+                "amount": t.get("amount"),
+                "time":   t.get("block_time"),
+            }
+            for t in ordered[-50:]
+        ]
         relationships.append({
             "wallet_a":          a,
             "wallet_b":          b,
@@ -390,6 +401,7 @@ def detect_inter_transfers(
                 "latest_tx":      latest.get("tx_signature"),
                 "latest_time":    latest.get("block_time"),
                 "token_symbol":   token_symbol,
+                "transfers":      transfers,
             }),
             "confidence_score":  CONFIDENCE["INTER_TRANSFER"],
         })
@@ -721,6 +733,28 @@ def detect_identical_balance_pairs(
     return relationships
 
 
+def _normalize_block_time(value: Any) -> str | None:
+    """
+    Normalize a block-time value to an ISO-8601 string for the timestamptz column.
+    Accepts unix-epoch (int or numeric string, e.g. "1782628760") and ISO strings
+    (e.g. "2026-06-28T10:24:05+00:00"). Returns None if unparseable.
+    """
+    if value is None or value == "":
+        return None
+    s = str(value).strip()
+    # Unix epoch seconds (all digits)
+    if s.isdigit():
+        try:
+            return datetime.fromtimestamp(int(s), tz=timezone.utc).isoformat()
+        except Exception:
+            return None
+    # ISO string
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).isoformat()
+    except Exception:
+        return None
+
+
 def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
     """
     Write per-tx evidence rows to relationship_evidence for high-confidence detections.
@@ -731,8 +765,8 @@ def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
     rows: list[dict] = []
     for rel in relationships:
         rel_type = rel.get("relationship_type", "")
-        if rel_type not in ("JITO_BUNDLE", "COMMON_FUNDER", "ROUND_NUMBER_BUNDLE",
-                            "IDENTICAL_BALANCE"):
+        if rel_type not in ("JITO_BUNDLE", "INTER_TRANSFER", "COMMON_FUNDER",
+                            "ROUND_NUMBER_BUNDLE", "IDENTICAL_BALANCE"):
             continue
         wa, wb = rel.get("wallet_a", ""), rel.get("wallet_b", "")
         if not wa or not wb:
@@ -751,11 +785,33 @@ def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
                     "wallet_b":          max(wa, wb),
                     "relationship_type": "JITO_BUNDLE",
                     "tx_signature":      sig,
+                    "block_time":        None,
                     "token_address":     rel.get("token_address"),
                     "raw_json":          {
                         "bundle_id":       ev.get("bundle_id"),
                         "bundled_wallets": ev.get("bundled_wallets"),
                         "detection_note":  ev.get("detection_note"),
+                    },
+                })
+        elif rel_type == "INTER_TRANSFER":
+            # One evidence row per real on-chain token transfer between the two wallets.
+            # These are token transfers (not SOL), so the token amount goes in raw_json,
+            # not the amount_sol column. tx_signature + block_time are real on-chain values.
+            for tr in (ev.get("transfers") or []):
+                sig = tr.get("sig")
+                if not sig:
+                    continue
+                rows.append({
+                    "wallet_a":          min(wa, wb),
+                    "wallet_b":          max(wa, wb),
+                    "relationship_type": "INTER_TRANSFER",
+                    "tx_signature":      sig,
+                    "block_time":        _normalize_block_time(tr.get("time")),
+                    "token_address":     rel.get("token_address"),
+                    "raw_json":          {
+                        "token_amount":   tr.get("amount"),
+                        "transfer_count": ev.get("transfer_count"),
+                        "token_symbol":   ev.get("token_symbol"),
                     },
                 })
         else:
@@ -765,6 +821,7 @@ def _write_evidence_rows(relationships: list[dict], supabase: Any) -> None:
                 "wallet_b":          max(wa, wb),
                 "relationship_type": rel_type,
                 "tx_signature":      None,
+                "block_time":        None,
                 "token_address":     rel.get("token_address"),
                 "raw_json":          ev,
             })
