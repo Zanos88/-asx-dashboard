@@ -725,10 +725,14 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
     ts       = tx.get("timestamp", 0)
     time_str = datetime.utcfromtimestamp(ts).strftime("%H:%M:%S UTC") if ts else "—"
 
+    # Live mint→symbol map from tracked_tokens (so newly added tokens like ANSEM are
+    # labelled correctly), falling back to the static registry.
+    live_registry = {addr: sym for sym, addr in _get_tracked_tokens().items()} or TOKEN_REGISTRY
+
     for tt in tx.get("tokenTransfers", []):
         try:
             mint      = tt.get("mint", "")
-            symbol    = TOKEN_REGISTRY.get(mint, f"{mint[:8]}...")
+            symbol    = live_registry.get(mint, TOKEN_REGISTRY.get(mint, f"{mint[:8]}..."))
             amount    = float(tt.get("tokenAmount", 0) or 0)
             usd_val   = float(tt.get("tokenAmountUsd", 0) or 0)
 

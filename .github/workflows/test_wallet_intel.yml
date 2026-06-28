@@ -1,0 +1,45 @@
+name: Test Wallet Intel (verify fixed fetch_wallet_intel)
+
+# Runs the PRODUCTION monitor.fetch_wallet_intel against a wallet and prints the full
+# result (SOL balance, total_usd_est, holdings_count, other_holdings) so the fix can be
+# verified against an independent getBalance check (verify_wallet workflow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      wallet:
+        description: "Wallet address"
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run fetch_wallet_intel
+        env:
+          HELIUS_API_KEY:            ${{ secrets.HELIUS_API_KEY }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_KEY:      ${{ secrets.SUPABASE_SERVICE_KEY }}
+          WALLET:                    ${{ inputs.wallet }}
+        run: |
+          python3 - <<'PY'
+          import os, json
+          from monitor import fetch_wallet_intel
+          w = os.environ["WALLET"].strip()
+          intel = fetch_wallet_intel(w, "__none__")
+          print("== fetch_wallet_intel for", w, "==")
+          print("sol_balance     :", intel.get("sol_balance"))
+          print("sol_usd         :", intel.get("sol_usd"))
+          print("holdings_count  :", intel.get("holdings_count"))
+          print("unpriced_count  :", intel.get("unpriced_count"))
+          print("total_usd_est   :", intel.get("total_usd_est"))
+          print("other_monitored :", json.dumps(intel.get("other_monitored")))
+          print("major_tokens    :", json.dumps(intel.get("major_tokens")))
+          print("other_holdings  :", json.dumps(intel.get("other_holdings"))[:1500])
+          PY

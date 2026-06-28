@@ -91,6 +91,8 @@ MIN_HOLDER_CHANGE_TOKENS = float(
 
 PUBLIC_SOLANA_RPC = _cfg.get("helius_fallback_rpc", "https://api.mainnet-beta.solana.com")
 ALERTS_MUTED: bool = False
+# Per-token Telegram mute (data collection unaffected — gate is in send_alert only).
+MUTED_TOKENS: set[str] = set()
 
 TOKENS: dict[str, str] = {
     sym: info["address"]
@@ -149,7 +151,7 @@ _supabase: Client | None = init_supabase()
 
 def _load_bot_config_from_supabase() -> None:
     """Override config.json values with live settings written by the Telegram bot."""
-    global MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS, TOKENS, ALERTS_MUTED
+    global MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS, TOKENS, ALERTS_MUTED, MUTED_TOKENS
     if _supabase is None:
         return
     try:
@@ -178,6 +180,17 @@ def _load_bot_config_from_supabase() -> None:
             ALERTS_MUTED = cfg["alerts_muted"].strip().lower() == "true"
             if ALERTS_MUTED:
                 log.info("bot_config override: alerts_muted=True — Telegram alerts suppressed")
+
+        if "muted_tokens" in cfg:
+            try:
+                ml = json.loads(cfg["muted_tokens"])
+                if isinstance(ml, list):
+                    MUTED_TOKENS = {str(s).strip().upper() for s in ml if str(s).strip()}
+                    if MUTED_TOKENS:
+                        log.info("bot_config override: muted_tokens=%s (Telegram only; data unaffected)",
+                                 sorted(MUTED_TOKENS))
+            except json.JSONDecodeError:
+                pass
     except Exception as exc:
         log.warning("Failed to load bot_config from Supabase: %s", exc)
 
@@ -199,6 +212,28 @@ def update_bot_config(key: str, value: str) -> bool:
     except Exception as exc:
         log.warning("bot_config update failed (%s): %s", key, exc)
         return False
+
+
+def get_live_tracked_tokens() -> dict[str, str]:
+    """
+    Single source of truth for the tracked-token set: reads bot_config.tracked_tokens
+    fresh (so any /addtoken takes effect everywhere without a redeploy). Falls back to the
+    module TOKENS (config.json) then the ALON literal. Used by commands/registries that
+    would otherwise read a stale import-time snapshot.
+    """
+    global _supabase
+    if _supabase is None:
+        _supabase = init_supabase()
+    if _supabase is not None:
+        try:
+            r = _supabase.table("bot_config").select("value").eq("key", "tracked_tokens").execute()
+            if r.data and r.data[0].get("value"):
+                parsed = json.loads(r.data[0]["value"])
+                if isinstance(parsed, dict) and parsed:
+                    return parsed
+        except Exception as exc:
+            log.warning("get_live_tracked_tokens read failed: %s", exc)
+    return dict(TOKENS) or {"ALON": "8XtRWb4uAAJFMP4QQhoYYCWR6XXb7ybcCdiqPwz9s5WS"}
 
 
 # ── Supabase writers ──────────────────────────────────────────────────────────
@@ -464,11 +499,21 @@ def send_telegram(msg: str, reply_markup: dict[str, Any] | None = None, *, chat_
     return True, ""
 
 
-def send_alert(msg: str, reply_markup: dict[str, Any] | None = None) -> tuple[bool, str]:
-    """Send alert to channel when configured, else fall back to owner chat."""
+def send_alert(msg: str, reply_markup: dict[str, Any] | None = None,
+               symbol: str | None = None) -> tuple[bool, str]:
+    """
+    Send alert to channel when configured, else fall back to owner chat.
+
+    Telegram-dispatch layer ONLY — this is the single mute gate, downstream of every
+    Supabase write. `symbol` (when provided) suppresses the send if that token is muted;
+    the caller has already persisted its data, so muting never reduces what's stored.
+    """
     if ALERTS_MUTED:
         log.info("Alerts muted — skipping Telegram send")
         return True, "muted"
+    if symbol and symbol.upper() in MUTED_TOKENS:
+        log.info("Token %s muted — skipping Telegram send (data still written)", symbol)
+        return True, f"muted:{symbol.upper()}"
     target = TELEGRAM_CHANNEL_ID or TELEGRAM_CHAT_ID
     if not target:
         return False, "no_targets"
@@ -557,8 +602,11 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
         return cached[0]
 
     result: dict[str, Any] = {
-        "other_monitored": {},  # sym -> {"amount": float, "usd": float, "rank": int|None}
-        "major_tokens":    {},  # sym -> {"amount": float, "usd": float}
+        "other_monitored": {},   # sym -> {"amount": float, "usd": float, "rank": int|None}
+        "major_tokens":    {},   # sym -> {"amount": float, "usd": float}
+        "other_holdings":  [],   # [{"mint","amount","usd"|None,"status"}] — untracked SPL tokens
+        "holdings_count":  0,    # total distinct SPL holdings with amount>0
+        "unpriced_count":  0,    # holdings whose USD price was unavailable (never defaulted to 0)
         "sol_balance":     None,
         "sol_usd":         None,
         "total_usd_est":   None,
@@ -603,19 +651,32 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
             except (KeyError, TypeError, ValueError):
                 continue
 
-            if mint not in mints_of_interest or amount <= 0:
+            if amount <= 0:
                 continue
 
-            sym   = mints_of_interest[mint]
+            result["holdings_count"] += 1
+            # Price EVERY holding (not just tracked/major) so total portfolio value is real.
+            # On price failure: record value-unavailable, never silently omit or default to 0.
             price = fetch_price_context(mint).get("price") or 0.0
-            usd   = round(amount * price, 2)
-            total_usd += usd
-            entry = {"amount": amount, "usd": usd}
-
-            if sym in TOKENS and sym != current_symbol:
-                result["other_monitored"][sym] = entry
+            if price > 0:
+                usd = round(amount * price, 2)
+                total_usd += usd
             else:
-                result["major_tokens"][sym] = entry
+                usd = None
+                result["unpriced_count"] += 1
+
+            sym = mints_of_interest.get(mint)
+            if sym:
+                entry = {"amount": amount, "usd": usd}
+                if sym in TOKENS and sym != current_symbol:
+                    result["other_monitored"][sym] = entry
+                else:
+                    result["major_tokens"][sym] = entry
+            else:
+                result["other_holdings"].append({
+                    "mint": mint, "amount": amount, "usd": usd,
+                    "status": "ok" if usd is not None else "value_unavailable",
+                })
 
         # Rank lookup for other monitored tokens (uses local disk snapshot — fast, no RPC)
         for sym, entry in result["other_monitored"].items():
@@ -633,13 +694,19 @@ def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, An
             "params":  [wallet_address],
         }, timeout=5)
         if sol_resp.ok:
+            # getBalance returns lamports in result.value; /1e9 → SOL (standard conversion).
             lamports = (sol_resp.json().get("result") or {}).get("value") or 0
             result["sol_balance"] = lamports / 1e9
-            if result["sol_balance"] and result["sol_balance"] >= 0.1:
+            # Value SOL whenever there is any balance (no >=0.1 gate) so the total is real
+            # even for small balances. Price-unavailable is flagged, never defaulted to 0.
+            if result["sol_balance"] and result["sol_balance"] > 0:
                 sol_price = fetch_price_context(WSOL_MINT).get("price") or 0.0
-                sol_usd = round(result["sol_balance"] * sol_price, 2)
-                result["sol_usd"] = sol_usd
-                total_usd += sol_usd
+                if sol_price > 0:
+                    sol_usd = round(result["sol_balance"] * sol_price, 2)
+                    result["sol_usd"] = sol_usd
+                    total_usd += sol_usd
+                else:
+                    result["unpriced_count"] += 1
 
         if total_usd > 0:
             result["total_usd_est"] = round(total_usd, 2)
@@ -1032,6 +1099,16 @@ def send_cross_coin_digest(
     if not multi:
         return
 
+    # Mute wins: if ANY token appearing in this digest is muted, suppress the Telegram
+    # send. Relationships were already persisted by persist_wallet_relationships(), so
+    # muting never drops data — only this cross-token Telegram message.
+    symbols_in_digest = {s.upper() for h in multi.values() for s in h}
+    muted_hit = symbols_in_digest & MUTED_TOKENS
+    if muted_hit:
+        log.info("Cross-coin digest suppressed — muted token(s) present: %s (data already written)",
+                 sorted(muted_hit))
+        return
+
     lines = [
         f"🕸 <b>Cross-coin Whales — {datetime.now(timezone.utc).strftime('%H:%M UTC')}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -1167,13 +1244,13 @@ def _notify_new_cluster(
             {"text": "🔍 Solscan",     "url": solscan_url},
             {"text": "🫧 Bubblemaps",  "url": bubblemap},
         ]]}
-        send_alert(msg, kb)
+        send_alert(msg, kb, symbol=symbol)
         if wallets[10:20]:
             msg2 = f"📋 <b>BUNDLED WALLETS — {symbol}</b> (continued)\n"
             msg2 += "━━━━━━━━━━━━━━━━━━━━━━\n"
             for rank, w in enumerate(wallets[10:20], 11):
                 msg2 += _wallet_line(rank, w)
-            send_alert(msg2)
+            send_alert(msg2, symbol=symbol)
     except Exception as exc:
         log.warning("_notify_new_cluster failed: %s", exc)
 
@@ -1319,7 +1396,7 @@ def detect_coordinated_moves(
                     f' | <a href="https://app.bubblemaps.io/sol/token/{token_address}">Bubblemaps</a>'
                 )
 
-            ok, err = send_alert("\n".join(lines))
+            ok, err = send_alert("\n".join(lines), symbol=symbol)
             if ok:
                 log.info("Coordinated move alert sent for %s (%d wallets)", symbol, len(group))
             else:
@@ -1466,26 +1543,41 @@ def format_quant_alert(
         total   = wallet_intel.get("total_usd_est")
 
         for sym, data in other.items():
-            usd    = data.get("usd", 0)
+            usd    = data.get("usd")
             rank   = data.get("rank")
             rank_s = f" (#{rank} holder)" if rank else ""
-            usd_s  = f" ~${usd:,.0f}" if usd >= 1 else ""
+            usd_s  = f" ~${usd:,.0f}" if (usd is not None and usd >= 1) else (
+                     " (value unavailable)" if usd is None else "")
             intel_lines.append(f"  • Also holds {sym}{rank_s}{usd_s}")
 
         major_parts = []
-        for sym, data in sorted(majors.items(), key=lambda kv: -kv[1].get("usd", 0)):
-            usd = data.get("usd", 0)
-            if usd >= 500:
+        for sym, data in sorted(majors.items(), key=lambda kv: -(kv[1].get("usd") or 0)):
+            usd = data.get("usd")
+            if usd is not None and usd >= 500:
                 major_parts.append(f"{sym}: ~${usd:,.0f}")
         if major_parts:
             intel_lines.append(f"  • {', '.join(major_parts[:4])}")
 
-        if sol_bal and sol_bal >= 0.1:
-            sol_usd = wallet_intel.get("sol_usd")
-            usd_s   = f" (~${sol_usd:,.0f})" if sol_usd and sol_usd >= 1 else ""
-            intel_lines.append(f"  • SOL: {sol_bal:.1f} SOL{usd_s}")
+        # Untracked SPL holdings (e.g. MANLET) — summarize value so the total reflects them.
+        others = wallet_intel.get("other_holdings", [])
+        if others:
+            oth_usd = sum(o["usd"] for o in others if o.get("usd") is not None)
+            unpriced = sum(1 for o in others if o.get("usd") is None)
+            parts = [f"+{len(others)} other token{'s' if len(others) != 1 else ''}"]
+            if oth_usd >= 1:
+                parts.append(f"~${oth_usd:,.0f}")
+            if unpriced:
+                parts.append(f"{unpriced} value unavailable")
+            intel_lines.append(f"  • {' '.join(parts)}")
 
-        if total and total >= 100:
+        if sol_bal and sol_bal > 0:
+            sol_usd = wallet_intel.get("sol_usd")
+            bal_str = f"{sol_bal:.3f}".rstrip("0").rstrip(".")
+            usd_s   = f" (~${sol_usd:,.2f})" if (sol_usd is not None and sol_usd >= 0.01) else (
+                      " (value unavailable)" if sol_usd is None else "")
+            intel_lines.append(f"  • SOL: {bal_str} SOL{usd_s}")
+
+        if total and total >= 1:
             intel_lines.append(f"  • Est. total portfolio: ~${total:,.0f}")
 
         if intel_lines:
@@ -1538,7 +1630,7 @@ def send_hourly_digest(symbol: str, token_address: str, flows: list[dict], price
         f"💵 {symbol} Price: {price_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
-    ok, err = send_alert(msg)
+    ok, err = send_alert(msg, symbol=symbol)
     if not ok:
         log.error("Flow digest failed: %s", err)
     else:
@@ -1904,7 +1996,7 @@ def run_holder_monitor() -> None:
                         f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━"
                     )
-                    send_alert(_dmsg, reply_markup=make_inline_keyboard(_addr, token_address))
+                    send_alert(_dmsg, reply_markup=make_inline_keyboard(_addr, token_address), symbol=symbol)
                     log.info("  Dormant wake: %s %s (inactive %d days)", symbol, _addr[:8], _days)
                     if _supabase is not None:
                         try:
@@ -1986,7 +2078,7 @@ def run_holder_monitor() -> None:
 
                 telegram_sent = False
                 try:
-                    ok, err = send_alert(msg, reply_markup=kb)
+                    ok, err = send_alert(msg, reply_markup=kb, symbol=symbol)
                     telegram_sent = ok
                     if not ok:
                         log.error("  Telegram failed: %s", err)
