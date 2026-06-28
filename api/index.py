@@ -58,6 +58,9 @@ HELIUS_API_KEY        = os.environ.get("HELIUS_API_KEY", "")
 XAI_API_KEY           = os.environ.get("XAI_API_KEY", "")
 HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
 CRON_SECRET           = os.environ.get("CRON_SECRET", "")
+# Read-only dashboard API key (header x-api-key). Wallet/cluster data is sensitive —
+# these endpoints fail CLOSED: unset key → 503, wrong key → 401. Set in Vercel + Railway.
+DASHBOARD_API_KEY     = os.environ.get("DASHBOARD_API_KEY", "")
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
 
@@ -642,3 +645,171 @@ async def cron(request: Request) -> JSONResponse:
             continue
 
     return JSONResponse({"cron": "complete", "dispatched": dispatched})
+
+
+# ── Dashboard data API (read-only; Phase D/E data layer) ────────────────────────
+#
+# Reuses the same Supabase + shared modules as the rest of the pipeline (no duplicated
+# business logic). All endpoints fail CLOSED behind DASHBOARD_API_KEY (header x-api-key).
+# Real data only — empty results return an empty array + status, never mock rows.
+
+def _auth_dashboard(request: Request) -> JSONResponse | None:
+    """Return a 401/503 JSONResponse if the request is not authorized, else None."""
+    if not DASHBOARD_API_KEY:
+        return JSONResponse({"error": "auth_not_configured",
+                             "detail": "DASHBOARD_API_KEY not set — refusing to serve data"},
+                            status_code=503)
+    provided = request.headers.get("x-api-key", "")
+    if not hmac.compare_digest(provided, DASHBOARD_API_KEY):
+        return JSONResponse({"error": "invalid_api_key"}, status_code=401)
+    return None
+
+
+def _resolve_token(token: str) -> str:
+    """Accept a symbol (ALON) or a raw mint address; return the mint address."""
+    t = (token or "").strip()
+    if t.upper() in SYMBOL_TO_MINT:
+        return SYMBOL_TO_MINT[t.upper()]
+    return t
+
+
+@app.get("/api/alerts")
+async def api_alerts(request: Request) -> JSONResponse:
+    auth = _auth_dashboard(request)
+    if auth is not None:
+        return auth
+    sb = _get_supabase()
+    if not sb:
+        return JSONResponse({"status": "error", "detail": "supabase unavailable", "rows": []}, status_code=503)
+    qp = request.query_params
+    try:
+        limit  = max(1, min(int(qp.get("limit", "50")), 200))
+        offset = max(0, int(qp.get("offset", "0")))
+    except ValueError:
+        return JSONResponse({"status": "error", "detail": "limit/offset must be ints", "rows": []}, status_code=400)
+    try:
+        q = sb.table("whale_alerts").select(
+            "token_symbol,wallet_address,change_type,delta_pct,old_pct,new_pct,alerted_at,telegram_sent"
+        )
+        if qp.get("token"):
+            q = q.eq("token_symbol", qp["token"].upper())
+        if qp.get("wallet"):
+            q = q.eq("wallet_address", qp["wallet"])
+        if qp.get("since"):
+            q = q.gte("alerted_at", qp["since"])
+        q = q.order("alerted_at", desc=True).range(offset, offset + limit - 1)
+        rows = q.execute().data or []
+    except Exception as exc:
+        log.error("api_alerts query failed: %s", exc)
+        return JSONResponse({"status": "error", "detail": str(exc), "rows": []}, status_code=500)
+    return JSONResponse({
+        "status": "ok" if rows else "empty",
+        "count": len(rows), "limit": limit, "offset": offset, "rows": rows,
+    })
+
+
+@app.get("/api/holders/{token}")
+async def api_holders(token: str, request: Request) -> JSONResponse:
+    auth = _auth_dashboard(request)
+    if auth is not None:
+        return auth
+    sb = _get_supabase()
+    if not sb:
+        return JSONResponse({"status": "error", "detail": "supabase unavailable", "holders": []}, status_code=503)
+    mint = _resolve_token(token)
+    want_history = request.query_params.get("history") in ("1", "true", "yes")
+    try:
+        r = (sb.table("wallet_snapshots")
+             .select("wallet_address,pct_supply,balance,rank,captured_at,total_supply")
+             .eq("token_address", mint)
+             .order("captured_at", desc=True)
+             .limit(2000).execute())
+        rows = r.data or []
+    except Exception as exc:
+        log.error("api_holders query failed: %s", exc)
+        return JSONResponse({"status": "error", "detail": str(exc), "holders": []}, status_code=500)
+    if not rows:
+        return JSONResponse({"status": "empty", "token": token, "mint": mint, "holders": []})
+    latest_ts = (rows[0].get("captured_at") or "")[:19]
+    latest: dict[str, dict] = {}
+    for row in rows:
+        if (row.get("captured_at") or "")[:19] != latest_ts:
+            continue
+        w = row["wallet_address"]
+        if w not in latest:
+            latest[w] = row
+    holders = sorted(latest.values(), key=lambda h: -(h.get("pct_supply") or 0))
+    # Top-N concentration reuses the already-correct stored pct_supply (no recompute).
+    top10 = round(sum((h.get("pct_supply") or 0) for h in holders[:10]), 4)
+    payload = {
+        "status": "ok", "token": token, "mint": mint,
+        "captured_at": latest_ts, "holder_count": len(holders),
+        "top10_pct": top10, "holders": holders,
+    }
+    if want_history:
+        payload["history"] = rows  # full time series (most-recent-first)
+    return JSONResponse(payload)
+
+
+@app.get("/api/clusters/{token}")
+async def api_clusters(token: str, request: Request) -> JSONResponse:
+    auth = _auth_dashboard(request)
+    if auth is not None:
+        return auth
+    sb = _get_supabase()
+    if not sb:
+        return JSONResponse({"status": "error", "detail": "supabase unavailable", "clusters": []}, status_code=503)
+    mint = _resolve_token(token)
+    try:
+        clusters = (sb.table("wallet_clusters").select("*")
+                    .eq("token_address", mint).order("total_supply_pct", desc=True)
+                    .execute().data or [])
+        rels = (sb.table("wallet_relationships")
+                .select("wallet_a,wallet_b,relationship_type,confidence_score")
+                .eq("token_address", mint).limit(500).execute().data or [])
+        ev = (sb.table("relationship_evidence")
+              .select("wallet_a,wallet_b,relationship_type,tx_signature,block_time,token_address")
+              .eq("token_address", mint).limit(500).execute().data or [])
+    except Exception as exc:
+        log.error("api_clusters query failed: %s", exc)
+        return JSONResponse({"status": "error", "detail": str(exc), "clusters": []}, status_code=500)
+    status = "ok" if (clusters or rels or ev) else "empty"
+    return JSONResponse({
+        "status": status, "token": token, "mint": mint,
+        "clusters": clusters,
+        "relationships": rels,
+        "relationship_evidence": ev,          # real tx_signature/block_time proof
+        "evidence_count": len(ev),
+    })
+
+
+@app.get("/api/wallets/performance")
+async def api_wallets_performance(request: Request) -> JSONResponse:
+    auth = _auth_dashboard(request)
+    if auth is not None:
+        return auth
+    sb = _get_supabase()
+    if not sb:
+        return JSONResponse({"status": "error", "detail": "supabase unavailable", "wallets": []}, status_code=503)
+    try:
+        rows = (sb.table("smart_wallets").select(
+            "wallet_address,label,tier,status,win_rate,trade_count,trades_90d,"
+            "avg_hold_time_min,total_pnl_sol,backfill_days,updated_at"
+        ).order("total_pnl_sol", desc=True).execute().data or [])
+    except Exception as exc:
+        log.error("api_wallets_performance query failed: %s", exc)
+        return JSONResponse({"status": "error", "detail": str(exc), "wallets": []}, status_code=500)
+    wallets = []
+    for w in rows:
+        w = dict(w)
+        # Per-wallet data-window length so a thin/short history can't read as conviction.
+        w["data_window_days"] = w.get("backfill_days")
+        wallets.append(w)
+    return JSONResponse({
+        "status": "ok" if wallets else "empty",
+        "disclaimer": "memecoin signal — hint not thesis",
+        "data_quality_note": "Dataset is thin; many wallets dormant/TIER_C. "
+                             "Treat win_rate/PnL as a hint, not a thesis. "
+                             "Check data_window_days per wallet before trusting any number.",
+        "count": len(wallets), "wallets": wallets,
+    })
