@@ -1387,10 +1387,14 @@ def format_quant_alert(
         sign       = "+" if delta > 0 else "-"
         supply_str = f"{change['old_pct']:.3f}% → {change['new_pct']:.3f}% ({delta:+.3f}%)"
 
-    # Token / USD
-    price   = price_ctx.get("price") or 0.0
-    usd_val = tokens_delta * price
-    usd_str = f"~${usd_val:,.0f} USD" if usd_val >= 1 else f"~${usd_val:.4f} USD"
+    # Token / USD — show a USD estimate only when a real price is available; never
+    # render a "~$0" value derived from a defaulted/missing price.
+    price = price_ctx.get("price") or 0.0
+    if price:
+        usd_val = tokens_delta * price
+        usd_str = f"~${usd_val:,.0f} USD" if usd_val >= 1 else f"~${usd_val:.4f} USD"
+    else:
+        usd_str = "USD N/A"
     tokens_str = f"{sign}{tokens_delta:,.0f} ({usd_str})"
 
     # Price (FIX 4 — 1h + 24h)
