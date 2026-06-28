@@ -36,6 +36,13 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+# Make the repo-root modules importable from this api/ subpackage (Vercel + local).
+import sys as _sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+from supply_utils import fetch_token_supply, pct_of_supply  # noqa: E402
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -427,9 +434,20 @@ def send_holder_status(symbol: str, mint: str) -> None:
         log.warning("No holder data for %s — skipping status", symbol)
         return
 
-    total  = sum(float(h.get("uiAmount") or h.get("amount", 0)) for h in holders) or 1.0
-    top3   = sum(float(h.get("uiAmount") or h.get("amount", 0)) for h in holders[:3]) / total * 100
-    flag   = "🔴" if top3 > 50 else "🟡" if top3 > 30 else "🟢"
+    # Percent-of-supply uses TRUE circulating supply, never the sum of the top-20
+    # holders (which inflates every figure). If supply can't be fetched, skip the
+    # alert — never emit a %-of-supply number built on a degraded denominator.
+    total_supply = fetch_token_supply(mint, HELIUS_API_KEY)
+    if total_supply is None:
+        log.error("Holder status for %s skipped — true supply unavailable", symbol)
+        return
+
+    top3_amt = sum(float(h.get("uiAmount") or h.get("amount", 0)) for h in holders[:3])
+    top3     = pct_of_supply(top3_amt, total_supply)
+    if top3 is None:
+        log.error("Holder status for %s skipped — supply invalid", symbol)
+        return
+    flag = "🔴" if top3 > 50 else "🟡" if top3 > 30 else "🟢"
 
     lines = [
         f"👥 <b>Holder Status — {symbol}</b>",
@@ -438,7 +456,7 @@ def send_holder_status(symbol: str, mint: str) -> None:
     ]
     for i, h in enumerate(holders[:10], 1):
         amt = float(h.get("uiAmount") or h.get("amount", 0))
-        pct = amt / total * 100
+        pct = pct_of_supply(amt, total_supply) or 0.0
         lines.append(f"{i:2d}. <code>{shorten_addr(h.get('address', ''))}</code>  {pct:.2f}%")
 
     ok, err = send_alert("\n".join(lines))

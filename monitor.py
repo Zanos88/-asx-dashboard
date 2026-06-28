@@ -37,6 +37,7 @@ from wallet_relationship_engine import (  # noqa: E402
     get_cluster_for_wallet,
     get_wallet_clusters_for_token,
 )
+from supply_utils import fetch_token_supply as _shared_fetch_token_supply
 from supabase import Client, create_client
 from tenacity import (
     before_sleep_log,
@@ -830,50 +831,14 @@ def fetch_holders(token_address: str) -> list[dict[str, Any]]:
     raise RuntimeError(f"All RPC endpoints failed for {token_address[:8]}: {last_exc}")
 
 
-def fetch_token_supply(token_address: str) -> float:
-    """Return true circulating supply via getTokenSupply RPC. Tries Helius then public RPC."""
-    payload = {
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getTokenSupply",
-        "params": [token_address],
-    }
-    endpoints: list[tuple[str, str]] = []
-    if HELIUS_API_KEY:
-        endpoints.append(("Helius", f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"))
-    endpoints.append(("Solana-public", PUBLIC_SOLANA_RPC))
-
+def fetch_token_supply(token_address: str) -> float | None:
+    """
+    True circulating supply via the shared helper. Returns None on failure — callers
+    MUST skip the token's %-of-supply alerts rather than fall back to a degraded
+    (sum-of-holders) denominator.
+    """
     log.info("  Fetching total supply for %s...", token_address[:8])
-    for name, url in endpoints:
-        try:
-            resp = requests.post(url, json=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            if "error" in data:
-                log.warning("  [supply] %s error for %s: %s", name, token_address[:8], data["error"])
-                continue
-            value = (data.get("result") or {}).get("value") or {}
-            # uiAmount can be null for very large token supplies; fall back to uiAmountString
-            ui_amount = value.get("uiAmount")
-            if ui_amount is not None:
-                supply = float(ui_amount)
-                if supply > 0:
-                    log.info("  [supply] %s → %.0f tokens (uiAmount, %s)", token_address[:8], supply, name)
-                    return supply
-            ui_str = value.get("uiAmountString") or ""
-            if ui_str:
-                supply = float(ui_str)
-                if supply > 0:
-                    log.info("  [supply] %s → %.0f tokens (uiAmountString, %s)", token_address[:8], supply, name)
-                    return supply
-            log.warning("  [supply] %s returned zero/null for %s via %s", token_address[:8], name, url[:50])
-        except Exception as exc:
-            log.error("  [supply] %s failed for %s: %s", name, token_address[:8], exc)
-
-    log.warning(
-        "⚠️ getTokenSupply failed for %s — using filtered holder sum as fallback; pct values will be inflated",
-        token_address[:8],
-    )
-    return 0.0
+    return _shared_fetch_token_supply(token_address, HELIUS_API_KEY, PUBLIC_SOLANA_RPC)
 
 
 # ── Snapshot helpers ──────────────────────────────────────────────────────────
@@ -953,18 +918,18 @@ def get_amount(holder: dict[str, Any]) -> float:
 
 
 def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold: float | None = None, total_supply: float = 0.0) -> list[dict[str, Any]]:
+    # Percent-of-supply MUST use the true circulating supply as a single stable
+    # denominator for BOTH snapshots. The old per-list-sum fallback caused two bugs:
+    # (1) inflated % (top-N sum << supply) and (2) false accumulator/distributor signals
+    # (denominator shifts when list composition changes, so an unchanged balance shows a
+    # non-zero delta). Callers now always pass a real supply (and skip the token when it's
+    # unavailable), so there is NO fallback denominator here — bail out loudly instead.
+    if not total_supply or total_supply <= 0:
+        log.error("compare_holders called without a real total_supply — returning no changes")
+        return []
+    denom        = total_supply
     old_map      = {h["address"]: h for h in old_holders}
     new_map      = {h["address"]: h for h in new_holders}
-    old_total    = sum(get_amount(h) for h in old_holders) or 1.0
-    new_total    = sum(get_amount(h) for h in new_holders) or 1.0
-    # Percent-of-supply MUST use a single stable denominator (true circulating supply)
-    # for BOTH snapshots. Using per-snapshot list sums (old_total/new_total) caused two
-    # bugs: (1) inflated % because the top-N list sum << total supply, and (2) false
-    # accumulator/distributor signals — when the holder list composition changes (a new
-    # wallet enters / one drops out), the per-list denominator shifts, so an unchanged
-    # balance produces a non-zero delta and gets miscounted. A stable denom yields
-    # delta == 0 for any wallet whose actual balance is unchanged.
-    denom        = total_supply if total_supply and total_supply > 0 else (new_total or old_total or 1.0)
     old_rank_map = {h["address"]: i + 1 for i, h in enumerate(old_holders)}
     new_rank_map = {h["address"]: i + 1 for i, h in enumerate(new_holders)}
     changes: list[dict[str, Any]] = []
@@ -1037,10 +1002,13 @@ def build_cross_holdings(
     result: dict[str, dict[str, float]] = {}
     all_supplies = all_supplies or {}
     for symbol, holders in all_current.items():
-        # Use true total supply as denominator (same as write_snapshot_to_supabase),
-        # NOT the sum of filtered ex-LP holders — otherwise percentages are inflated
-        # by the LP/untracked fraction (token-specific 3-3.5x).
-        total = all_supplies.get(symbol, 0.0) or sum(get_amount(h) for h in holders) or 1.0
+        # Percent-of-supply requires the TRUE total supply. If it's unavailable, skip the
+        # token entirely rather than fall back to the sum-of-holders denominator (which
+        # inflates every figure by the LP/untracked fraction). Skip + log, never substitute.
+        total = all_supplies.get(symbol)
+        if not total or total <= 0:
+            log.error("  cross-coin: %s skipped — true supply unavailable", symbol)
+            continue
         for h in holders:
             addr = h["address"]
             pct  = get_amount(h) / total * 100
@@ -1814,18 +1782,28 @@ def run_holder_monitor() -> None:
         all_addresses[symbol] = token_address
         try:
             all_supplies[symbol] = fetch_token_supply(token_address)
-            log.info("  Total supply: %.0f tokens", all_supplies[symbol])
         except Exception:
-            all_supplies[symbol] = 0.0
+            all_supplies[symbol] = None
+        supply_val = all_supplies.get(symbol)
+        if supply_val is None:
+            log.error(
+                "  %s: true supply unavailable — skipping snapshot + alerts this run "
+                "(no %%-of-supply figure will be emitted on a degraded denominator)",
+                symbol,
+            )
+        else:
+            log.info("  Total supply: %.0f tokens", supply_val)
         try:
             all_price_ctx[symbol] = fetch_price_context(token_address)
         except Exception:
             all_price_ctx[symbol] = {}
-        snapshot_rows += write_snapshot_to_supabase(
-            symbol, token_address, current,
-            total_supply=all_supplies.get(symbol, 0.0),
-            lp_pct_excluded=filter_result["lp_pct"],
-        )
+        # Only write a snapshot when supply is real — otherwise pct_supply would be inflated.
+        if supply_val is not None:
+            snapshot_rows += write_snapshot_to_supabase(
+                symbol, token_address, current,
+                total_supply=supply_val,
+                lp_pct_excluded=filter_result["lp_pct"],
+            )
 
     cross_holdings = build_cross_holdings(all_current, all_supplies)
     persist_wallet_relationships(cross_holdings)
@@ -1844,7 +1822,7 @@ def run_holder_monitor() -> None:
                 cross_holdings=cross_holdings,
                 supabase=_supabase,
                 helius_key=HELIUS_API_KEY,
-                total_supply=all_supplies.get(symbol, 0.0),
+                total_supply=all_supplies.get(symbol) or 0.0,
             )
             _all_clusters[symbol] = clusters
         except Exception as exc:
@@ -1860,10 +1838,17 @@ def run_holder_monitor() -> None:
 
         log.info("Checking %s — pct=%.4f%%  tokens=%.0f", symbol, MOVE_THRESHOLD_PCT, MIN_HOLDER_CHANGE_TOKENS)
 
+        # Skip the entire diff/alert path if true supply is unavailable — every alert
+        # here reports %-of-supply, and we never emit one on a degraded denominator.
+        token_supply = all_supplies.get(symbol)
+        if not token_supply or token_supply <= 0:
+            log.error("  %s: skipping diff/alerts — true supply unavailable this run", symbol)
+            continue
+
         snapshot = load_snapshot(symbol) or _supabase_fallbacks.get(symbol)
         if snapshot:
             try:
-                changes = compare_holders(snapshot["holders"], current, total_supply=all_supplies.get(symbol, 0.0))
+                changes = compare_holders(snapshot["holders"], current, total_supply=token_supply)
             except (KeyError, TypeError) as exc:
                 log.error("Snapshot comparison failed for %s: %s", symbol, exc)
                 save_snapshot(symbol, current)
@@ -1903,7 +1888,7 @@ def run_holder_monitor() -> None:
 
             # Dormant wallet wake: movement ≥0.001% by wallets inactive >7d
             _alerted_addrs   = {c["address"] for c in changes}
-            _dormant_changes = compare_holders(snapshot["holders"], current, threshold=0.001, total_supply=all_supplies.get(symbol, 0.0))
+            _dormant_changes = compare_holders(snapshot["holders"], current, threshold=0.001, total_supply=token_supply)
             for _ch in _dormant_changes:
                 _addr = _ch["address"]
                 if _addr in _alerted_addrs or _ch["type"] != "MOVE":
