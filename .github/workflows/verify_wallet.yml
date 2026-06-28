@@ -1,0 +1,63 @@
+name: Verify Wallet (independent cross-check)
+
+# Manual, read-only cross-check tool. Queries the PUBLIC Solana RPC (a different
+# provider than the monitor's Helius path) so it independently verifies a wallet's
+# most-recent on-chain activity (getSignaturesForAddress) and its balance of a given
+# mint (getTokenAccountsByOwner). Used to cross-check dormant_alerts / EXIT decisions
+# without trusting the same function that produced them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wallet:
+        description: "Wallet address to verify"
+        required: true
+      mint:
+        description: "Token mint (optional, for balance check)"
+        required: false
+        default: ""
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query public RPC
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, datetime
+          wallet = os.environ["WALLET"].strip()
+          mint   = os.environ["MINT"].strip()
+          RPC = "https://api.mainnet-beta.solana.com"
+
+          def rpc(method, params):
+              req = urllib.request.Request(
+                  RPC,
+                  data=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode(),
+                  headers={"content-type":"application/json"},
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return json.load(r).get("result")
+
+          print(f"== independent verify for {wallet} (provider: public RPC) ==")
+          sigs = rpc("getSignaturesForAddress", [wallet, {"limit": 1}])
+          if sigs:
+              bt = sigs[0].get("blockTime")
+              when = datetime.datetime.fromtimestamp(bt, datetime.timezone.utc).isoformat() if bt else None
+              print(f"last_activity blockTime={bt}  ({when})")
+              print(f"latest_signature={sigs[0].get('signature')}")
+          else:
+              print("last_activity: NO SIGNATURES returned")
+
+          if mint:
+              res = rpc("getTokenAccountsByOwner", [wallet, {"mint": mint}, {"encoding":"jsonParsed"}])
+              total = 0.0
+              for acc in (res or {}).get("value", []):
+                  try:
+                      total += float(acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0)
+                  except Exception:
+                      pass
+              print(f"current balance of {mint}: {total}")
+          PY
+        env:
+          WALLET: ${{ inputs.wallet }}
+          MINT: ${{ inputs.mint }}
