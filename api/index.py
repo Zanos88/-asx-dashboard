@@ -327,21 +327,23 @@ def process_transaction(tx: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
             to_addr   = tt.get("toUserAccount", "")   or ""
             direction = _transfer_direction(tx, mint)
 
-            price   = get_token_price_usd(mint)
-            usd_val = round(amount * price, 2) if price else 0.0
-
-            # Gate on USD value when price is known; fall back to token count
-            if price:
-                if usd_val < WHALE_THRESHOLD_USD:
-                    log.info(
-                        "  Skip %s %s: $%.2f < threshold $%.0f",
-                        symbol, direction, usd_val, WHALE_THRESHOLD_USD,
-                    )
-                    continue
-            else:
-                min_tokens = float(_cfg.get("min_holder_change_tokens", 0))
-                if min_tokens > 0 and amount < min_tokens:
-                    continue
+            price = get_token_price_usd(mint)
+            # Never alert on a defaulted price. get_token_price_usd returns 0.0 on
+            # failure; a $0 USD value built on that is meaningless, so skip + log
+            # rather than fall through to a token-count gate and emit a "~$0" whale.
+            if not price:
+                log.warning(
+                    "  Skip %s %s: price unavailable — not alerting on a defaulted $0 value",
+                    symbol, direction,
+                )
+                continue
+            usd_val = round(amount * price, 2)
+            if usd_val < WHALE_THRESHOLD_USD:
+                log.info(
+                    "  Skip %s %s: $%.2f < threshold $%.0f",
+                    symbol, direction, usd_val, WHALE_THRESHOLD_USD,
+                )
+                continue
 
             log.info(
                 "  🐳 WHALE %s %s %s — %,.0f tokens  $%.2f",
