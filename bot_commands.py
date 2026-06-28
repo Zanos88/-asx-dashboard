@@ -34,6 +34,7 @@ from monitor import (
     _load_config,
     _supabase,
     update_bot_config,
+    get_live_tracked_tokens,
     fetch_holders,
     fetch_wallet_intel,
     fetch_wallet_winrate,
@@ -258,8 +259,7 @@ async def cmd_holders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Usage: /holders &lt;SYMBOL&gt;", parse_mode="HTML")
         return
     sym = context.args[0].upper()
-    cfg = _load_config()
-    tokens = {s: info["address"] for s, info in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     if sym not in tokens:
         known = ", ".join(tokens) or "none"
         await update.message.reply_text(f"Unknown token '{sym}'. Tracked: {known}")
@@ -467,14 +467,15 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _deny(update)
         return
 
-    sym = (context.args[0].upper() if context.args else None) or next(iter(TOKENS), None)
-    cfg = _load_config()
-    tok = cfg.get("solana_tokens", {}).get(sym)
-    if not tok:
+    live = get_live_tracked_tokens()
+    sym = (context.args[0].upper() if context.args else None) or next(iter(live), None)
+    addr = live.get(sym)
+    if not addr:
         await update.message.reply_text(
-            f"Unknown token '{sym}'. Tracked: {', '.join(TOKENS) or 'none'}"
+            f"Unknown token '{sym}'. Tracked: {', '.join(live) or 'none'}"
         )
         return
+    tok = {"address": addr}
 
     snap = load_snapshot(sym)
     if not snap or not snap.get("holders"):
@@ -563,14 +564,15 @@ async def cmd_clusters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _authorized(update):
         await _deny(update)
         return
-    sym = (context.args[0].upper() if context.args else None) or next(iter(TOKENS), None)
-    cfg = _load_config()
-    tok = cfg.get("solana_tokens", {}).get(sym)
-    if not tok:
+    live = get_live_tracked_tokens()
+    sym = (context.args[0].upper() if context.args else None) or next(iter(live), None)
+    addr = live.get(sym)
+    if not addr:
         await update.message.reply_text(
-            f"Unknown token '{sym}'. Tracked: {', '.join(TOKENS) or 'none'}"
+            f"Unknown token '{sym}'. Tracked: {', '.join(live) or 'none'}"
         )
         return
+    tok = {"address": addr}
 
     loop     = asyncio.get_running_loop()
     clusters = await loop.run_in_executor(
@@ -706,19 +708,85 @@ async def cmd_bundle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+def _get_muted_tokens() -> set[str]:
+    """Read the live muted_tokens set from bot_config."""
+    try:
+        if _supabase:
+            r = _supabase.table("bot_config").select("value").eq("key", "muted_tokens").execute()
+            if r.data and r.data[0].get("value"):
+                return {str(s).strip().upper() for s in json.loads(r.data[0]["value"]) if str(s).strip()}
+    except Exception as exc:
+        log.warning("read muted_tokens failed: %s", exc)
+    return set()
+
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mute Telegram alerts for ONE token. Data collection is unaffected."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /mute &lt;SYMBOL&gt;", parse_mode="HTML")
+        return
+    sym  = context.args[0].upper()
+    live = get_live_tracked_tokens()
+    if sym not in live:
+        await update.message.reply_text(f"Unknown token '{sym}'. Tracked: {', '.join(live) or 'none'}")
+        return
+    muted = _get_muted_tokens()
+    muted.add(sym)
+    if update_bot_config("muted_tokens", json.dumps(sorted(muted))):
+        await update.message.reply_text(
+            f"🔇 Muted {sym}. Telegram alerts suppressed — snapshots, relationships, "
+            f"evidence and clusters keep being collected."
+        )
+    else:
+        await update.message.reply_text("Failed to update muted_tokens.")
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-enable Telegram alerts for a token."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /unmute &lt;SYMBOL&gt;", parse_mode="HTML")
+        return
+    sym   = context.args[0].upper()
+    muted = _get_muted_tokens()
+    if sym not in muted:
+        await update.message.reply_text(f"{sym} is not muted. Muted: {', '.join(sorted(muted)) or 'none'}")
+        return
+    muted.discard(sym)
+    if update_bot_config("muted_tokens", json.dumps(sorted(muted))):
+        await update.message.reply_text(f"🔔 Unmuted {sym}. Telegram alerts restored.")
+    else:
+        await update.message.reply_text("Failed to update muted_tokens.")
+
+
+async def cmd_muted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List currently muted tokens."""
+    if not _authorized(update):
+        await _deny(update)
+        return
+    muted = _get_muted_tokens()
+    await update.message.reply_text("🔇 Muted tokens: " + (", ".join(sorted(muted)) or "none (all alerting)"))
+
+
 async def cmd_relationships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the full relationship graph for a token."""
     if not _authorized(update):
         await _deny(update)
         return
-    sym = (context.args[0].upper() if context.args else None) or next(iter(TOKENS), None)
-    cfg = _load_config()
-    tok = cfg.get("solana_tokens", {}).get(sym)
-    if not tok:
+    live = get_live_tracked_tokens()
+    sym = (context.args[0].upper() if context.args else None) or next(iter(live), None)
+    addr = live.get(sym)
+    if not addr:
         await update.message.reply_text(
-            f"Unknown token '{sym}'. Tracked: {', '.join(TOKENS) or 'none'}"
+            f"Unknown token '{sym}'. Tracked: {', '.join(live) or 'none'}"
         )
         return
+    tok = {"address": addr}
 
     loop  = asyncio.get_running_loop()
     rels  = await loop.run_in_executor(
@@ -1921,6 +1989,9 @@ def main() -> None:
     app.add_handler(CommandHandler("moves",         cmd_moves))
     app.add_handler(CommandHandler("top",           cmd_top))
     app.add_handler(CommandHandler("alert",         cmd_alert_toggle))
+    app.add_handler(CommandHandler("mute",          cmd_mute))
+    app.add_handler(CommandHandler("unmute",        cmd_unmute))
+    app.add_handler(CommandHandler("muted",         cmd_muted))
     app.add_handler(CommandHandler("scancluster",   cmd_scancluster))
     app.add_handler(CommandHandler("scantest",      cmd_scantest))
     app.add_handler(CommandHandler("addwallet",     cmd_addwallet))

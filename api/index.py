@@ -316,13 +316,27 @@ def process_transaction(tx: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
     log.info("Processing tx %s... type=%s ts=%s", sig[:16], tx_type, time_str)
 
+    # Live mint→symbol map from bot_config.tracked_tokens (so newly added tokens like
+    # ANSEM are tracked here too), falling back to the static config-derived registry.
+    live_registry = dict(TOKEN_REGISTRY)
+    try:
+        sb = _get_supabase()
+        if sb:
+            r = sb.table("bot_config").select("value").eq("key", "tracked_tokens").execute()
+            if r.data and r.data[0].get("value"):
+                parsed = json.loads(r.data[0]["value"])
+                if isinstance(parsed, dict):
+                    live_registry.update({addr: sym for sym, addr in parsed.items()})
+    except Exception as exc:
+        log.warning("tracked_tokens resolve failed, using static registry: %s", exc)
+
     for tt in tx.get("tokenTransfers", []):
         try:
             mint = tt.get("mint", "")
-            if mint not in TOKEN_REGISTRY:
+            if mint not in live_registry:
                 continue
 
-            symbol    = TOKEN_REGISTRY[mint]
+            symbol    = live_registry[mint]
             token_cfg = _cfg.get("solana_tokens", {}).get(symbol, {})
             emoji     = token_cfg.get("emoji", "🪙")
             amount    = float(tt.get("tokenAmount", 0) or 0)

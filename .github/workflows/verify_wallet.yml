@@ -39,6 +39,10 @@ jobs:
                   return json.load(r).get("result")
 
           print(f"== independent verify for {wallet} (provider: public RPC) ==")
+          bal = rpc("getBalance", [wallet])
+          if bal is not None:
+              lamports = bal.get("value") if isinstance(bal, dict) else bal
+              print(f"SOL balance: {(lamports or 0)/1e9} ({lamports} lamports)")
           sigs = rpc("getSignaturesForAddress", [wallet, {"limit": 1}])
           if sigs:
               bt = sigs[0].get("blockTime")
