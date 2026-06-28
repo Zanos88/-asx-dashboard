@@ -37,7 +37,11 @@ from wallet_relationship_engine import (  # noqa: E402
     get_cluster_for_wallet,
     get_wallet_clusters_for_token,
 )
-from supply_utils import fetch_token_supply as _shared_fetch_token_supply
+from supply_utils import (
+    fetch_token_supply as _shared_fetch_token_supply,
+    fetch_last_activity,
+    fetch_wallet_token_balance,
+)
 from supabase import Client, create_client
 from tenacity import (
     before_sleep_log,
@@ -1050,24 +1054,6 @@ def send_cross_coin_digest(
         log.error("Cross-coin digest failed: %s", err)
 
 
-def _get_wallet_last_moved(addr: str, symbol: str) -> "datetime | None":
-    if not _supabase:
-        return None
-    try:
-        r = (_supabase.table("whale_alerts")
-             .select("alerted_at")
-             .eq("wallet_address", addr)
-             .eq("token_symbol", symbol)
-             .order("alerted_at", desc=True)
-             .limit(1)
-             .execute())
-        if r.data:
-            return datetime.fromisoformat(r.data[0]["alerted_at"].replace("Z", "+00:00"))
-    except Exception:
-        pass
-    return None
-
-
 def _notify_new_cluster(
     symbol: str,
     token_address: str,
@@ -1886,15 +1872,24 @@ def run_holder_monitor() -> None:
                     save_snapshot(symbol, current)
                     continue
 
-            # Dormant wallet wake: movement ≥0.001% by wallets inactive >7d
+            # Dormant wallet wake: real MOVE (≥0.001% of supply) by a wallet whose last
+            # ON-CHAIN activity was >7d ago. "Last active" is a real getSignaturesForAddress
+            # lookup — NOT "last alerted". If the lookup fails, skip + log (never fabricate a
+            # sentinel like 999). Every fired alert is persisted to dormant_alerts.
             _alerted_addrs   = {c["address"] for c in changes}
             _dormant_changes = compare_holders(snapshot["holders"], current, threshold=0.001, total_supply=token_supply)
             for _ch in _dormant_changes:
                 _addr = _ch["address"]
                 if _addr in _alerted_addrs or _ch["type"] != "MOVE":
                     continue
-                _last = _get_wallet_last_moved(_addr, symbol)
-                _days = (datetime.now(timezone.utc) - _last).days if _last else 999
+                _last = fetch_last_activity(_addr, HELIUS_API_KEY, PUBLIC_SOLANA_RPC)
+                if _last is None:
+                    log.warning(
+                        "  Dormant check skipped for %s %s — last-activity lookup failed",
+                        symbol, _addr[:8],
+                    )
+                    continue
+                _days = (datetime.now(timezone.utc) - _last).days
                 if _days >= 7:
                     _dmsg = (
                         f"⚡ <b>DORMANT WALLET ACTIVE — {symbol}</b>\n"
@@ -1907,6 +1902,16 @@ def run_holder_monitor() -> None:
                     )
                     send_alert(_dmsg, reply_markup=make_inline_keyboard(_addr, token_address))
                     log.info("  Dormant wake: %s %s (inactive %d days)", symbol, _addr[:8], _days)
+                    if _supabase is not None:
+                        try:
+                            _supabase.table("dormant_alerts").insert({
+                                "wallet_address": _addr,
+                                "token_symbol":   symbol,
+                                "last_active_at": _last.isoformat(),
+                                "move_pct":       round(_ch["delta"], 6),
+                            }).execute()
+                        except Exception as exc:
+                            log.warning("  dormant_alerts persist failed for %s: %s", _addr[:8], exc)
 
             for change in changes:
                 addr        = change["address"]
@@ -1916,6 +1921,31 @@ def run_holder_monitor() -> None:
                 if is_rate_limited(addr):
                     log.info("  Rate-limited: %s %s...", symbol, addr[:8])
                     continue
+
+                # EXIT confirmation: leaving the tracked top-N is NOT proof of a sale — a
+                # wallet drops out simply by falling below the rank cutoff while still
+                # holding tokens. Confirm with a real on-chain balance lookup. Skip+log if
+                # the lookup fails (never fabricate new_tokens=0); suppress if the wallet
+                # still holds materially (rank drop-out, not a sale). Only a near-zero
+                # remaining balance is a genuine exit.
+                if change_type == "EXIT":
+                    _bal = fetch_wallet_token_balance(addr, token_address, HELIUS_API_KEY, PUBLIC_SOLANA_RPC)
+                    if _bal is None:
+                        log.warning(
+                            "  EXIT unverified for %s %s — balance lookup failed; skipping alert",
+                            symbol, addr[:8],
+                        )
+                        continue
+                    _old = float(change.get("old_tokens") or 0.0)
+                    if _bal > max(_old * 0.05, 1.0):
+                        log.info(
+                            "  EXIT suppressed for %s %s — still holds %.0f tokens "
+                            "(dropped out of top-N, not a sale)",
+                            symbol, addr[:8], _bal,
+                        )
+                        continue
+                    # Genuine exit — reflect the real (near-zero) remaining balance.
+                    change["new_tokens"] = _bal
 
                 new_rank    = change.get("new_rank") or change.get("old_rank") or 0
                 wallet_info = get_wallet_first_seen(addr, symbol, new_rank)
