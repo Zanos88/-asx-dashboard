@@ -1,0 +1,67 @@
+name: Test Dormant Path (controlled)
+
+# Controlled test of the REAL dormant code path. Runs the production
+# supply_utils.fetch_last_activity (Helius) for a given wallet, prints the real
+# last-activity timestamp + days, and — only if >= 7 days — inserts a clearly
+# marked row into dormant_alerts (symbol TEST_DORMANT) to prove persistence with a
+# real timestamp (never a 999 sentinel). Cross-check the printed/persisted timestamp
+# against the verify_wallet workflow (public RPC, different provider).
+
+on:
+  workflow_dispatch:
+    inputs:
+      wallet:
+        description: "Wallet address to test the dormant path against"
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run real dormant path
+        env:
+          HELIUS_API_KEY:            ${{ secrets.HELIUS_API_KEY }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_KEY:      ${{ secrets.SUPABASE_SERVICE_KEY }}
+          WALLET:                    ${{ inputs.wallet }}
+        run: |
+          python3 - <<'PY'
+          import os, datetime
+          from supply_utils import fetch_last_activity
+          from supabase import create_client
+
+          wallet = os.environ["WALLET"].strip()
+          helius = os.environ.get("HELIUS_API_KEY", "")
+
+          # REAL production helper (Helius provider)
+          last = fetch_last_activity(wallet, helius)
+          print(f"== controlled dormant test for {wallet} (provider: Helius via fetch_last_activity) ==")
+          if last is None:
+              print("fetch_last_activity returned None -> production code would SKIP + LOG (no 999, no alert)")
+              raise SystemExit(0)
+          days = (datetime.datetime.now(datetime.timezone.utc) - last).days
+          print(f"real last_active_at={last.isoformat()}  days_inactive={days}")
+          if days < 7:
+              print("days_inactive < 7 -> not dormant; production would not fire. (no row inserted)")
+              raise SystemExit(0)
+
+          url = os.environ.get("SUPABASE_URL", "")
+          key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", "")
+          sb = create_client(url, key)
+          sb.table("dormant_alerts").insert({
+              "wallet_address": wallet,
+              "token_symbol":   "TEST_DORMANT",
+              "last_active_at": last.isoformat(),
+              "move_pct":       0,
+          }).execute()
+          print(f"INSERTED dormant_alerts row: wallet={wallet} last_active_at={last.isoformat()} (real timestamp, no sentinel)")
+          PY
