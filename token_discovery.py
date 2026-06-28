@@ -213,9 +213,27 @@ def _fetch_raydium(since: datetime | None) -> list[dict]:
     return results
 
 
+def _discovery_source(sb) -> str:
+    """Active discovery writer: 'polling' (default) or 'webhook'. One source at a time."""
+    try:
+        r = sb.table("bot_config").select("value").eq("key", "discovery_source").execute()
+        if r.data and r.data[0].get("value"):
+            return str(r.data[0]["value"]).strip().lower()
+    except Exception as exc:
+        log.warning("discovery_source read failed: %s", exc)
+    return "polling"
+
+
 def main() -> None:
     sb = _get_supabase()
     if not sb:
+        return
+
+    # Mutual exclusion: only the single active source writes discovered_tokens. If the
+    # webhook source is active, the polling cron stands down (still no double-writing).
+    source = _discovery_source(sb)
+    if source == "webhook":
+        log.info("discovery_source=webhook — polling stands down this run (no double-write)")
         return
 
     last_polled = _get_last_polled(sb)

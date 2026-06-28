@@ -44,6 +44,8 @@ import hmac
 import json
 import logging
 import os
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -755,6 +757,89 @@ def process_transaction(tx: dict[str, Any]) -> list[str]:
     return alerts
 
 
+# ── Phase 1C: webhook token-discovery source (LOG-ONLY scaffolding) ─────────────
+#
+# Second discovery source alongside the GeckoTerminal polling cron (token_discovery.py).
+# Built per the "build both, one active at a time, automatic + logged safety switch" spec.
+#
+# SAFETY MODEL (all controlled via bot_config, no redeploy needed):
+#   discovery_source            "polling" (default) | "webhook"  — the single active writer
+#   webhook_discovery_mode      "log_only" (default) | "live"    — log_only NEVER writes rows
+#   webhook_max_events_per_min  int (default 300)                — auto-pause threshold
+#
+# Current state: LOG-ONLY. This endpoint counts/logs events and measures delivery volume
+# but does NOT write discovered_tokens and does NOT create the live Helius subscription.
+# Going live is gated on a paid Helius plan + a 24-48h soak (free tier = 1 webhook /
+# 100k credits/mo, which Pump.fun/Raydium traffic would exhaust in hours).
+#
+# Program IDs to subscribe (when going live, via Helius webhook create — one webhook,
+# both addresses): Pump.fun + Raydium AMM v4.
+PUMPFUN_PROGRAM_ID  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"   # pump.fun
+RAYDIUM_AMM_V4      = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"   # Raydium AMM v4
+WEBHOOK_DISCOVERY_PROGRAMS = [PUMPFUN_PROGRAM_ID, RAYDIUM_AMM_V4]
+
+# In-memory rolling window of event-arrival timestamps (this process only; resets on
+# restart — adequate as a rate gauge for the auto-pause switch).
+_webhook_event_times: deque[float] = deque(maxlen=5000)
+
+
+def _discovery_source() -> str:
+    return (_bot_config_get("discovery_source") or "polling").strip().lower()
+
+
+def _webhook_discovery_mode() -> str:
+    return (_bot_config_get("webhook_discovery_mode") or "log_only").strip().lower()
+
+
+def _webhook_max_events_per_min() -> int:
+    try:
+        return int(_bot_config_get("webhook_max_events_per_min") or "300")
+    except (TypeError, ValueError):
+        return 300
+
+
+def _events_per_min() -> int:
+    """Events seen in the last 60s from the in-memory rolling window."""
+    cutoff = time.time() - 60.0
+    while _webhook_event_times and _webhook_event_times[0] < cutoff:
+        _webhook_event_times.popleft()
+    return len(_webhook_event_times)
+
+
+def _auto_pause_webhook(rate: int) -> None:
+    """Disable the webhook branch, fall back to polling, log + alert. Automatic + logged."""
+    _bot_config_set("discovery_source", "polling")
+    _bot_config_set("webhook_discovery_mode", "log_only")
+    log.error(
+        "Webhook discovery AUTO-PAUSED — %d events/min exceeded threshold %d; "
+        "fell back to polling (discovery_source=polling, mode=log_only)",
+        rate, _webhook_max_events_per_min(),
+    )
+    try:
+        send_alert(
+            f"⚠️ <b>Token-discovery webhook auto-paused</b>\n"
+            f"Event rate {rate}/min exceeded threshold {_webhook_max_events_per_min()}/min.\n"
+            f"Fell back to polling (GeckoTerminal). Webhook set to log_only.\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+        )
+    except Exception as exc:
+        log.warning("auto-pause Telegram alert failed: %s", exc)
+
+
+def _extract_created_mints(tx: dict[str, Any]) -> list[str]:
+    """
+    Best-effort extraction of newly-created token mints from a Helius enhanced-webhook tx.
+    Used only in 'live' mode; in log_only we just count events. Looks at tokenTransfers /
+    accountData mints touching the subscribed programs. Intentionally conservative.
+    """
+    mints: set[str] = set()
+    for tt in tx.get("tokenTransfers", []) or []:
+        m = tt.get("mint")
+        if m:
+            mints.add(m)
+    return [m for m in mints if m and m != "So11111111111111111111111111111111111111112"]
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -809,6 +894,82 @@ async def helius_webhook(request: Request) -> JSONResponse:
             continue
 
     return JSONResponse({"received": len(transactions), "alerts_sent": alerts_sent})
+
+
+@app.post("/webhook/token-discovery")
+async def token_discovery_webhook(request: Request) -> JSONResponse:
+    """
+    Phase 1C webhook discovery source (LOG-ONLY by default).
+
+    Receives Helius enhanced-webhook events for the Pump.fun / Raydium programs and:
+      - measures real delivery volume (events/min),
+      - auto-pauses + falls back to polling if volume exceeds the configured threshold,
+      - in log_only mode: logs counts/sample mints, writes NOTHING to discovered_tokens,
+      - in live mode (future): writes discovered_tokens ONLY if discovery_source==webhook.
+    Never runs as a second simultaneous writer — mutual exclusion via discovery_source.
+    """
+    body = await request.body()
+    signature = request.headers.get("authorization", "")
+    if not HELIUS_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Webhook auth not configured")
+    if not verify_helius_signature(body, signature, HELIUS_WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    events: list[dict[str, Any]] = payload if isinstance(payload, list) else [payload]
+    now = time.time()
+    for _ in events:
+        _webhook_event_times.append(now)
+    rate = _events_per_min()
+
+    # Volume safety switch — automatic + logged + alerted.
+    threshold = _webhook_max_events_per_min()
+    if rate > threshold:
+        _auto_pause_webhook(rate)
+        return JSONResponse({"received": len(events), "rate_per_min": rate, "auto_paused": True})
+
+    mode = _webhook_discovery_mode()
+    sample_mints: list[str] = []
+    for tx in events[:25]:
+        sample_mints.extend(_extract_created_mints(tx))
+    sample_mints = sorted(set(sample_mints))[:10]
+
+    if mode == "log_only":
+        # Soak/measurement mode — observe volume + filtering, write nothing.
+        log.info(
+            "[discovery-webhook LOG-ONLY] %d event(s), rate=%d/min, sample_mints=%s",
+            len(events), rate, sample_mints,
+        )
+        return JSONResponse({
+            "received": len(events), "rate_per_min": rate,
+            "mode": "log_only", "wrote": 0, "sample_mints": sample_mints,
+        })
+
+    # mode == "live": only the single active source may write.
+    if _discovery_source() != "webhook":
+        log.info(
+            "[discovery-webhook] live mode but discovery_source!=webhook — not writing "
+            "(polling is the active source). %d event(s), rate=%d/min",
+            len(events), rate,
+        )
+        return JSONResponse({"received": len(events), "rate_per_min": rate, "wrote": 0,
+                             "note": "inactive source"})
+
+    sb = _get_supabase()
+    wrote = 0
+    if sb and sample_mints:
+        rows = [{"token_address": m, "platform": "helius_webhook", "is_watched": False}
+                for m in sample_mints]
+        try:
+            sb.table("discovered_tokens").upsert(rows, on_conflict="token_address").execute()
+            wrote = len(rows)
+        except Exception as exc:
+            log.warning("[discovery-webhook] discovered_tokens upsert failed: %s", exc)
+    log.info("[discovery-webhook LIVE] %d event(s), rate=%d/min, wrote=%d", len(events), rate, wrote)
+    return JSONResponse({"received": len(events), "rate_per_min": rate, "mode": "live", "wrote": wrote})
 
 
 @app.post("/trigger/sentiment")
