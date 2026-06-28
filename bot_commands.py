@@ -206,7 +206,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _deny(update)
         return
     cfg = _load_config()
-    tokens = {sym: info["address"] for sym, info in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     helius_ok  = "✅" if os.environ.get("HELIUS_API_KEY") else "⚠️ not set (public RPC)"
     supabase_ok = "✅" if _supabase is not None else "❌ not connected (check SUPABASE_SERVICE_ROLE_KEY)"
     token_lines = "\n".join(
@@ -229,7 +229,7 @@ async def cmd_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _deny(update)
         return
     cfg = _load_config()
-    tokens = {sym: info["address"] for sym, info in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     if not tokens:
         await update.message.reply_text("No tokens tracked. Use /addtoken.")
         return
@@ -398,7 +398,7 @@ async def cmd_related(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     cfg    = _load_config()
-    tokens = {sym: info["address"] for sym, info in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     if not tokens:
         await update.message.reply_text("No tokens tracked. Use /addtoken.")
         return
@@ -1102,7 +1102,7 @@ async def cmd_moves(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update)
         return
     cfg    = _load_config()
-    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     symbol = context.args[0].upper() if context.args else None
     syms   = [symbol] if symbol and symbol in tokens else list(tokens.keys())
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -1144,7 +1144,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _deny(update)
         return
     cfg    = _load_config()
-    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     symbol = context.args[0].upper() if context.args else None
     syms   = [symbol] if symbol and symbol in tokens else list(tokens.keys())
     for sym in syms:
@@ -1221,7 +1221,7 @@ def _run_scan_with_progress(
         )
 
     cfg       = _load_config()
-    tokens    = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     token_addr = tokens.get(symbol.upper(), "")
     sb         = _supabase
 
@@ -1319,7 +1319,7 @@ async def cmd_scancluster(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _deny(update)
         return
     cfg    = _load_config()
-    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     sym    = (context.args[0].upper() if context.args else None) or next(iter(tokens), None)
     if not sym or sym not in tokens:
         known = ", ".join(tokens) or "none"
@@ -1343,7 +1343,7 @@ async def cmd_scantest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _deny(update)
         return
     cfg    = _load_config()
-    tokens = {s: i["address"] for s, i in cfg.get("solana_tokens", {}).items()}
+    tokens = get_live_tracked_tokens()
     sym    = (context.args[0].upper() if context.args else None) or next(iter(tokens), None)
     if not sym or sym not in tokens:
         known = ", ".join(tokens) or "none"
