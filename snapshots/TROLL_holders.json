@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-06-28T09:34:24.870429+00:00",
+  "timestamp": "2026-06-28T09:43:06.047946+00:00",
   "holders": [
     {
       "address": "51ig4tkZD1kCcnXLRuFre1nxyJg83aFTfQb5UGLPwMHy",
@@ -27,10 +27,10 @@
     },
     {
       "address": "4w2cysotX6czaUGmmWg13hDpY4QEMG2CzeKYEQyK9Ama",
-      "uiAmount": 24959651.449349,
+      "uiAmount": 25288499.559264,
       "decimals": 6,
-      "amount": "24959651449349",
-      "uiAmountString": "24959651.449349",
+      "amount": "25288499559264",
+      "uiAmountString": "25288499.559264",
       "token_account": "8SmW82qNZ7BpdBp5PZk7znqt3VswFzX3nkRgHBBE1x4e"
     },
     {
@@ -43,10 +43,10 @@
     },
     {
       "address": "9ZPsRWGkukYeWg2Z7eZ8NaTBZ1DSuBUVzLcGQWZgE4Y4",
-      "uiAmount": 18440823.597353,
+      "uiAmount": 18446780.190305,
       "decimals": 6,
-      "amount": "18440823597353",
-      "uiAmountString": "18440823.597353",
+      "amount": "18446780190305",
+      "uiAmountString": "18446780.190305",
       "token_account": "53vDorCSUPb1vNkY5cvJVFGGzymByXftvtv25k5hCSZ9"
     },
     {
@@ -75,10 +75,10 @@
     },
     {
       "address": "u6PJ8DtQuPFnfmwHbGFULQ4u4EgjDiyYKjVEsynXq2w",
-      "uiAmount": 11613002.880893,
+      "uiAmount": 11560082.494803,
       "decimals": 6,
-      "amount": "11613002880893",
-      "uiAmountString": "11613002.880893",
+      "amount": "11560082494803",
+      "uiAmountString": "11560082.494803",
       "token_account": "AVnk2eh9UuPTAprMboDWEkQAd3W35kFPFidkhFJ2sTxM"
     },
     {
@@ -146,20 +146,20 @@
       "token_account": "7pMcxFP5MB5W4oSKxieXx7FPMzkpVGATW8ZJg58oFsq5"
     },
     {
+      "address": "DPqsobysNf5iA9w7zrQM8HLzCKZEDMkZsWbiidsAt1xo",
+      "uiAmount": 8157900.966415,
+      "decimals": 6,
+      "amount": "8157900966415",
+      "uiAmountString": "8157900.966415",
+      "token_account": "GkRetvRvnShW4BqYGpXd3GQSb6B9Q8raQXDPoF6ipgjg"
+    },
+    {
       "address": "G23RB28wwx86rwZsTjdGesfbz8tPgwgwQF67k6UPXsjD",
       "uiAmount": 8074670.321151,
       "decimals": 6,
       "amount": "8074670321151",
       "uiAmountString": "8074670.321151",
       "token_account": "GmPEJd4Fz5SWPsvJtwd8XVYS4hS9m679h7vooCopMRmv"
-    },
-    {
-      "address": "DPqsobysNf5iA9w7zrQM8HLzCKZEDMkZsWbiidsAt1xo",
-      "uiAmount": 7989279.96002,
-      "decimals": 6,
-      "amount": "7989279960020",
-      "uiAmountString": "7989279.96002",
-      "token_account": "GkRetvRvnShW4BqYGpXd3GQSb6B9Q8raQXDPoF6ipgjg"
     }
   ]
 }

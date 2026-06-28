@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-06-28T09:34:40.359411+00:00",
+  "timestamp": "2026-06-28T09:43:17.639104+00:00",
   "holders": [
     {
       "address": "GV6UUmNxz2RpKxmNAPadYKb7uQpszwqQAu3qLJxVdC52",
-      "uiAmount": 604010339.100291,
+      "uiAmount": 604010344.100291,
       "decimals": 6,
-      "amount": "604010339100291",
-      "uiAmountString": "604010339.100291",
+      "amount": "604010344100291",
+      "uiAmountString": "604010344.100291",
       "token_account": "2U9XFtekYTstzMYXmuyDCNdFxRYB91dMtSKxtUB5rVct"
     },
     {
@@ -27,34 +27,34 @@
     },
     {
       "address": "CxCTVjvgK3bWcgavMKo8PushR8ycw1atrWiSTruZrdtT",
-      "uiAmount": 9454591.182135,
+      "uiAmount": 9404591.182135,
       "decimals": 6,
-      "amount": "9454591182135",
-      "uiAmountString": "9454591.182135",
+      "amount": "9404591182135",
+      "uiAmountString": "9404591.182135",
       "token_account": "FBMRQXijs467WyqpByjFr4gv46MsUGsSt2Ee9XnSbNP4"
     },
     {
       "address": "3H9LVHarjBoZ2YPEsgFbVD1zuERCGwfp4AeyHoHsFSEC",
-      "uiAmount": 7456776.512878,
+      "uiAmount": 7344723.002298,
       "decimals": 6,
-      "amount": "7456776512878",
-      "uiAmountString": "7456776.512878",
+      "amount": "7344723002298",
+      "uiAmountString": "7344723.002298",
       "token_account": "AsysJTMTfdYMjNjTcTfqcN8pY2ZuYDQYuKBc1addBR13"
     },
     {
       "address": "FnzKY6x7entQ1eR3D225dQyT7ybfka4PskBMQhb8L3CC",
-      "uiAmount": 6404337.804276,
+      "uiAmount": 6303694.133339,
       "decimals": 6,
-      "amount": "6404337804276",
-      "uiAmountString": "6404337.804276",
+      "amount": "6303694133339",
+      "uiAmountString": "6303694.133339",
       "token_account": "BmCXK8QFCHgjiqGm7peAtBbZpFPJNsp5fYP5rSRazMS8"
     },
     {
       "address": "5URyNUmhcuWdZiiQrtNdFrSbQPfq72UV2gqQasr9c19Y",
-      "uiAmount": 5950001.0,
+      "uiAmount": 5450001.0,
       "decimals": 6,
-      "amount": "5950001000000",
-      "uiAmountString": "5950001",
+      "amount": "5450001000000",
+      "uiAmountString": "5450001",
       "token_account": "A4Bohfv2cyfkeKHWuwvaLJVQ3Nqoadytkvqk4N7dBgtk"
     },
     {
