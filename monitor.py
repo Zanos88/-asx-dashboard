@@ -952,11 +952,19 @@ def get_amount(holder: dict[str, Any]) -> float:
     return float(ui) if ui is not None else float(holder.get("amount", 0))
 
 
-def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold: float | None = None) -> list[dict[str, Any]]:
+def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold: float | None = None, total_supply: float = 0.0) -> list[dict[str, Any]]:
     old_map      = {h["address"]: h for h in old_holders}
     new_map      = {h["address"]: h for h in new_holders}
     old_total    = sum(get_amount(h) for h in old_holders) or 1.0
     new_total    = sum(get_amount(h) for h in new_holders) or 1.0
+    # Percent-of-supply MUST use a single stable denominator (true circulating supply)
+    # for BOTH snapshots. Using per-snapshot list sums (old_total/new_total) caused two
+    # bugs: (1) inflated % because the top-N list sum << total supply, and (2) false
+    # accumulator/distributor signals — when the holder list composition changes (a new
+    # wallet enters / one drops out), the per-list denominator shifts, so an unchanged
+    # balance produces a non-zero delta and gets miscounted. A stable denom yields
+    # delta == 0 for any wallet whose actual balance is unchanged.
+    denom        = total_supply if total_supply and total_supply > 0 else (new_total or old_total or 1.0)
     old_rank_map = {h["address"]: i + 1 for i, h in enumerate(old_holders)}
     new_rank_map = {h["address"]: i + 1 for i, h in enumerate(new_holders)}
     changes: list[dict[str, Any]] = []
@@ -966,8 +974,8 @@ def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold:
             tokens = get_amount(h)
             changes.append({
                 "type": "NEW", "address": addr,
-                "old_pct": None, "new_pct": tokens / new_total * 100,
-                "delta": tokens / new_total * 100,
+                "old_pct": None, "new_pct": tokens / denom * 100,
+                "delta": tokens / denom * 100,
                 "old_rank": None, "new_rank": new_rank_map.get(addr),
                 "tokens_delta": tokens, "old_tokens": 0.0, "new_tokens": tokens,
                 "trigger": "entry",
@@ -978,8 +986,8 @@ def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold:
             tokens = get_amount(h)
             changes.append({
                 "type": "EXIT", "address": addr,
-                "old_pct": tokens / old_total * 100, "new_pct": None,
-                "delta": -(tokens / old_total * 100),
+                "old_pct": tokens / denom * 100, "new_pct": None,
+                "delta": -(tokens / denom * 100),
                 "old_rank": old_rank_map.get(addr), "new_rank": None,
                 "tokens_delta": tokens, "old_tokens": tokens, "new_tokens": 0.0,
                 "trigger": "exit",
@@ -988,8 +996,8 @@ def compare_holders(old_holders: list[dict], new_holders: list[dict], threshold:
     for addr in set(old_map) & set(new_map):
         old_amt     = get_amount(old_map[addr])
         new_amt     = get_amount(new_map[addr])
-        old_pct     = old_amt / old_total * 100
-        new_pct     = new_amt / new_total * 100
+        old_pct     = old_amt / denom * 100
+        new_pct     = new_amt / denom * 100
         delta       = new_pct - old_pct
         token_delta = abs(new_amt - old_amt)
         pct_trig    = abs(delta) >= (threshold if threshold is not None else MOVE_THRESHOLD_PCT)
@@ -1855,7 +1863,7 @@ def run_holder_monitor() -> None:
         snapshot = load_snapshot(symbol) or _supabase_fallbacks.get(symbol)
         if snapshot:
             try:
-                changes = compare_holders(snapshot["holders"], current)
+                changes = compare_holders(snapshot["holders"], current, total_supply=all_supplies.get(symbol, 0.0))
             except (KeyError, TypeError) as exc:
                 log.error("Snapshot comparison failed for %s: %s", symbol, exc)
                 save_snapshot(symbol, current)
@@ -1895,7 +1903,7 @@ def run_holder_monitor() -> None:
 
             # Dormant wallet wake: movement ≥0.001% by wallets inactive >7d
             _alerted_addrs   = {c["address"] for c in changes}
-            _dormant_changes = compare_holders(snapshot["holders"], current, threshold=0.001)
+            _dormant_changes = compare_holders(snapshot["holders"], current, threshold=0.001, total_supply=all_supplies.get(symbol, 0.0))
             for _ch in _dormant_changes:
                 _addr = _ch["address"]
                 if _addr in _alerted_addrs or _ch["type"] != "MOVE":
