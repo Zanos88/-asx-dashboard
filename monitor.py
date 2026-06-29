@@ -562,6 +562,31 @@ def get_severity(change: dict[str, Any]) -> tuple[str, str]:
 
 # ── DexScreener price (FIX 4 — cached, includes 24h change) ─────────────────
 
+def _jupiter_price(mint: str) -> float:
+    """
+    Fallback USD price from the Jupiter price API (covers many illiquid SPL tokens that
+    DexScreener lacks). Returns 0.0 if Jupiter also has no price — caller then treats it
+    as value-unavailable (never a fabricated default).
+    """
+    for url in (
+        f"https://lite-api.jup.ag/price/v2?ids={mint}",
+        f"https://api.jup.ag/price/v2?ids={mint}",
+    ):
+        try:
+            resp = requests.get(url, timeout=8)
+            if not resp.ok:
+                continue
+            data = (resp.json() or {}).get("data") or {}
+            entry = data.get(mint) or {}
+            price = float(entry.get("price") or 0)
+            if price > 0:
+                log.info("  [price] %s → $%.6g via Jupiter fallback", mint[:8], price)
+                return price
+        except Exception as exc:
+            log.debug("  [price] Jupiter fetch failed for %s: %s", mint[:8], exc)
+    return 0.0
+
+
 def fetch_price_context(token_address: str) -> dict[str, Any]:
     cached = _price_cache.get(token_address)
     if cached and (time.time() - cached[1]) < PRICE_CACHE_SECS:
@@ -574,11 +599,17 @@ def fetch_price_context(token_address: str) -> dict[str, Any]:
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
         if not pairs:
-            return {}
+            jp = _jupiter_price(token_address)
+            return {"price": jp, "change_1h": 0.0, "change_24h": 0.0} if jp else {}
         best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
         pc   = best.get("priceChange") or {}
+        price = float(best.get("priceUsd") or 0)
+        if price <= 0:
+            jp = _jupiter_price(token_address)
+            if jp:
+                price = jp
         result = {
-            "price":      float(best.get("priceUsd") or 0),
+            "price":      price,
             "change_1h":  float(pc.get("h1")  or 0),
             "change_24h": float(pc.get("h24") or 0),
         }
@@ -586,10 +617,48 @@ def fetch_price_context(token_address: str) -> dict[str, Any]:
         return result
     except Exception as exc:
         log.warning("DexScreener fetch failed for %s: %s", token_address[:8], exc)
-        return {}
+        jp = _jupiter_price(token_address)
+        return {"price": jp, "change_1h": 0.0, "change_24h": 0.0} if jp else {}
 
 
 # ── Wallet intelligence (FIX 3) ───────────────────────────────────────────────
+
+def fetch_wallet_token_amounts(wallet_address: str) -> dict[str, float] | None:
+    """
+    Real on-chain SPL holdings for a wallet: {mint: uiAmount} for balances > 0.
+    Returns None on lookup failure (caller decides). Used by the deep /crosswallets
+    cross-balance check so it catches holders that aren't in any token's top-20.
+    """
+    rpc_url = (
+        f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        if HELIUS_API_KEY else PUBLIC_SOLANA_RPC
+    )
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
+        "params": [wallet_address,
+                   {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                   {"encoding": "jsonParsed"}],
+    }
+    try:
+        resp = requests.post(rpc_url, json=payload, timeout=10)
+        if resp.status_code == 403 and rpc_url != PUBLIC_SOLANA_RPC:
+            resp = requests.post(PUBLIC_SOLANA_RPC, json=payload, timeout=10)
+        resp.raise_for_status()
+        accounts = (resp.json().get("result") or {}).get("value") or []
+    except Exception as exc:
+        log.debug("fetch_wallet_token_amounts failed for %s: %s", wallet_address[:8], exc)
+        return None
+    out: dict[str, float] = {}
+    for acc in accounts:
+        try:
+            info = acc["account"]["data"]["parsed"]["info"]
+            amt = float((info.get("tokenAmount") or {}).get("uiAmount") or 0)
+            if amt > 0:
+                out[info["mint"]] = amt
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
 
 def fetch_wallet_intel(wallet_address: str, current_symbol: str) -> dict[str, Any]:
     """

@@ -35,6 +35,8 @@ from monitor import (
     _supabase,
     update_bot_config,
     get_live_tracked_tokens,
+    build_cross_holdings,
+    fetch_wallet_token_amounts,
     fetch_holders,
     fetch_wallet_intel,
     fetch_wallet_winrate,
@@ -771,6 +773,118 @@ async def cmd_muted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     muted = _get_muted_tokens()
     await update.message.reply_text("🔇 Muted tokens: " + (", ".join(sorted(muted)) or "none (all alerting)"))
+
+
+def _latest_holders_by_token(live: dict[str, str]) -> dict[str, tuple[list[dict], float]]:
+    """{sym: (holders[{address,uiAmount}], total_supply)} from the latest snapshot batch."""
+    out: dict[str, tuple[list[dict], float]] = {}
+    for sym, mint in live.items():
+        try:
+            r = (_supabase.table("wallet_snapshots")
+                 .select("wallet_address,balance,total_supply,captured_at")
+                 .eq("token_address", mint).order("captured_at", desc=True)
+                 .limit(60).execute())
+            rows = r.data or []
+        except Exception as exc:
+            log.warning("crosswallets snapshot query failed for %s: %s", sym, exc)
+            rows = []
+        if not rows:
+            continue
+        latest = (rows[0].get("captured_at") or "")[:19]
+        holders, seen, supply = [], set(), 0.0
+        for row in rows:
+            if (row.get("captured_at") or "")[:19] != latest:
+                continue
+            w = row["wallet_address"]
+            if w in seen:
+                continue
+            seen.add(w)
+            holders.append({"address": w, "uiAmount": float(row.get("balance") or 0)})
+            supply = float(row.get("total_supply") or 0) or supply
+        out[sym] = (holders, supply)
+    return out
+
+
+def _crosswallets_fast(live: dict[str, str]) -> dict[str, dict[str, float]]:
+    """Top-20 intersection — reuses build_cross_holdings (zero duplicated calc)."""
+    data = _latest_holders_by_token(live)
+    all_current  = {sym: hd[0] for sym, hd in data.items()}
+    all_supplies = {sym: hd[1] for sym, hd in data.items()}
+    return build_cross_holdings(all_current, all_supplies)
+
+
+def _crosswallets_deep(live: dict[str, str]) -> dict[str, dict[str, float]]:
+    """
+    Per-wallet on-chain cross-balance check — catches holders that aren't in any token's
+    top-20 (the screenshot case). Candidate set = union of current top holders; each is
+    checked for real balances of every tracked mint via fetch_wallet_token_amounts.
+    """
+    data      = _latest_holders_by_token(live)
+    supplies  = {sym: hd[1] for sym, hd in data.items()}
+    mint_sym  = {mint: sym for sym, mint in live.items()}
+    candidates: set[str] = set()
+    for holders, _ in data.values():
+        candidates.update(h["address"] for h in holders)
+    result: dict[str, dict[str, float]] = {}
+    for w in list(candidates)[:80]:          # bounded
+        amts = fetch_wallet_token_amounts(w)
+        if not amts:
+            continue
+        held: dict[str, float] = {}
+        for mint, sym in mint_sym.items():
+            amt = amts.get(mint)
+            if amt and amt > 0:
+                sup = supplies.get(sym) or 0.0
+                held[sym] = round(amt / sup * 100, 4) if sup > 0 else 0.0
+        if len(held) >= 2:
+            result[w] = held
+    return result
+
+
+async def cmd_crosswallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    On-demand cross-token holders. Usage:
+      /crosswallets            — fast (top-20 snapshot intersection)
+      /crosswallets deep       — on-chain per-wallet scan (catches sub-top-20 holders)
+      /crosswallets [deep] SYM — only wallets also overlapping SYM
+    """
+    if not _authorized(update):
+        await _deny(update)
+        return
+    args = context.args or []
+    deep = any(a.lower() == "deep" for a in args)
+    filt = next((a.upper() for a in args if a.lower() != "deep"), None)
+    live = get_live_tracked_tokens()
+    if len(live) < 2:
+        await update.message.reply_text("Need 2+ tracked tokens to find cross-holders.")
+        return
+    if filt and filt not in live:
+        await update.message.reply_text(f"Unknown token '{filt}'. Tracked: {', '.join(live)}")
+        return
+    if deep:
+        await update.message.reply_text("⏳ Deep on-chain scan — this can take ~20s…")
+    loop  = asyncio.get_running_loop()
+    cross = await loop.run_in_executor(None, _crosswallets_deep if deep else _crosswallets_fast, live)
+    multi = {a: h for a, h in cross.items() if len(h) >= 2 and (filt is None or filt in h)}
+    mode  = "deep" if deep else "snapshot"
+    if not multi:
+        scope = f" overlapping {filt}" if filt else ""
+        await update.message.reply_text(f"No wallets hold 2+ tracked tokens{scope} ({mode} scan).")
+        return
+    lines = [
+        f"🕸 <b>Cross-coin Whales ({mode}) — {datetime.now(timezone.utc).strftime('%H:%M UTC')}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for addr, h in sorted(multi.items(), key=lambda kv: -sum(kv[1].values()))[:15]:
+        lines.append(f"<code>{addr[:8]}...{addr[-6:]}</code>  (combined {sum(h.values()):.2f}%)")
+        lines.append(f"📋 <code>{addr}</code>")
+        for sym, pct in sorted(h.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  • {sym}: {pct:.2f}%")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    if not deep:
+        lines.append("ℹ️ snapshot scan = top-20 intersection. Use <code>/crosswallets deep</code> for sub-top-20 holders.")
+    await update.message.reply_text("\n".join(lines).strip(), parse_mode="HTML")
 
 
 async def cmd_relationships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1989,6 +2103,8 @@ def main() -> None:
     app.add_handler(CommandHandler("moves",         cmd_moves))
     app.add_handler(CommandHandler("top",           cmd_top))
     app.add_handler(CommandHandler("alert",         cmd_alert_toggle))
+    app.add_handler(CommandHandler("crosswallets",  cmd_crosswallets))
+    app.add_handler(CommandHandler("multiholders",  cmd_crosswallets))
     app.add_handler(CommandHandler("mute",          cmd_mute))
     app.add_handler(CommandHandler("unmute",        cmd_unmute))
     app.add_handler(CommandHandler("muted",         cmd_muted))
