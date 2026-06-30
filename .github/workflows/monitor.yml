@@ -2,7 +2,7 @@ name: Holder Monitor + Sentiment Digest
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # every 15 minutes
+    - cron: '0 * * * *'  # hourly (*/15 throttled by GitHub to ~2h; hourly fires reliably)
   workflow_dispatch:          # allow manual trigger from GitHub UI
 
 permissions:
