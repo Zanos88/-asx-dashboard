@@ -64,34 +64,44 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-BOTFATHER_COMMANDS = """\
-ping - Check bot is alive
-status - Config & connection status
-run - Trigger a full monitor run immediately
-alert - Mute or unmute all automatic alerts
-snapshot - Latest saved snapshot for all tokens
-holders - Live top-10 holders from Helius
-top - Full top-20 with activity status
-moves - Wallet movements in last 24h
-bundle - Cluster report for token OR wallet lookup
-clusters - All detected wallet clusters
-relationships - Full wallet relationship graph
-classify - Classify address: wallet, LP pool, or program
-topwallets - Rank wallets by win rate
-addtoken - Start tracking a token
-removetoken - Stop tracking a token
-threshold - Set move alert threshold
-movethreshold - Alias for threshold
-testalert - Fire a synthetic alert to verify pipeline
-related - External token holdings for top wallets
-scancluster - On-chain SOL transfer scan for a token's bundle cluster
-scantest - Test inter-transfer scan (2 wallets, 30 days, no DB write)
-addwallet - Track a smart wallet (validates + runs 30d backfill)
-tier - Show tier and stats for a tracked wallet
-backfill - Re-run 30d swap backfill for a wallet
-evidence - Show on-chain proof for a wallet's relationships
-rejections - Last 20 toxic-flow filter rejections
-injectevidence - Full-history evidence scan for all clusters"""
+# Single source of truth for all registered commands.
+# Feeds both the BotFather log-hint and set_my_commands (auto-syncs the pinned menu on deploy).
+_COMMAND_LIST: list[tuple[str, str]] = [
+    ("ping",           "Check bot is alive"),
+    ("status",         "Config & connection status"),
+    ("run",            "Trigger a full monitor run immediately"),
+    ("alert",          "Global mute toggle: /alert on|off (owner only)"),
+    ("mute",           "Mute Telegram alerts for one token: /mute SYMBOL"),
+    ("unmute",         "Re-enable alerts for a token: /unmute SYMBOL"),
+    ("muted",          "List currently muted tokens"),
+    ("snapshot",       "Latest saved snapshot for all tokens"),
+    ("holders",        "Live top-10 holders from Helius"),
+    ("top",            "Full top-20 with activity status"),
+    ("moves",          "Wallet movements in last 24h"),
+    ("crosswallets",   "Cross-token holders: /crosswallets [deep] [SYMBOL]"),
+    ("multiholders",   "Alias for crosswallets"),
+    ("bundle",         "Cluster report for token OR wallet lookup"),
+    ("clusters",       "All detected wallet clusters"),
+    ("relationships",  "Full wallet relationship graph"),
+    ("classify",       "Classify address: wallet, LP pool, or program"),
+    ("topwallets",     "Rank wallets by win rate"),
+    ("addtoken",       "Start tracking a token"),
+    ("removetoken",    "Stop tracking a token"),
+    ("threshold",      "Set move alert threshold"),
+    ("movethreshold",  "Alias for threshold"),
+    ("testalert",      "Fire a synthetic alert to verify pipeline"),
+    ("related",        "External token holdings for top wallets"),
+    ("scancluster",    "On-chain SOL transfer scan for a token's bundle cluster"),
+    ("scantest",       "Test inter-transfer scan (2 wallets, 30 days, no DB write)"),
+    ("addwallet",      "Track a smart wallet (validates + runs 30d backfill)"),
+    ("tier",           "Show tier and stats for a tracked wallet"),
+    ("backfill",       "Re-run 30d swap backfill for a wallet"),
+    ("evidence",       "Show on-chain proof for a wallet's relationships"),
+    ("rejections",     "Last 20 toxic-flow filter rejections"),
+    ("injectevidence", "Full-history evidence scan for all clusters"),
+]
+
+BOTFATHER_COMMANDS = "\n".join(f"{cmd} - {desc}" for cmd, desc in _COMMAND_LIST)
 
 def _parse_chat_ids(raw: str) -> set[int]:
     return {int(cid.strip()) for cid in raw.split(",") if cid.strip().lstrip("-").isdigit()}
@@ -2076,10 +2086,20 @@ async def _telegram_error_handler(update: object, context: ContextTypes.DEFAULT_
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+async def _set_commands(app: Application) -> None:
+    """post_init hook: registers all commands with Telegram so the pinned menu auto-updates."""
+    from telegram import BotCommand
+    try:
+        await app.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in _COMMAND_LIST])
+        log.info("Telegram command menu synced (%d commands)", len(_COMMAND_LIST))
+    except Exception as exc:
+        log.warning("set_my_commands failed (non-fatal): %s", exc)
+
+
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_set_commands).build()
     log.info("BotFather commands:\n%s", BOTFATHER_COMMANDS)
     app.add_handler(CommandHandler("ping",          cmd_ping))
     app.add_handler(CommandHandler("start",         cmd_start))
