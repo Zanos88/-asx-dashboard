@@ -2,7 +2,7 @@ name: Token Discovery
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # every 15 minutes
+    - cron: '30 * * * *'  # hourly at :30 (offset from monitor; */15 throttled by GitHub)
   workflow_dispatch:          # allow manual trigger from GitHub UI
 
 jobs:

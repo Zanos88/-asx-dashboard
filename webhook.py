@@ -858,6 +858,7 @@ async def health() -> JSONResponse:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
         "supabase_configured": bool(SUPABASE_URL),
+        "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA", os.getenv("GIT_COMMIT_SHA", "unknown")),
     }
     status_code = 200 if bot_alive else 503
     return JSONResponse(payload, status_code=status_code)
