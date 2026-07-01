@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-01T20:09:17.034338+00:00",
+  "timestamp": "2026-07-01T22:21:44.267633+00:00",
   "holders": [
     {
       "address": "14rAMrvCcuy2evYhFLQ1nNdYAYauBbrkLbKNKirXF8ZS",
@@ -130,6 +130,14 @@
       "token_account": "GXgftYS9TJSDXVcqmWPqNUJTYiFbCJxt1RDcAQEwjuNX"
     },
     {
+      "address": "AmNDxHzjmkx7FS8sT7QpCYmVt9GTdpAFtmMi33YKgZLZ",
+      "uiAmount": 8459793.789877,
+      "decimals": 6,
+      "amount": "8459793789877",
+      "uiAmountString": "8459793.789877",
+      "token_account": "Gwpp5EwwTDNdF8jTsbTxm3NqVc5hxH1t8j7sqRceMRan"
+    },
+    {
       "address": "AwPRAtfgzBWwiaACehbDsDLwvZF3UxyaqM2HL1NCYgyu",
       "uiAmount": 8000000.0,
       "decimals": 6,
@@ -144,14 +152,6 @@
       "amount": "7900000004400",
       "uiAmountString": "7900000.0044",
       "token_account": "DsVfVCp3JEopAsURETLNx4EktPTQ9wZTztYF4e9QQTFB"
-    },
-    {
-      "address": "4kJvmY5utWE3gw3DoJ6nauZcg7V3m77wo3HyRZJF15pR",
-      "uiAmount": 7502909.368805,
-      "decimals": 6,
-      "amount": "7502909368805",
-      "uiAmountString": "7502909.368805",
-      "token_account": "VF6CzpwLr3mQ8wVsU7gQ8QPHP98JhvCvgwGYf7E9dcr"
     }
   ]
 }
